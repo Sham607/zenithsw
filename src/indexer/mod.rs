@@ -12,9 +12,9 @@ pub struct SmartMoneyIndexer {
 }
 
 impl SmartMoneyIndexer {
-    pub fn new(helius_rpc_url: &str, db: Arc<SmartWalletDb>, interval_secs: u64) -> Self {
+    pub fn new(helius_rpc_url: &str, arbitrum_rpc_url: &str, db: Arc<SmartWalletDb>, interval_secs: u64) -> Self {
         Self {
-            profiler: WinnerProfiler::new(helius_rpc_url, db),
+            profiler: WinnerProfiler::new(helius_rpc_url, arbitrum_rpc_url, db),
             interval_secs,
         }
     }

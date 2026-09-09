@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     let confluence = Arc::new(ConfluenceEngine::new(config.clone(), db.clone()));
     let sol_exec = Arc::new(SolanaExecutor::new(config.clone(), db.clone()));
     let evm_exec = Arc::new(EvmExecutor::new(config.clone(), db.clone()));
-    let indexer = Arc::new(SmartMoneyIndexer::new(&config.solana_rpc_url, db.clone(), 600));
+    let indexer = Arc::new(SmartMoneyIndexer::new(&config.solana_rpc_url, &config.arbitrum_rpc_url, db.clone(), 600));
 
     // Initial sync of Top traders
     let _ = scraper.sync_to_db().await;
