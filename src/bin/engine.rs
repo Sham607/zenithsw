@@ -9,7 +9,7 @@ use zenithsw::gating::ConfluenceEngine;
 use zenithsw::ingestion::FomoScraper;
 use zenithsw::ipc::{IpcMessage, IpcServer};
 use zenithsw::models::{ActivityType, Chain};
-use zenithsw::streams::{EvmStreamListener, SolanaStreamListener};
+use zenithsw::streams::{EvmStreamListener, FomoApiStreamListener, SolanaStreamListener};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,6 +24,9 @@ async fn main() -> Result<()> {
     println!("[CONFIG] Min Liquidity: ${:.0}", config.min_liquidity_usd);
     println!("[CONFIG] Position Size: ${:.0}", config.position_size_usd);
     println!("[CONFIG] Fomo Sync Interval: {}s", config.fomo_sync_interval_sec);
+    if config.fomo_auth_token.is_some() {
+        println!("[CONFIG] FOMO Auth Session: Active 🟢 (Privy Authenticated Direct API)");
+    }
 
     let db = Arc::new(SmartWalletDb::new(&config.db_path)?);
     let ipc_server = Arc::new(IpcServer::new(&config.ipc_socket_path));
@@ -34,21 +37,24 @@ async fn main() -> Result<()> {
     let sol_listener = Arc::new(SolanaStreamListener::new(&config.solana_rpc_url));
     let arb_listener = Arc::new(EvmStreamListener::new(&config.arbitrum_rpc_url, Chain::Arbitrum));
     let base_listener = Arc::new(EvmStreamListener::new(&config.base_rpc_url, Chain::Base));
+    let fomo_listener = Arc::new(FomoApiStreamListener::new(config.clone()));
     let confluence = Arc::new(ConfluenceEngine::new(config.clone(), db.clone()));
     let sol_exec = Arc::new(SolanaExecutor::new(config.clone(), db.clone()));
     let evm_exec = Arc::new(EvmExecutor::new(config.clone(), db.clone()));
 
-    // Task 1: Periodic FOMO Leaderboard Synchronizer (Syncs Verified Wallets & Live Leaderboard Stats)
+    // Initial sync of Top 100 traders
+    let _ = scraper.sync_and_persist(db.clone()).await;
+
+    // Task 1: Periodic FOMO Leaderboard Synchronizer (Syncs 100 Real On-Chain Wallets)
     let db_sync = db.clone();
     let scraper_sync = scraper.clone();
     let ipc_sync = ipc_server.clone();
     let sync_sec = config.fomo_sync_interval_sec;
     tokio::spawn(async move {
-        println!("[FOMO SYNC] Worker started (Interval: {}s)", sync_sec);
+        println!("[FOMO SYNC] Leaderboard sync worker started (Interval: {}s)", sync_sec);
         loop {
             match scraper_sync.sync_and_persist(db_sync.clone()).await {
-                Ok(count) => {
-                    println!("[FOMO SYNC] Verified & synced {} smart wallets", count);
+                Ok(_count) => {
                     if let Ok(wallets) = db_sync.get_active_wallets() {
                         let _ = ipc_sync.broadcast(&IpcMessage::WalletSync { wallets });
                     }
@@ -66,6 +72,7 @@ async fn main() -> Result<()> {
     let sol_listener_stream = sol_listener.clone();
     let arb_listener_stream = arb_listener.clone();
     let base_listener_stream = base_listener.clone();
+    let fomo_listener_stream = fomo_listener.clone();
     let confluence_stream = confluence.clone();
     let sol_exec_stream = sol_exec.clone();
     let evm_exec_stream = evm_exec.clone();
@@ -73,19 +80,28 @@ async fn main() -> Result<()> {
     let poll_ms = config.stream_poll_interval_ms;
 
     tokio::spawn(async move {
-        println!("[STREAM WORKER] Multi-Chain Ingestion active (Poll interval: {}ms)", poll_ms);
+        println!("[STREAM WORKER] Multi-Chain + FOMO API Ingestion active (Poll interval: {}ms)", poll_ms);
         loop {
             if let Ok(wallets) = db_stream.get_active_wallets() {
                 for w in wallets {
-                    let activity_opt = match w.chain {
-                        Chain::Solana => sol_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
-                        Chain::Arbitrum => arb_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
-                        Chain::Base => base_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
-                        _ => None,
-                    };
+                    // Check FOMO API Direct Swaps first, fallback to Helius RPC
+                    let mut activity_opt = fomo_listener_stream
+                        .check_trader_swaps(&w.handle, &w.address, db_stream.clone())
+                        .await
+                        .ok()
+                        .flatten();
+
+                    if activity_opt.is_none() {
+                        activity_opt = match w.chain {
+                            Chain::Solana => sol_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
+                            Chain::Arbitrum => arb_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
+                            Chain::Base => base_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
+                            _ => None,
+                        };
+                    }
 
                     if let Some(act) = activity_opt {
-                        println!("[ACTIVITY] {} by @{} ({}) -> Token: {}", act.activity_type, act.wallet_handle, act.chain, act.token_symbol);
+                        println!("[ACTIVITY 🔥] {} by @{} ({}) -> Token: {} (${:.2})", act.activity_type, act.wallet_handle, act.chain, act.token_symbol, act.amount_usd);
                         let _ = ipc_stream.broadcast(&IpcMessage::ActivityBroadcast { activity: act.clone() });
 
                         // Handle Shadow Mirror Exit

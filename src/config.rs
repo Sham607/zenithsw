@@ -17,7 +17,8 @@ pub struct Config {
     pub base_ws_url: String,
     pub evm_private_key: Option<String>,
 
-    // Ingestion & Sync settings
+    // FOMO Auth & Ingestion settings
+    pub fomo_auth_token: Option<String>,
     pub fomo_sync_interval_sec: u64,
     pub stream_poll_interval_ms: u64,
 
@@ -50,9 +51,9 @@ impl Config {
         let solana_private_key = env::var("SOLANA_PRIVATE_KEY").ok();
 
         let arbitrum_rpc_url = env::var("ARBITRUM_RPC_URL")
-            .unwrap_or_else(|_| "https://arb-mainnet.g.alchemy.com/v2/demo".to_string());
+            .unwrap_or_else(|_| "https://arb-mainnet.g.alchemy.com/v2/alch_PS21nEmHejPxYhypdUH1A".to_string());
         let arbitrum_ws_url = env::var("ARBITRUM_WS_URL")
-            .unwrap_or_else(|_| "wss://arb-mainnet.g.alchemy.com/v2/demo".to_string());
+            .unwrap_or_else(|_| "wss://arb-mainnet.g.alchemy.com/v2/alch_PS21nEmHejPxYhypdUH1A".to_string());
 
         let base_rpc_url = env::var("BASE_RPC_URL")
             .unwrap_or_else(|_| "https://base-mainnet.g.alchemy.com/v2/demo".to_string());
@@ -61,10 +62,12 @@ impl Config {
 
         let evm_private_key = env::var("EVM_PRIVATE_KEY").ok();
 
+        let fomo_auth_token = env::var("FOMO_AUTH_TOKEN").ok().filter(|s| !s.trim().is_empty());
+
         let fomo_sync_interval_sec = env::var("FOMO_SYNC_INTERVAL_SEC")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(60);
+            .unwrap_or(5);
 
         let stream_poll_interval_ms = env::var("STREAM_POLL_INTERVAL_MS")
             .ok()
@@ -102,14 +105,14 @@ impl Config {
             .unwrap_or(50.0);
 
         let shadow_exit_enabled = env::var("SHADOW_EXIT_ENABLED")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .map(|v| v.to_lowercase() == "true")
             .unwrap_or(true);
 
         let confluence_mode = env::var("CONFLUENCE_MODE")
             .unwrap_or_else(|_| "TIER_S_OR_DUAL_A".to_string());
 
         let dry_run = env::var("DRY_RUN")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .map(|v| v.to_lowercase() == "true")
             .unwrap_or(true);
 
         let db_path = env::var("DB_PATH")
@@ -127,6 +130,7 @@ impl Config {
             base_rpc_url,
             base_ws_url,
             evm_private_key,
+            fomo_auth_token,
             fomo_sync_interval_sec,
             stream_poll_interval_ms,
             max_price_delta_pct,

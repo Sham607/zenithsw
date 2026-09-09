@@ -1,16 +1,43 @@
+use crate::config::Config;
 use crate::db::SmartWalletDb;
 use crate::models::{Chain, SmartWallet, WalletTier};
 use anyhow::Result;
 use chrono::Utc;
-use regex::Regex;
+use serde_json::Value;
 use std::fs;
 use std::sync::Arc;
 
-pub struct FomoScraper;
+pub struct FomoScraper {
+    config: Config,
+}
 
 impl FomoScraper {
     pub fn new() -> Self {
-        Self
+        let config = Config::load().unwrap_or_else(|_| Config {
+            solana_rpc_url: "".to_string(),
+            solana_ws_url: "".to_string(),
+            solana_private_key: None,
+            arbitrum_rpc_url: "".to_string(),
+            arbitrum_ws_url: "".to_string(),
+            base_rpc_url: "".to_string(),
+            base_ws_url: "".to_string(),
+            evm_private_key: None,
+            fomo_auth_token: None,
+            fomo_sync_interval_sec: 5,
+            stream_poll_interval_ms: 500,
+            max_price_delta_pct: 5.0,
+            min_liquidity_usd: 30000.0,
+            position_size_usd: 15.0,
+            trailing_stop_pct: 10.0,
+            stop_loss_pct: 15.0,
+            take_profit_pct: 50.0,
+            shadow_exit_enabled: true,
+            confluence_mode: "TIER_S_OR_DUAL_A".to_string(),
+            dry_run: true,
+            db_path: "data/smart_wallets.db".to_string(),
+            ipc_socket_path: "/tmp/zenithsw.sock".to_string(),
+        });
+        Self { config }
     }
 
     pub fn get_default_seed_traders() -> Vec<SmartWallet> {
@@ -22,142 +49,128 @@ impl FomoScraper {
         Self::fallback_seed_traders()
     }
 
-    pub async fn fetch_leaderboard() -> Result<Vec<SmartWallet>> {
-        let mut verified_wallets = Self::get_default_seed_traders();
-
-        let url = "https://fominal.family/leaderboard";
+    pub async fn fetch_leaderboard(&self) -> Result<Vec<SmartWallet>> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(8))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .timeout(std::time::Duration::from_secs(6))
             .build()?;
 
-        let resp = match client.get(url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            _ => return Ok(verified_wallets),
-        };
+        // 1. Authenticated Direct API Fetch from FOMO Backend
+        if let Some(token) = &self.config.fomo_auth_token {
+            let api_url = "https://prod-api.fomo.family/v2/leaderboard?timeframe=24h";
+            let mut req = client.get(api_url)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                .header("Accept", "application/json")
+                .header("Origin", "https://fomo.family")
+                .header("Referer", "https://fomo.family/");
 
-        let html = resp.text().await.unwrap_or_default();
+            if !token.starts_with("Bearer ") {
+                req = req.header("Authorization", format!("Bearer {}", token));
+            } else {
+                req = req.header("Authorization", token);
+            }
 
-        // Parse Leaderboard Stats (Cards & Table) to update PnL and Ranks of verified wallets
-        let mut stats_map = std::collections::HashMap::new();
+            if let Ok(resp) = req.send().await {
+                if resp.status().is_success() {
+                    if let Ok(json) = resp.json::<Value>().await {
+                        if let Some(items) = json.get("responseObject").and_then(|r| r.get("leaderboard")).and_then(|l| l.as_array()) {
+                            let mut wallets = Vec::new();
+                            for (idx, item) in items.iter().enumerate() {
+                                let name = item.get("displayName").and_then(|v| v.as_str()).unwrap_or("Trader").to_string();
+                                let handle = item.get("userHandle").and_then(|v| v.as_str()).unwrap_or("trader").to_string();
+                                let sol_addr = item.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let evm_addr = item.get("evmAddress").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let pnl = item.get("pnl").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let rank = (idx + 1) as u32;
 
-        // 1. Top Cards
-        let card_re = Regex::new(
-            r#"text-\[15px\] font-medium">([^<]+)</p>\s*<p class="[^"]*text-\[12px\] text-dim">@<!-- -->([^<]+)</p>.*?text-\[26px\][^"]*text-up">\+?\$?([0-9,]+\.[0-9]{2})</p>"#,
-        );
-        if let Ok(re) = card_re {
-            for (idx, cap) in re.captures_iter(&html).enumerate() {
-                let handle = cap[2].trim().to_string();
-                let pnl: f64 = cap[3].replace(',', "").parse().unwrap_or(0.0);
-                stats_map.insert(handle, ((idx + 1) as u32, pnl));
+                                let (chain, address) = if !sol_addr.is_empty() {
+                                    (Chain::Solana, sol_addr)
+                                } else if !evm_addr.is_empty() {
+                                    (Chain::Robinhood, evm_addr)
+                                } else {
+                                    continue;
+                                };
+
+                                let tier = if pnl >= 100_000.0 || rank <= 3 {
+                                    WalletTier::TierS
+                                } else if pnl >= 30_000.0 || rank <= 15 {
+                                    WalletTier::TierA
+                                } else {
+                                    WalletTier::TierB
+                                };
+
+                                wallets.push(SmartWallet {
+                                    id: None,
+                                    address,
+                                    name,
+                                    handle,
+                                    chain,
+                                    tier,
+                                    rank,
+                                    pnl_24h_usd: pnl,
+                                    win_rate_pct: 75.0,
+                                    total_trades: 20,
+                                    is_active: true,
+                                    last_seen_at: Some(Utc::now()),
+                                    updated_at: Utc::now(),
+                                });
+                            }
+
+                            if !wallets.is_empty() {
+                                return Ok(wallets);
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        // 2. Table Rows
-        let row_re = Regex::new(
-            r#"<td[^>]*>(\d+)</td>.*?font-medium">([^<]+)</span>.*?text-dim">@<!-- -->([^<]+)</span>.*?text-up">\+?\$?([0-9,]+\.[0-9]{2})</td>"#,
-        );
-        if let Ok(re) = row_re {
-            for cap in re.captures_iter(&html) {
-                let rank: u32 = cap[1].parse().unwrap_or(99);
-                let handle = cap[3].trim().to_string();
-                let pnl: f64 = cap[4].replace(',', "").parse().unwrap_or(0.0);
-                stats_map.insert(handle, (rank, pnl));
-            }
-        }
-
-        // Update verified wallets with live PnL / Rank from leaderboard
-        for w in &mut verified_wallets {
-            if let Some((rank, pnl)) = stats_map.get(&w.handle) {
-                w.rank = *rank;
-                w.pnl_24h_usd = *pnl;
-                w.tier = if *pnl >= 100_000.0 {
-                    WalletTier::TierS
-                } else if *pnl >= 30_000.0 {
-                    WalletTier::TierA
-                } else {
-                    WalletTier::TierB
-                };
-                w.updated_at = Utc::now();
-            }
-        }
-
-        Ok(verified_wallets)
+        // 2. Fallback to Local Verified Seeds
+        Ok(Self::get_default_seed_traders())
     }
 
     pub fn fallback_seed_traders() -> Vec<SmartWallet> {
         vec![
             SmartWallet {
                 id: None,
-                address: "EZcv4WSEmX7WopTJc2bfrdaYovpKcxk81s9zXiQ3Zm9i".to_string(),
-                name: "Ethermonk Whale 📿".to_string(),
-                handle: "ether_monk".to_string(),
+                address: "6cerGpSGzCrA1NeHUNtyoNm4rWQx5SnK3DSAXb4e615t".to_string(),
+                name: "point farm capital 🌾".to_string(),
+                handle: "pointfarmcap".to_string(),
                 chain: Chain::Solana,
                 tier: WalletTier::TierS,
                 rank: 1,
-                pnl_24h_usd: 254395.02,
-                win_rate_pct: 86.4,
-                total_trades: 42,
+                pnl_24h_usd: 2183981.02,
+                win_rate_pct: 88.0,
+                total_trades: 2500,
                 is_active: true,
                 last_seen_at: Some(Utc::now()),
                 updated_at: Utc::now(),
             },
             SmartWallet {
                 id: None,
-                address: "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1".to_string(),
-                name: "Logan Lim 👑".to_string(),
-                handle: "loganlim_x".to_string(),
+                address: "FJDy9FDRy6bwGEUKuAC98bUtN8MkpE2pT7Dj7HE3Z7Q1".to_string(),
+                name: "Unipcs 🦄".to_string(),
+                handle: "unipcs".to_string(),
                 chain: Chain::Solana,
                 tier: WalletTier::TierS,
                 rank: 2,
-                pnl_24h_usd: 172605.34,
-                win_rate_pct: 82.1,
-                total_trades: 38,
+                pnl_24h_usd: 1416868.37,
+                win_rate_pct: 84.0,
+                total_trades: 120,
                 is_active: true,
                 last_seen_at: Some(Utc::now()),
                 updated_at: Utc::now(),
             },
             SmartWallet {
                 id: None,
-                address: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
+                address: "GmfY52CC5BKt43xt9GSmZWNzsAv4ywE6qgguRM5fvAtN".to_string(),
                 name: "TheS◎Lstice 🪐".to_string(),
                 handle: "The__Solstice".to_string(),
                 chain: Chain::Solana,
                 tier: WalletTier::TierS,
                 rank: 3,
-                pnl_24h_usd: 139151.04,
+                pnl_24h_usd: 1069432.77,
                 win_rate_pct: 79.5,
-                total_trades: 29,
-                is_active: true,
-                last_seen_at: Some(Utc::now()),
-                updated_at: Utc::now(),
-            },
-            SmartWallet {
-                id: None,
-                address: "0x7163aE1B5aEa2F09EBc609c52b4DCAC0A7a4bC2D".to_string(),
-                name: "Avast EVM 🛡️".to_string(),
-                handle: "0xAvast".to_string(),
-                chain: Chain::Robinhood,
-                tier: WalletTier::TierS,
-                rank: 4,
-                pnl_24h_usd: 108471.36,
-                win_rate_pct: 77.0,
-                total_trades: 35,
-                is_active: true,
-                last_seen_at: Some(Utc::now()),
-                updated_at: Utc::now(),
-            },
-            SmartWallet {
-                id: None,
-                address: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".to_string(),
-                name: "Onchaingambles 🎲".to_string(),
-                handle: "Onchainmetrics".to_string(),
-                chain: Chain::Solana,
-                tier: WalletTier::TierA,
-                rank: 5,
-                pnl_24h_usd: 79495.58,
-                win_rate_pct: 71.3,
-                total_trades: 22,
+                total_trades: 45,
                 is_active: true,
                 last_seen_at: Some(Utc::now()),
                 updated_at: Utc::now(),
@@ -166,7 +179,7 @@ impl FomoScraper {
     }
 
     pub async fn sync_and_persist(&self, db: Arc<SmartWalletDb>) -> Result<usize> {
-        let wallets = Self::fetch_leaderboard().await?;
+        let wallets = self.fetch_leaderboard().await?;
         let count = wallets.len();
         for w in wallets {
             let _ = db.upsert_wallet(&w);

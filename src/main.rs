@@ -24,6 +24,7 @@ async fn main() -> Result<()> {
         base_rpc_url: "".to_string(),
         base_ws_url: "".to_string(),
         evm_private_key: None,
+        fomo_auth_token: None,
         fomo_sync_interval_sec: 60,
         stream_poll_interval_ms: 500,
         max_price_delta_pct: 5.0,

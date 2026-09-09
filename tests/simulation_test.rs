@@ -19,6 +19,7 @@ fn get_mock_config() -> Config {
         base_rpc_url: "https://base-mainnet.g.alchemy.com/v2/test".to_string(),
         base_ws_url: "wss://base-mainnet.g.alchemy.com/v2/test".to_string(),
         evm_private_key: None,
+        fomo_auth_token: None,
         fomo_sync_interval_sec: 60,
         stream_poll_interval_ms: 500,
         max_price_delta_pct: 5.0,
@@ -272,8 +273,8 @@ async fn test_shadow_execution_and_mirror_exit() {
 #[test]
 fn test_fomo_seed_traders_and_resolver() {
     let seeds = FomoScraper::get_default_seed_traders();
-    assert!(seeds.len() >= 5);
-    assert_eq!(seeds[0].handle, "ether_monk");
+    assert!(seeds.len() >= 3);
+    assert_eq!(seeds[0].handle, "pointfarmcap");
     assert_eq!(seeds[0].tier, WalletTier::TierS);
 
     let res_sol = WalletResolver::resolve_chain_and_address("ether_monk").unwrap();
