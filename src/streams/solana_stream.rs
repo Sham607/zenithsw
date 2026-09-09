@@ -44,6 +44,10 @@ impl SolanaStreamListener {
 
         let res = match self.client.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
+            Ok(r) if r.status().as_u16() == 429 => {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                return Ok(None);
+            }
             _ => return Ok(None),
         };
 

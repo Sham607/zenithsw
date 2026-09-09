@@ -105,6 +105,9 @@ async fn main() -> Result<()> {
                         };
                     }
 
+                    // Stagger RPC requests to avoid rate limits
+                    sleep(Duration::from_millis(150)).await;
+
                     if let Some(act) = activity_opt {
                         println!("[ACTIVITY 🔥] {} by @{} ({}) -> Token: {} (${:.2})", act.activity_type, act.wallet_handle, act.chain, act.token_symbol, act.amount_usd);
                         let _ = ipc_stream.broadcast(&IpcMessage::ActivityBroadcast { activity: act.clone() });
