@@ -150,11 +150,19 @@ impl FomoApiStreamListener {
                     || in_token.contains("So11111111111111111111111111111111111111112") // SOL
                     || in_token.contains("0x");
 
-                let (activity_type, token_mint, token_symbol) = if is_buy {
+                let (activity_type, token_mint, mut token_symbol) = if is_buy {
                     (ActivityType::Buy, out_token.to_string(), "FOMO_COIN".to_string())
                 } else {
                     (ActivityType::Sell, in_token.to_string(), "FOMO_COIN".to_string())
                 };
+
+                let mut execution_price_usd = 0.0;
+                if let Ok((sym, price, _)) = crate::streams::solana_stream::SolanaStreamListener::fetch_token_price(&token_mint).await {
+                    if sym != "UNKNOWN" {
+                        token_symbol = sym;
+                    }
+                    execution_price_usd = price;
+                }
 
                 let activity = WalletActivity {
                     id: None,
@@ -166,7 +174,7 @@ impl FomoApiStreamListener {
                     token_mint,
                     amount_usd,
                     token_amount: 1.0,
-                    execution_price_usd: 0.0, // Resolved later via Jupiter
+                    execution_price_usd,
                     tx_signature: swap_id.to_string(),
                     timestamp: Utc::now(),
                 };
