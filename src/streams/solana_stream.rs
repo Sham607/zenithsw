@@ -99,7 +99,7 @@ impl SolanaStreamListener {
         }
 
         let now = Utc::now();
-        let tx_age_secs = if block_time > 0 {
+        let _tx_age_secs = if block_time > 0 {
             (now.timestamp() - block_time).max(0)
         } else {
             0

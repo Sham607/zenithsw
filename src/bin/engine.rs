@@ -1,82 +1,61 @@
 use anyhow::Result;
 use chrono::Utc;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use std::time::Duration;
+use tokio::time::sleep;
+
 use zenithsw::config::Config;
 use zenithsw::db::SmartWalletDb;
-use zenithsw::execution::{EvmExecutor, SolanaExecutor};
-use zenithsw::gating::ConfluenceEngine;
+use zenithsw::execution::evm_executor::EvmExecutor;
+use zenithsw::execution::solana_executor::SolanaExecutor;
+use zenithsw::gating::confluence::ConfluenceEngine;
 use zenithsw::indexer::SmartMoneyIndexer;
-use zenithsw::ingestion::FomoScraper;
+use zenithsw::ingestion::fomo_scraper::FomoScraper;
 use zenithsw::ipc::{IpcMessage, IpcServer};
-use zenithsw::models::{ActivityType, Chain};
-use zenithsw::streams::{EvmStreamListener, FomoApiStreamListener, SolanaStreamListener};
+use zenithsw::models::{ActivityType, Chain, ShadowPosition, SmartWallet, WalletTier};
+use zenithsw::streams::evm_stream::EvmStreamListener;
+use zenithsw::streams::fomo_api_stream::FomoApiStreamListener;
+use zenithsw::streams::solana_stream::SolanaStreamListener;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("============================================================");
-    println!(" 🚀 ZENITHSW - SMART MONEY SHADOW ENGINE DAEMON v0.1.0");
-    println!("============================================================");
+    println!("======================================================");
+    println!("       ZENITHSW - SMART MONEY SHADOW ENGINE (DAEMON)  ");
+    println!("======================================================");
 
     let config = Config::load()?;
-    println!("[CONFIG] Database: {}", config.db_path);
-    println!("[CONFIG] IPC Socket: {}", config.ipc_socket_path);
-    println!("[CONFIG] Max Entry Delta: +{:.1}%", config.max_price_delta_pct);
-    println!("[CONFIG] Min Liquidity: ${:.0}", config.min_liquidity_usd);
-    println!("[CONFIG] Position Size: ${:.0}", config.position_size_usd);
-    println!("[CONFIG] Fomo Sync Interval: {}s", config.fomo_sync_interval_sec);
-    if config.fomo_auth_token.is_some() {
-        println!("[CONFIG] FOMO Auth Session: Active 🟢 (Privy Authenticated Direct API)");
+    let db = Arc::new(SmartWalletDb::new(&config.db_path)?);
+
+    // Initial seed: Verified smart wallets into SQLite database
+    let default_seeds = FomoScraper::get_default_seed_traders();
+    println!("[INIT] Syncing {} verified elite smart wallets into database...", default_seeds.len());
+    for s in &default_seeds {
+        let _ = db.upsert_wallet(s);
     }
 
-    let db = Arc::new(SmartWalletDb::new(&config.db_path)?);
+    // Initialize IPC Server
     let ipc_server = Arc::new(IpcServer::new(&config.ipc_socket_path));
     ipc_server.start().await?;
-    println!("[IPC] Server online on {}", config.ipc_socket_path);
 
-    let scraper = Arc::new(FomoScraper::new(Arc::new(config.clone()), db.clone()));
+    // Initialize Stream Listeners
     let sol_listener = Arc::new(SolanaStreamListener::new(&config.solana_rpc_url));
-    let arb_listener = Arc::new(EvmStreamListener::new(&config.arbitrum_rpc_url, Chain::Arbitrum));
+    let arb_listener = Arc::new(EvmStreamListener::new(&config.arbitrum_rpc_url, Chain::Robinhood));
     let base_listener = Arc::new(EvmStreamListener::new(&config.base_rpc_url, Chain::Base));
     let fomo_listener = Arc::new(FomoApiStreamListener::new(Arc::new(config.clone())));
+
+    // Initialize Gating & Executors
     let confluence = Arc::new(ConfluenceEngine::new(config.clone(), db.clone()));
     let sol_exec = Arc::new(SolanaExecutor::new(config.clone(), db.clone()));
     let evm_exec = Arc::new(EvmExecutor::new(config.clone(), db.clone()));
+
+    // Task 1: Direct On-Chain DEX Graph Indexer Worker (Every 10 minutes)
     let indexer = Arc::new(SmartMoneyIndexer::new(&config.solana_rpc_url, &config.arbitrum_rpc_url, db.clone(), 600));
-
-    // Initial sync of Top traders
-    let _ = scraper.sync_to_db().await;
-
-    // Spawn Background FOMO API Poller (Python Subprocess to bypass Cloudflare WAF 430)
-    let poller_handle = std::process::Command::new("python3")
-        .arg("scripts/fomo_poller.py")
-        .spawn();
-    match poller_handle {
-        Ok(child) => println!("[FOMO POLLER] Background syncer child process spawned (PID: {})", child.id()),
-        Err(e) => eprintln!("[FOMO POLLER] Failed to spawn poller child process: {}", e),
-    }
-
-    // Task 0: Background Direct On-Chain DEX Graph Indexer
-    let indexer_task = indexer.clone();
+    let indexer_worker = indexer.clone();
     tokio::spawn(async move {
-        indexer_task.run_background_loop().await;
+        indexer_worker.run_background_loop().await;
     });
 
-    // Task 1: Periodic Database Sync to IPC Broadcast (Syncs Real On-Chain Wallets to TUI)
-    let db_sync = db.clone();
-    let ipc_sync = ipc_server.clone();
-    let sync_sec = config.fomo_sync_interval_sec;
-    tokio::spawn(async move {
-        println!("[FOMO SYNC] Leaderboard IPC broadcast worker started (Interval: {}s)", sync_sec);
-        loop {
-            if let Ok(wallets) = db_sync.get_active_wallets() {
-                let _ = ipc_sync.broadcast(&IpcMessage::WalletSync { wallets });
-            }
-            sleep(Duration::from_secs(sync_sec)).await;
-        }
-    });
-
-    // Task 2: Sub-Second Multi-Chain Activity Stream Poller & Shadow Executor
+    // Task 2: High-Speed Concurrent Stream Ingestion Worker (<100ms Latency)
     let db_stream = db.clone();
     let sol_listener_stream = sol_listener.clone();
     let arb_listener_stream = arb_listener.clone();
@@ -89,33 +68,39 @@ async fn main() -> Result<()> {
     let poll_ms = config.stream_poll_interval_ms;
 
     tokio::spawn(async move {
-        println!("[STREAM WORKER] Multi-Chain + FOMO API Ingestion active (Poll interval: {}ms)", poll_ms);
+        println!("[STREAM WORKER] Concurrent Multi-Chain Streamer online (Cycle: {}ms)", poll_ms);
         loop {
             if let Ok(wallets) = db_stream.get_active_wallets() {
-                for w in wallets {
-                    // Check FOMO API Direct Swaps only for Tier-S Whales (to prevent Cloudflare 429), use Helius RPC for others
-                    let mut activity_opt = if w.tier == zenithsw::models::WalletTier::TierS {
-                        fomo_listener_stream
-                            .check_trader_swaps(&w.handle, &w.address, db_stream.clone())
-                            .await
-                            .ok()
-                            .flatten()
-                    } else {
-                        None
-                    };
+                let check_futures = wallets.into_iter().map(|w: SmartWallet| {
+                    let db = db_stream.clone();
+                    let fomo = fomo_listener_stream.clone();
+                    let sol = sol_listener_stream.clone();
+                    let arb = arb_listener_stream.clone();
+                    let base = base_listener_stream.clone();
 
-                    if activity_opt.is_none() {
-                        activity_opt = match w.chain {
-                            Chain::Solana => sol_listener_stream.check_recent_txs(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
-                            Chain::Arbitrum => arb_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
-                            Chain::Base => base_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
-                            _ => None,
+                    async move {
+                        let mut activity_opt = if w.tier == WalletTier::TierS {
+                            fomo.check_trader_swaps(&w.handle, &w.address, db.clone()).await.ok().flatten()
+                        } else {
+                            None
                         };
+
+                        if activity_opt.is_none() {
+                            activity_opt = match w.chain {
+                                Chain::Solana => sol.check_recent_txs(&w.handle, &w.address, db.clone()).await.ok().flatten(),
+                                Chain::Robinhood | Chain::Arbitrum => arb.check_wallet_activity(&w.handle, &w.address, db.clone()).await.ok().flatten(),
+                                Chain::Base => base.check_wallet_activity(&w.handle, &w.address, db.clone()).await.ok().flatten(),
+                                _ => None,
+                            };
+                        }
+
+                        (w, activity_opt)
                     }
+                });
 
-                    // Stagger RPC requests to avoid rate limits
-                    sleep(Duration::from_millis(150)).await;
+                let results = futures_util::future::join_all(check_futures).await;
 
+                for (w, activity_opt) in results {
                     if let Some(act) = activity_opt {
                         println!("[ACTIVITY 🔥] {} by @{} ({}) -> Token: {} (${:.2})", act.activity_type, act.wallet_handle, act.chain, act.token_symbol, act.amount_usd);
                         let _ = ipc_stream.broadcast(&IpcMessage::ActivityBroadcast { activity: act.clone() });
@@ -145,22 +130,18 @@ async fn main() -> Result<()> {
                                 }
                             }
                         } else if act.activity_type == ActivityType::Buy {
-                            // Fetch real-time pool price & liquidity
-                            let (current_price, pool_liq) = if act.chain == Chain::Solana {
-                                SolanaStreamListener::fetch_token_price(&act.token_mint)
-                                    .await
-                                    .map(|(_, p, l)| (p, l))
-                                    .unwrap_or((0.0, 0.0))
-                            } else {
-                                (act.execution_price_usd, 40000.0)
-                            };
+                            // Fetch real-time pool price & liquidity across Solana/EVM
+                            let (current_price, pool_liq) = SolanaStreamListener::fetch_token_price(&act.token_mint)
+                                .await
+                                .map(|(_, p, l)| (p, l))
+                                .unwrap_or((act.execution_price_usd, 35000.0));
 
                             // Strict Gating & Confluence Evaluation
                             if let Ok(sig) = confluence_stream.evaluate_activity(&act, &w, current_price, pool_liq) {
                                 let _ = ipc_stream.broadcast(&IpcMessage::SignalBroadcast { signal: sig.clone() });
 
                                 if sig.is_passed {
-                                    println!("[EXECUTE] Passed strict gating! Executing shadow buy for {}", sig.token_symbol);
+                                    println!("[EXECUTE 🚀] Passed strict gating! Executing shadow buy for {}", sig.token_symbol);
                                     let pos_opt = match sig.chain {
                                         Chain::Solana => sol_exec_stream.execute_shadow_buy(&sig).await.ok().flatten(),
                                         _ => evm_exec_stream.execute_shadow_buy(&sig).await.ok().flatten(),
@@ -196,14 +177,10 @@ async fn main() -> Result<()> {
                     }
 
                     // Fetch latest live price for open position
-                    let live_price = if pos.chain == Chain::Solana {
-                        SolanaStreamListener::fetch_token_price(&pos.token_mint)
-                            .await
-                            .map(|(_, p, _)| p)
-                            .unwrap_or(0.0)
-                    } else {
-                        pos.current_price
-                    };
+                    let live_price = SolanaStreamListener::fetch_token_price(&pos.token_mint)
+                        .await
+                        .map(|(_, p, _)| p)
+                        .unwrap_or(pos.current_price);
 
                     if live_price > 0.0 {
                         pos.current_price = live_price;
@@ -231,8 +208,8 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         loop {
             let uptime_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-            let tracked_wallets_count = db_heartbeat.get_active_wallets().map(|w| w.len()).unwrap_or(0);
-            let active_positions_count = db_heartbeat.get_active_positions().map(|p| p.len()).unwrap_or(0);
+            let tracked_wallets_count = db_heartbeat.get_active_wallets().map(|w: Vec<SmartWallet>| w.len()).unwrap_or(0);
+            let active_positions_count = db_heartbeat.get_active_positions().map(|p: Vec<ShadowPosition>| p.len()).unwrap_or(0);
 
             let hb = IpcMessage::Heartbeat {
                 uptime_secs,
