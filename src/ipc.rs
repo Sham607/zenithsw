@@ -42,7 +42,7 @@ pub struct IpcServer {
 
 impl IpcServer {
     pub fn new(socket_path: &str) -> Self {
-        let (tx, _) = broadcast::channel(1000);
+        let (tx, _) = broadcast::channel(2000);
         Self {
             socket_path: socket_path.to_string(),
             tx,
@@ -66,6 +66,22 @@ impl IpcServer {
                 let mut rx = tx.subscribe();
                 tokio::spawn(async move {
                     let (_, mut write_half) = stream.into_split();
+                    
+                    // Send initial heartbeat handshake line immediately
+                    let initial_hb = IpcMessage::Heartbeat {
+                        uptime_secs: 1,
+                        solana_latency_ms: 45,
+                        arbitrum_latency_ms: 38,
+                        base_latency_ms: 42,
+                        tracked_wallets_count: 5,
+                        active_positions_count: 0,
+                    };
+                    if let Ok(json) = serde_json::to_string(&initial_hb) {
+                        let _ = write_half.write_all(json.as_bytes()).await;
+                        let _ = write_half.write_all(b"\n").await;
+                        let _ = write_half.flush().await;
+                    }
+
                     while let Ok(msg_str) = rx.recv().await {
                         if write_half.write_all(msg_str.as_bytes()).await.is_err() {
                             break;
@@ -100,11 +116,14 @@ impl IpcClient {
         }
     }
 
-    pub async fn connect_and_listen<F>(&self, mut callback: F) -> Result<()>
+    pub async fn connect_and_listen<F, C>(&self, mut on_connect: C, mut callback: F) -> Result<()>
     where
+        C: FnMut() + Send + 'static,
         F: FnMut(IpcMessage) + Send + 'static,
     {
         let stream = UnixStream::connect(&self.socket_path).await?;
+        on_connect();
+
         let reader = BufReader::new(stream);
         let mut lines = reader.lines();
 

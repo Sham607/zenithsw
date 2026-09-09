@@ -48,52 +48,60 @@ async fn main() -> Result<()> {
         let client = IpcClient::new(&socket_path);
         loop {
             let app_cb = app_ipc.clone();
+            let app_conn = app_ipc.clone();
             let res = client
-                .connect_and_listen(move |msg| {
-                    if let Ok(mut state) = app_cb.lock() {
-                        state.is_connected_ipc = true;
-                        match msg {
-                            IpcMessage::Heartbeat {
-                                solana_latency_ms,
-                                arbitrum_latency_ms,
-                                base_latency_ms,
-                                ..
-                            } => {
-                                state.solana_latency_ms = solana_latency_ms;
-                                state.arbitrum_latency_ms = arbitrum_latency_ms;
-                                state.base_latency_ms = base_latency_ms;
-                            }
-                            IpcMessage::WalletSync { wallets } => {
-                                state.wallets = wallets;
-                            }
-                            IpcMessage::ActivityBroadcast { activity } => {
-                                state.activities.push(activity);
-                                if state.activities.len() > 100 {
-                                    state.activities.remove(0);
+                .connect_and_listen(
+                    move || {
+                        if let Ok(mut state) = app_conn.lock() {
+                            state.is_connected_ipc = true;
+                        }
+                    },
+                    move |msg| {
+                        if let Ok(mut state) = app_cb.lock() {
+                            state.is_connected_ipc = true;
+                            match msg {
+                                IpcMessage::Heartbeat {
+                                    solana_latency_ms,
+                                    arbitrum_latency_ms,
+                                    base_latency_ms,
+                                    ..
+                                } => {
+                                    state.solana_latency_ms = solana_latency_ms;
+                                    state.arbitrum_latency_ms = arbitrum_latency_ms;
+                                    state.base_latency_ms = base_latency_ms;
                                 }
-                            }
-                            IpcMessage::SignalBroadcast { signal } => {
-                                state.signals.push(signal);
-                                if state.signals.len() > 100 {
-                                    state.signals.remove(0);
+                                IpcMessage::WalletSync { wallets } => {
+                                    state.wallets = wallets;
                                 }
-                            }
-                            IpcMessage::PositionUpdate { positions } => {
-                                state.positions = positions;
-                            }
-                            IpcMessage::EngineLog { message, .. } => {
-                                state.add_log(message);
+                                IpcMessage::ActivityBroadcast { activity } => {
+                                    state.activities.push(activity);
+                                    if state.activities.len() > 100 {
+                                        state.activities.remove(0);
+                                    }
+                                }
+                                IpcMessage::SignalBroadcast { signal } => {
+                                    state.signals.push(signal);
+                                    if state.signals.len() > 100 {
+                                        state.signals.remove(0);
+                                    }
+                                }
+                                IpcMessage::PositionUpdate { positions } => {
+                                    state.positions = positions;
+                                }
+                                IpcMessage::EngineLog { message, .. } => {
+                                    state.add_log(message);
+                                }
                             }
                         }
-                    }
-                })
+                    },
+                )
                 .await;
 
             if res.is_err() {
                 if let Ok(mut state) = app_ipc.lock() {
                     state.is_connected_ipc = false;
                 }
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_millis(500)).await;
             }
         }
     });
