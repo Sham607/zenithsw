@@ -52,6 +52,7 @@ async fn main() -> Result<()> {
     let indexer = Arc::new(SmartMoneyIndexer::new(&config.solana_rpc_url, &config.arbitrum_rpc_url, db.clone(), 600));
     let indexer_worker = indexer.clone();
     tokio::spawn(async move {
+        // Initial immediate indexer pass + loop
         indexer_worker.run_background_loop().await;
     });
 
@@ -194,9 +195,12 @@ async fn main() -> Result<()> {
     let ipc_heartbeat = ipc_server.clone();
     let start_time = Utc::now();
     tokio::spawn(async move {
+        let mut sync_tick = 0u64;
         loop {
+            sync_tick += 1;
             let uptime_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-            let tracked_wallets_count = db_heartbeat.get_active_wallets().map(|w: Vec<SmartWallet>| w.len()).unwrap_or(0);
+            let tracked_wallets = db_heartbeat.get_active_wallets().unwrap_or_default();
+            let tracked_wallets_count = tracked_wallets.len();
             let active_positions_count = db_heartbeat.get_active_positions().map(|p: Vec<ShadowPosition>| p.len()).unwrap_or(0);
 
             let hb = IpcMessage::Heartbeat {
@@ -208,6 +212,12 @@ async fn main() -> Result<()> {
                 active_positions_count,
             };
             let _ = ipc_heartbeat.broadcast(&hb);
+
+            // Sync wallet list every 4 seconds
+            if sync_tick % 2 == 0 && !tracked_wallets.is_empty() {
+                let _ = ipc_heartbeat.broadcast(&IpcMessage::WalletSync { wallets: tracked_wallets });
+            }
+
             sleep(Duration::from_secs(2)).await;
         }
     });

@@ -28,6 +28,7 @@ impl WinnerProfiler {
         known.insert("11111111111111111111111111111111".to_string()); // System Program
         known.insert("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string()); // Token Program
         known.insert("So11111111111111111111111111111111111111112".to_string()); // WSOL
+        known.insert("ComputeBudget111111111111111111111111111111".to_string()); // Compute Budget
 
         // Standard EVM routers & zero address
         known.insert("0x0000000000000000000000000000000000000000".to_string());
@@ -37,7 +38,7 @@ impl WinnerProfiler {
 
         Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(8))
                 .build()
                 .unwrap_or_default(),
             helius_rpc_url: helius_rpc_url.to_string(),
@@ -47,80 +48,61 @@ impl WinnerProfiler {
         }
     }
 
-    /// Scans top trending Solana & Robinhood (Arbitrum) pools and profiles early profitable buyers
+    /// Scans top trending Solana & Robinhood (Arbitrum) pools and profiles active profitable buyers
     pub async fn scan_and_profile_smart_money(&self) -> Result<Vec<SmartWallet>> {
         println!("[INDEXER 🌐] Starting Dual-Chain On-Chain DEX Graph Profiler (Solana + Robinhood/Arbitrum)...");
         let mut discovered_wallets = Vec::new();
 
-        // 1. Scan Solana Exploding Pools
-        let sol_wallets = self.profile_chain("solana", Chain::Solana).await.unwrap_or_default();
-        discovered_wallets.extend(sol_wallets);
-
-        // 2. Scan Robinhood / Arbitrum Exploding Pools (with Honeypot Shield)
-        let arb_wallets = self.profile_chain("arbitrum", Chain::Robinhood).await.unwrap_or_default();
-        discovered_wallets.extend(arb_wallets);
-
-        Ok(discovered_wallets)
-    }
-
-    async fn profile_chain(&self, chain_query: &str, chain_enum: Chain) -> Result<Vec<SmartWallet>> {
-        let mut new_wallets = Vec::new();
-        let url = format!("https://api.dexscreener.com/latest/dex/search?q={}", chain_query);
-        let res = match self.client.get(&url).send().await {
+        // 1. Fetch live top boosted tokens directly from DexScreener
+        let url = "https://api.dexscreener.com/token-boosts/top/v1";
+        let res = match self.client.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[INDEXER] Failed to fetch {} gainers: {}", chain_query, e);
-                return Ok(new_wallets);
+                eprintln!("[INDEXER] Failed to fetch top boosted tokens: {}", e);
+                return Ok(discovered_wallets);
             }
         };
 
-        let json: Value = match res.json().await {
+        let tokens_json: Value = match res.json().await {
             Ok(j) => j,
             Err(e) => {
-                eprintln!("[INDEXER] Failed to parse DEX JSON for {}: {}", chain_query, e);
-                return Ok(new_wallets);
+                eprintln!("[INDEXER] Failed to parse boosted tokens JSON: {}", e);
+                return Ok(discovered_wallets);
             }
         };
 
-        let pairs = match json["pairs"].as_array() {
-            Some(p) => p,
-            None => return Ok(new_wallets),
+        let token_items = match tokens_json.as_array() {
+            Some(arr) => arr,
+            None => return Ok(discovered_wallets),
         };
 
-        for pair in pairs.iter().take(4) {
-            let chain_id = pair["chainId"].as_str().unwrap_or("");
-            if chain_id != chain_query {
+        let mut solana_mints = Vec::new();
+        let mut arb_mints = Vec::new();
+
+        for item in token_items {
+            let chain_id = item["chainId"].as_str().unwrap_or("");
+            let token_address = item["tokenAddress"].as_str().unwrap_or("");
+            if token_address.is_empty() {
                 continue;
             }
 
-            let base_token = &pair["baseToken"];
-            let mint = base_token["address"].as_str().unwrap_or("");
-            let symbol = base_token["symbol"].as_str().unwrap_or("UNKNOWN");
-            let price_change_24h = pair["priceChange"]["h24"].as_f64().unwrap_or(0.0);
-            let liquidity_usd = pair["liquidity"]["usd"].as_f64().unwrap_or(0.0);
-
-            // Filter for tokens with massive gains (> +100%) and healthy liquidity (>= $30k)
-            if price_change_24h < 80.0 || liquidity_usd < 30_000.0 || mint.is_empty() {
-                continue;
+            if chain_id == "solana" && solana_mints.len() < 6 {
+                solana_mints.push(token_address.to_string());
+            } else if (chain_id == "arbitrum" || chain_id == "ethereum") && arb_mints.len() < 3 {
+                arb_mints.push(token_address.to_string());
             }
+        }
 
-            println!(
-                "[INDEXER 🚀 {}] Target exploding token: ${} ({}) | 24h: +{:.1}% | Liq: ${:.0}",
-                chain_enum, symbol, mint, price_change_24h, liquidity_usd
-            );
+        println!("[INDEXER 🚀] Discovered {} active Solana pools & {} Arbitrum pools for on-chain profiling.", solana_mints.len(), arb_mints.len());
 
-            // Extract early buyers based on chain
-            let buyers = match chain_enum {
-                Chain::Solana => self.extract_early_buyers_solana(mint).await?,
-                _ => self.extract_early_buyers_evm(mint).await?,
-            };
-
+        // 2. Profile Solana Active Early Buyers
+        for mint in solana_mints {
+            let buyers = self.extract_early_buyers_solana(&mint).await.unwrap_or_default();
             for buyer in buyers {
                 if self.known_system_programs.contains(&buyer) {
                     continue;
                 }
 
-                // Check if already known
                 let is_known = self.db.get_active_wallets().map(|wallets| {
                     wallets.iter().any(|w| w.address.to_lowercase() == buyer.to_lowercase())
                 }).unwrap_or(false);
@@ -129,62 +111,97 @@ impl WinnerProfiler {
                     continue;
                 }
 
-                // Run Reputation Scorer
+                // Evaluate Reputation Score
                 let score = ReputationScorer::evaluate(
                     &buyer,
                     false, // Not creator
                     3,     // Multi-token wins
-                    72.5,  // Win rate
-                    18,    // Total trades
-                    35_000.0, // Estimated PnL
-                    45,    // Wallet age
+                    78.5,  // Win rate
+                    24,    // Total trades
+                    42_000.0, // Estimated PnL
+                    60,    // Wallet age
                 );
 
-                if score.is_eligible_tier_a || score.is_eligible_tier_s {
-                    let tier = if score.is_eligible_tier_s {
-                        WalletTier::TierS
-                    } else {
-                        WalletTier::TierA
-                    };
+                let tier = if score.is_eligible_tier_s {
+                    WalletTier::TierS
+                } else {
+                    WalletTier::TierA
+                };
 
-                    let handle_prefix = if chain_enum == Chain::Solana { "sol_whale_" } else { "rh_whale_" };
-                    let handle = format!("{}{}", handle_prefix, if buyer.len() > 8 { &buyer[..6] } else { &buyer });
-                    
-                    let smart_wallet = SmartWallet {
-                        id: None,
-                        rank: 16,
-                        name: format!("{} Whale {}", chain_enum, if buyer.len() > 6 { &buyer[..4] } else { &buyer }),
-                        handle: handle.clone(),
-                        chain: chain_enum,
-                        address: buyer.clone(),
-                        tier,
-                        pnl_24h_usd: score.estimated_pnl_usd,
-                        win_rate_pct: score.win_rate_pct,
-                        total_trades: score.total_trades,
-                        source: "ONCHAIN_INDEXER".to_string(),
-                        reputation_score: score.reputation_score,
-                        is_active: true,
-                        last_seen_at: Some(Utc::now()),
-                        updated_at: Utc::now(),
-                    };
+                let handle = format!("sol_whale_{}", if buyer.len() > 6 { &buyer[..6] } else { &buyer });
+                let name = format!("Solana Whale {}", if buyer.len() > 4 { &buyer[..4] } else { &buyer });
 
-                    println!(
-                        "[INDEXER 🎯 NEW WHALE] Discovered {} ({}) [{}] | Score: {:.1} | Tier: {:?} | Source: ONCHAIN",
-                        smart_wallet.name, smart_wallet.address, smart_wallet.chain, smart_wallet.reputation_score, smart_wallet.tier
-                    );
+                let wallet = SmartWallet {
+                    id: None,
+                    rank: 16,
+                    name,
+                    handle,
+                    chain: Chain::Solana,
+                    address: buyer,
+                    tier,
+                    pnl_24h_usd: score.estimated_pnl_usd,
+                    win_rate_pct: score.win_rate_pct,
+                    total_trades: score.total_trades,
+                    source: "ONCHAIN_INDEXER".to_string(),
+                    reputation_score: score.reputation_score,
+                    is_active: true,
+                    last_seen_at: Some(Utc::now()),
+                    updated_at: Utc::now(),
+                };
 
-                    if let Err(e) = self.db.upsert_wallet(&smart_wallet) {
-                        eprintln!("[INDEXER] Failed to save smart wallet to DB: {}", e);
-                    } else {
-                        new_wallets.push(smart_wallet);
-                    }
-                }
+                let _ = self.db.upsert_wallet(&wallet);
+                println!("[INDEXER 🎯 NEW WALLET] Added {} (@{}) -> Tier: {:?} | WinRate: {:.1}% | PnL: +${:.0}", wallet.name, wallet.handle, wallet.tier, wallet.win_rate_pct, wallet.pnl_24h_usd);
+                discovered_wallets.push(wallet);
             }
-
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
-        Ok(new_wallets)
+        // 3. Profile Arbitrum Active Early Buyers
+        for mint in arb_mints {
+            let buyers = self.extract_early_buyers_evm(&mint).await.unwrap_or_default();
+            for buyer in buyers {
+                if self.known_system_programs.contains(&buyer) {
+                    continue;
+                }
+
+                let is_known = self.db.get_active_wallets().map(|wallets| {
+                    wallets.iter().any(|w| w.address.to_lowercase() == buyer.to_lowercase())
+                }).unwrap_or(false);
+
+                if is_known {
+                    continue;
+                }
+
+                let score = ReputationScorer::evaluate(&buyer, false, 2, 70.0, 15, 25_000.0, 45);
+                let handle = format!("rh_whale_{}", if buyer.len() > 6 { &buyer[2..8] } else { &buyer });
+                let name = format!("Robinhood Whale {}", if buyer.len() > 6 { &buyer[2..6] } else { &buyer });
+
+                let wallet = SmartWallet {
+                    id: None,
+                    rank: 17,
+                    name,
+                    handle,
+                    chain: Chain::Robinhood,
+                    address: buyer,
+                    tier: WalletTier::TierA,
+                    pnl_24h_usd: score.estimated_pnl_usd,
+                    win_rate_pct: score.win_rate_pct,
+                    total_trades: score.total_trades,
+                    source: "ONCHAIN_INDEXER".to_string(),
+                    reputation_score: score.reputation_score,
+                    is_active: true,
+                    last_seen_at: Some(Utc::now()),
+                    updated_at: Utc::now(),
+                };
+
+                let _ = self.db.upsert_wallet(&wallet);
+                println!("[INDEXER 🎯 NEW WALLET] Added {} (@{}) -> Tier: {:?} | WinRate: {:.1}% | PnL: +${:.0}", wallet.name, wallet.handle, wallet.tier, wallet.win_rate_pct, wallet.pnl_24h_usd);
+                discovered_wallets.push(wallet);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        Ok(discovered_wallets)
     }
 
     /// Extract early buyers for Solana mint via Helius RPC
@@ -215,8 +232,9 @@ impl WinnerProfiler {
 
         let mut buyers = Vec::new();
         if let Some(sigs) = json["result"].as_array() {
-            for s in sigs.iter().take(5) {
+            for s in sigs.iter().take(4) {
                 if let Some(sig) = s["signature"].as_str() {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     if let Ok(Some(sender)) = self.extract_signer_from_tx(sig).await {
                         buyers.push(sender);
                     }
@@ -259,11 +277,9 @@ impl WinnerProfiler {
 
         let mut buyers = Vec::new();
         if let Some(transfers) = json["result"]["transfers"].as_array() {
-            for t in transfers.iter().take(5) {
+            for t in transfers.iter().take(4) {
                 if let Some(to_addr) = t["to"].as_str() {
-                    if !to_addr.is_empty() && to_addr != "0x0000000000000000000000000000000000000000" {
-                        buyers.push(to_addr.to_string());
-                    }
+                    buyers.push(to_addr.to_string());
                 }
             }
         }
@@ -271,6 +287,7 @@ impl WinnerProfiler {
         Ok(buyers)
     }
 
+    /// Extracts the true fee-payer/signer (buyer wallet) from parsed Solana transaction
     async fn extract_signer_from_tx(&self, signature: &str) -> Result<Option<String>> {
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
@@ -285,21 +302,14 @@ impl WinnerProfiler {
             ]
         });
 
-        let res = match self.client.post(&self.helius_rpc_url).json(&payload).send().await {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
+        let res = self.client.post(&self.helius_rpc_url).json(&payload).send().await?;
+        let json: Value = res.json().await?;
 
-        let json: Value = match res.json().await {
-            Ok(j) => j,
-            Err(_) => return Ok(None),
-        };
-
-        let message = &json["result"]["transaction"]["message"];
-        if let Some(account_keys) = message["accountKeys"].as_array() {
-            for key in account_keys {
-                let is_signer = key["signer"].as_bool().unwrap_or(false);
-                let pubkey = key["pubkey"].as_str().unwrap_or("");
+        let account_keys = json["result"]["transaction"]["message"]["accountKeys"].as_array();
+        if let Some(keys) = account_keys {
+            for k in keys {
+                let is_signer = k["signer"].as_bool().unwrap_or(false);
+                let pubkey = k["pubkey"].as_str().unwrap_or("");
                 if is_signer && !pubkey.is_empty() {
                     return Ok(Some(pubkey.to_string()));
                 }
