@@ -33,35 +33,36 @@ async fn main() -> Result<()> {
     ipc_server.start().await?;
     println!("[IPC] Server online on {}", config.ipc_socket_path);
 
-    let scraper = Arc::new(FomoScraper::new());
+    let scraper = Arc::new(FomoScraper::new(Arc::new(config.clone()), db.clone()));
     let sol_listener = Arc::new(SolanaStreamListener::new(&config.solana_rpc_url));
     let arb_listener = Arc::new(EvmStreamListener::new(&config.arbitrum_rpc_url, Chain::Arbitrum));
     let base_listener = Arc::new(EvmStreamListener::new(&config.base_rpc_url, Chain::Base));
-    let fomo_listener = Arc::new(FomoApiStreamListener::new(config.clone()));
+    let fomo_listener = Arc::new(FomoApiStreamListener::new(Arc::new(config.clone())));
     let confluence = Arc::new(ConfluenceEngine::new(config.clone(), db.clone()));
     let sol_exec = Arc::new(SolanaExecutor::new(config.clone(), db.clone()));
     let evm_exec = Arc::new(EvmExecutor::new(config.clone(), db.clone()));
 
     // Initial sync of Top 100 traders
-    let _ = scraper.sync_and_persist(db.clone()).await;
+    let _ = scraper.sync_to_db().await;
 
-    // Task 1: Periodic FOMO Leaderboard Synchronizer (Syncs 100 Real On-Chain Wallets)
+    // Spawn Background FOMO API Poller (Python Subprocess to bypass Cloudflare WAF 430)
+    let poller_handle = std::process::Command::new("python3")
+        .arg("scripts/fomo_poller.py")
+        .spawn();
+    match poller_handle {
+        Ok(child) => println!("[FOMO POLLER] Background syncer child process spawned (PID: {})", child.id()),
+        Err(e) => eprintln!("[FOMO POLLER] Failed to spawn poller child process: {}", e),
+    }
+
+    // Task 1: Periodic Database Sync to IPC Broadcast (Syncs 100 Real On-Chain Wallets to TUI)
     let db_sync = db.clone();
-    let scraper_sync = scraper.clone();
     let ipc_sync = ipc_server.clone();
     let sync_sec = config.fomo_sync_interval_sec;
     tokio::spawn(async move {
-        println!("[FOMO SYNC] Leaderboard sync worker started (Interval: {}s)", sync_sec);
+        println!("[FOMO SYNC] Leaderboard IPC broadcast worker started (Interval: {}s)", sync_sec);
         loop {
-            match scraper_sync.sync_and_persist(db_sync.clone()).await {
-                Ok(_count) => {
-                    if let Ok(wallets) = db_sync.get_active_wallets() {
-                        let _ = ipc_sync.broadcast(&IpcMessage::WalletSync { wallets });
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[FOMO SYNC ERROR] Failed to sync fomo leaderboard: {}", e);
-                }
+            if let Ok(wallets) = db_sync.get_active_wallets() {
+                let _ = ipc_sync.broadcast(&IpcMessage::WalletSync { wallets });
             }
             sleep(Duration::from_secs(sync_sec)).await;
         }

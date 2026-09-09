@@ -8,16 +8,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub struct FomoApiStreamListener {
-    config: Config,
+    config: Arc<Config>,
     client: reqwest::Client,
     processed_swap_ids: Arc<Mutex<HashSet<String>>>,
     user_id_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl FomoApiStreamListener {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Arc<Config>) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(8))
             .build()
             .unwrap_or_default();
         Self {
@@ -31,18 +31,20 @@ impl FomoApiStreamListener {
     /// Refresh User ID Cache from Leaderboard
     pub async fn refresh_user_ids(&self) -> Result<()> {
         if let Some(token) = &self.config.fomo_auth_token {
-            let api_url = "https://prod-api.fomo.family/v2/leaderboard?timeframe=24h";
-            let mut req = self.client.get(api_url)
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                .header("Accept", "application/json")
-                .header("Origin", "https://fomo.family")
-                .header("Referer", "https://fomo.family/");
-
-            if !token.starts_with("Bearer ") {
-                req = req.header("Authorization", format!("Bearer {}", token));
+            let auth_header = if token.starts_with("Bearer ") {
+                token.to_string()
             } else {
-                req = req.header("Authorization", token);
-            }
+                format!("Bearer {}", token)
+            };
+
+            let api_url = "https://prod-api.fomo.family/v2/leaderboard?timeframe=24h";
+            let req = self.client.get(api_url)
+                .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .header("Origin", "https://fomo.family")
+                .header("Referer", "https://fomo.family/")
+                .header("Accept", "application/json, text/plain, */*")
+                .header("privy-app-id", "cm6h485v300n3zj9yl6vpedq7")
+                .header("Authorization", auth_header);
 
             if let Ok(resp) = req.send().await {
                 if resp.status().is_success() {
@@ -93,18 +95,20 @@ impl FomoApiStreamListener {
             }
         };
 
-        let swaps_url = format!("https://prod-api.fomo.family/v2/users/{}/swaps", user_id);
-        let mut req = self.client.get(&swaps_url)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            .header("Accept", "application/json")
-            .header("Origin", "https://fomo.family")
-            .header("Referer", "https://fomo.family/");
-
-        if !token.starts_with("Bearer ") {
-            req = req.header("Authorization", format!("Bearer {}", token));
+        let auth_header = if token.starts_with("Bearer ") {
+            token.to_string()
         } else {
-            req = req.header("Authorization", token);
-        }
+            format!("Bearer {}", token)
+        };
+
+        let swaps_url = format!("https://prod-api.fomo.family/v2/users/{}/swaps", user_id);
+        let req = self.client.get(&swaps_url)
+            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .header("Origin", "https://fomo.family")
+            .header("Referer", "https://fomo.family/")
+            .header("Accept", "application/json, text/plain, */*")
+            .header("privy-app-id", "cm6h485v300n3zj9yl6vpedq7")
+            .header("Authorization", auth_header);
 
         let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
@@ -121,50 +125,38 @@ impl FomoApiStreamListener {
                     continue;
                 }
 
-                // Check Deduplication Cache
+                // Check deduplication
                 {
-                    let mut cache = self.processed_swap_ids.lock().unwrap();
-                    if cache.contains(swap_id) {
+                    let mut processed = self.processed_swap_ids.lock().unwrap();
+                    if processed.contains(swap_id) {
                         continue;
                     }
-                    cache.insert(swap_id.to_string());
-                    if cache.len() > 2000 {
-                        cache.clear();
+                    processed.insert(swap_id.to_string());
+                    if processed.len() > 1000 {
+                        let to_remove: Vec<String> = processed.iter().take(200).cloned().collect();
+                        for r in to_remove {
+                            processed.remove(&r);
+                        }
                     }
                 }
 
                 let in_token = swap.get("inTokenAddress").and_then(|v| v.as_str()).unwrap_or("");
                 let out_token = swap.get("outTokenAddress").and_then(|v| v.as_str()).unwrap_or("");
-                let in_usd = swap.get("humanUsdAmountIn").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let out_usd = swap.get("humanUsdAmountOut").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let amount_usd = if in_usd > 0.0 { in_usd } else { out_usd };
+                let amount_usd = swap.get("humanUsdAmountIn").and_then(|v| v.as_f64())
+                    .or_else(|| swap.get("humanUsdAmountOut").and_then(|v| v.as_f64()))
+                    .unwrap_or(50.0);
 
-                let is_in_collateral = in_token == "So11111111111111111111111111111111111111112"
-                    || in_token == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-                    || in_token == "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+                let is_buy = in_token.contains("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v") // USDC
+                    || in_token.contains("So11111111111111111111111111111111111111112") // SOL
+                    || in_token.contains("0x");
 
-                let is_out_collateral = out_token == "So11111111111111111111111111111111111111112"
-                    || out_token == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-                    || out_token == "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
-
-                let (activity_type, token_mint) = if is_in_collateral && !is_out_collateral {
-                    (ActivityType::Buy, out_token.to_string())
-                } else if !is_in_collateral && is_out_collateral {
-                    (ActivityType::Sell, in_token.to_string())
+                let (activity_type, token_mint, token_symbol) = if is_buy {
+                    (ActivityType::Buy, out_token.to_string(), "FOMO_COIN".to_string())
                 } else {
-                    continue;
+                    (ActivityType::Sell, in_token.to_string(), "FOMO_COIN".to_string())
                 };
 
-                if token_mint.is_empty() {
-                    continue;
-                }
-
-                // Fetch real-time token symbol & price
-                let (token_symbol, price_usd, _liq) = crate::streams::SolanaStreamListener::fetch_token_price(&token_mint)
-                    .await
-                    .unwrap_or(("TOKEN".to_string(), 0.0, 0.0));
-
-                let act = WalletActivity {
+                let activity = WalletActivity {
                     id: None,
                     wallet_handle: handle.to_string(),
                     wallet_address: solana_address.to_string(),
@@ -173,14 +165,14 @@ impl FomoApiStreamListener {
                     token_symbol,
                     token_mint,
                     amount_usd,
-                    token_amount: 1000.0,
-                    execution_price_usd: price_usd,
-                    tx_signature: format!("FOMO-{}", swap_id),
+                    token_amount: 1.0,
+                    execution_price_usd: 0.0, // Resolved later via Jupiter
+                    tx_signature: swap_id.to_string(),
                     timestamp: Utc::now(),
                 };
 
-                let _ = db.insert_activity(&act);
-                return Ok(Some(act));
+                let _ = db.insert_activity(&activity);
+                return Ok(Some(activity));
             }
         }
 

@@ -181,7 +181,7 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
     let header = Row::new(vec![
-        "Rank", "Name / Profile", "Handle", "Chain", "Tier", "24h Realized PnL", "Win Rate", "Status",
+        "Rank", "Name / Profile", "Handle", "Chain", "Tier", "Total Realized PnL", "Win Rate", "Trades", "Status",
     ])
     .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     .bottom_margin(1);
@@ -190,10 +190,18 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
         .wallets
         .iter()
         .map(|w| {
-            let (tier_color, tier_str) = match w.tier {
-                WalletTier::TierS => (Color::Rgb(255, 215, 0), "[TIER-S 👑]"),
-                WalletTier::TierA => (Color::Rgb(0, 200, 255), "[TIER-A ⚡]"),
-                WalletTier::TierB => (Color::DarkGray, "[TIER-B]"),
+            let (tier_color, tier_str, status_str) = match w.tier {
+                WalletTier::TierS => (Color::Rgb(255, 215, 0), "[TIER-S 👑]", "EXECUTE 🟢"),
+                WalletTier::TierA => (Color::Rgb(0, 200, 255), "[TIER-A ⚡]", "EXECUTE 🟢"),
+                WalletTier::TierB => (Color::DarkGray, "[TIER-B]", "MONITOR 🟡"),
+            };
+
+            let formatted_pnl = if w.pnl_24h_usd >= 1_000_000.0 {
+                format!("+${:.2}M", w.pnl_24h_usd / 1_000_000.0)
+            } else if w.pnl_24h_usd >= 1_000.0 {
+                format!("+${:.1}k", w.pnl_24h_usd / 1_000.0)
+            } else {
+                format!("+${:.2}", w.pnl_24h_usd)
             };
 
             Row::new(vec![
@@ -202,9 +210,10 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
                 format!("@{}", w.handle),
                 w.chain.to_string(),
                 tier_str.to_string(),
-                format!("+${:.2}", w.pnl_24h_usd),
+                formatted_pnl,
                 format!("{:.1}%", w.win_rate_pct),
-                if w.is_active { "ACTIVE 🟢".to_string() } else { "PAUSED 🟡".to_string() },
+                w.total_trades.to_string(),
+                status_str.to_string(),
             ])
             .style(Style::default().fg(tier_color))
         })
@@ -214,13 +223,14 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Length(6),
-            Constraint::Percentage(20),
             Constraint::Percentage(18),
+            Constraint::Percentage(16),
+            Constraint::Percentage(10),
             Constraint::Percentage(12),
             Constraint::Percentage(14),
-            Constraint::Percentage(15),
             Constraint::Percentage(10),
-            Constraint::Percentage(10),
+            Constraint::Percentage(8),
+            Constraint::Percentage(12),
         ],
     )
     .header(header)

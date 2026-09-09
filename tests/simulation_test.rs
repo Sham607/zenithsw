@@ -147,17 +147,17 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
     let confluence = ConfluenceEngine::new(config, db.clone());
     let now = Utc::now();
 
-    // Tier-A Hunter
-    let wallet_a = SmartWallet {
+    // Tier-B Hunter (Requires Confluence >= 2)
+    let wallet_b = SmartWallet {
         id: None,
-        rank: 15,
-        name: "AlphaHunter".to_string(),
-        handle: "alphahunter".to_string(),
+        rank: 25,
+        name: "BetaHunter".to_string(),
+        handle: "betahunter".to_string(),
         chain: Chain::Solana,
         address: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".to_string(),
-        tier: WalletTier::TierA,
-        pnl_24h_usd: 45000.0,
-        win_rate_pct: 70.0,
+        tier: WalletTier::TierB,
+        pnl_24h_usd: 15000.0,
+        win_rate_pct: 60.0,
         total_trades: 12,
         is_active: true,
         last_seen_at: None,
@@ -166,7 +166,7 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
 
     let activity = WalletActivity {
         id: None,
-        wallet_handle: "alphahunter".to_string(),
+        wallet_handle: "betahunter".to_string(),
         wallet_address: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".to_string(),
         chain: Chain::Solana,
         activity_type: ActivityType::Buy,
@@ -181,7 +181,7 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
 
     // Case 1: Low Liquidity $15,000 < $30,000 -> Should REJECT
     let signal_liq = confluence
-        .evaluate_activity(&activity, &wallet_a, 1.01, 15000.0)
+        .evaluate_activity(&activity, &wallet_b, 1.01, 15000.0)
         .unwrap();
     assert!(!signal_liq.is_passed);
     assert!(signal_liq
@@ -189,15 +189,15 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
         .unwrap()
         .contains("LIQUIDITY_TOO_LOW"));
 
-    // Case 2: Good Liquidity $45k, but only 1 Tier-A buyer -> Should REJECT for confluence
+    // Case 2: Good Liquidity $45k, but only 1 Tier-B buyer -> Should REJECT for confluence
     let signal_conf = confluence
-        .evaluate_activity(&activity, &wallet_a, 1.01, 45000.0)
+        .evaluate_activity(&activity, &wallet_b, 1.01, 45000.0)
         .unwrap();
     assert!(!signal_conf.is_passed);
     assert!(signal_conf
         .rejection_reason
         .unwrap()
-        .contains("TIER_CONFLUENCE_REQUIRED"));
+        .contains("TIER_B_CONFLUENCE_REQUIRED"));
 
     // Insert another buyer for the same mint to achieve 2x confluence
     let activity2 = WalletActivity {
@@ -218,7 +218,7 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
     db.insert_activity(&activity2).unwrap();
 
     let signal_conf_pass = confluence
-        .evaluate_activity(&activity, &wallet_a, 1.02, 45000.0)
+        .evaluate_activity(&activity, &wallet_b, 1.02, 45000.0)
         .unwrap();
     assert!(signal_conf_pass.is_passed);
 }

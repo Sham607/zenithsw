@@ -84,14 +84,16 @@ impl ConfluenceEngine {
             }
         }
 
-        // Gating Check B: Multi-Wallet Confluence Rule (Tier-S instant, Tier-A requires 2+ buyers in 5m)
+        // Gating Check B: Multi-Wallet Confluence Rule
+        // Tier-S & Tier-A (Rank 1-15): Direct copy execution
+        // Tier-B (Rank >15): Passive monitoring only, requires >= 2 multi-wallet confluence
         let confluence_count = self.db.count_recent_buyers_for_mint(&activity.token_mint, 300).unwrap_or(1);
 
-        if wallet.tier != WalletTier::TierS && confluence_count < 2 {
+        if wallet.tier == WalletTier::TierB && confluence_count < 2 {
             is_passed = false;
             if rejection_reason.is_none() {
                 rejection_reason = Some(format!(
-                    "TIER_CONFLUENCE_REQUIRED (Tier: {}, Buyers: {} < 2)",
+                    "TIER_B_CONFLUENCE_REQUIRED (Tier: {}, Buyers: {} < 2)",
                     wallet.tier, confluence_count
                 ));
             }
