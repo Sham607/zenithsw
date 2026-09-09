@@ -5,41 +5,62 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub struct SolanaStreamListener {
-    rpc_url: String,
+    rpc_urls: Vec<String>,
+    current_rpc_idx: AtomicUsize,
     last_signatures: Arc<Mutex<HashMap<String, String>>>,
     processed_signatures: Arc<Mutex<HashSet<String>>>,
     client: Client,
 }
 
 impl SolanaStreamListener {
-    pub fn new(rpc_url: &str) -> Self {
+    pub fn new(primary_rpc_url: &str) -> Self {
+        let mut rpc_urls = Vec::new();
+        if !primary_rpc_url.is_empty() {
+            rpc_urls.push(primary_rpc_url.to_string());
+        }
+        // High-availability public & dedicated fallbacks
+        rpc_urls.push("https://solana-rpc.publicnode.com".to_string());
+        rpc_urls.push("https://rpc.ankr.com/solana".to_string());
+        rpc_urls.push("https://api.mainnet-beta.solana.com".to_string());
+
         Self {
-            rpc_url: rpc_url.to_string(),
+            rpc_urls,
+            current_rpc_idx: AtomicUsize::new(0),
             last_signatures: Arc::new(Mutex::new(HashMap::new())),
             processed_signatures: Arc::new(Mutex::new(HashSet::new())),
             client: Client::builder()
-                .timeout(Duration::from_secs(6))
+                .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap_or_default(),
         }
     }
 
-    /// Checks the latest on-chain transaction for a Solana smart wallet via standard JSON-RPC
+    fn get_rpc_url(&self) -> String {
+        let idx = self.current_rpc_idx.load(Ordering::Relaxed) % self.rpc_urls.len();
+        self.rpc_urls[idx].clone()
+    }
+
+    fn rotate_rpc(&self) {
+        self.current_rpc_idx.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Checks the latest on-chain transaction for a Solana smart wallet with Multi-RPC Failover
     pub async fn check_recent_txs(
         &self,
         handle: &str,
         address: &str,
         db: Arc<SmartWalletDb>,
     ) -> Result<Option<WalletActivity>> {
-        if self.rpc_url.is_empty() {
+        if self.rpc_urls.is_empty() {
             return Ok(None);
         }
 
-        // 1. Get latest signature via getSignaturesForAddress
+        // 1. Get latest signature via getSignaturesForAddress with RPC failover
         let sig_payload = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -50,17 +71,25 @@ impl SolanaStreamListener {
             ]
         });
 
-        let sig_res = match self.client.post(&self.rpc_url).json(&sig_payload).send().await {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
+        let mut sig_items = None;
+        for _ in 0..self.rpc_urls.len() {
+            let rpc = self.get_rpc_url();
+            match self.client.post(&rpc).json(&sig_payload).send().await {
+                Ok(res) if res.status().is_success() => {
+                    if let Ok(sig_json) = res.json::<Value>().await {
+                        if let Some(arr) = sig_json["result"].as_array() {
+                            sig_items = Some(arr.clone());
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    self.rotate_rpc(); // Failover to next RPC on 429 / timeout
+                }
+            }
+        }
 
-        let sig_json: Value = match sig_res.json().await {
-            Ok(j) => j,
-            Err(_) => return Ok(None),
-        };
-
-        let sig_items = match sig_json["result"].as_array() {
+        let sig_items = match sig_items {
             Some(arr) if !arr.is_empty() => arr,
             _ => return Ok(None),
         };
@@ -88,8 +117,7 @@ impl SolanaStreamListener {
                     return Ok(None); // No new transaction, skip
                 }
             } else {
-                // First time discovering this wallet on startup:
-                // Record baseline signature. If tx is older than 2 minutes, ignore as historical past trade
+                // First time baseline registration on startup
                 last_map.insert(address.to_string(), signature.to_string());
                 if tx_age_secs > 120 {
                     return Ok(None);
@@ -112,7 +140,7 @@ impl SolanaStreamListener {
             }
         }
 
-        // 2. Fetch full parsed transaction via JSON-RPC getTransaction
+        // 2. Fetch full parsed transaction via JSON-RPC getTransaction with RPC failover
         let tx_payload = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -126,24 +154,36 @@ impl SolanaStreamListener {
             ]
         });
 
-        let tx_res = match self.client.post(&self.rpc_url).json(&tx_payload).send().await {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
+        let mut tx_result = None;
+        for _ in 0..self.rpc_urls.len() {
+            let rpc = self.get_rpc_url();
+            match self.client.post(&rpc).json(&tx_payload).send().await {
+                Ok(res) if res.status().is_success() => {
+                    if let Ok(tx_json) = res.json::<Value>().await {
+                        if !tx_json["result"].is_null() {
+                            tx_result = Some(tx_json["result"].clone());
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    self.rotate_rpc();
+                }
+            }
+        }
+
+        let tx_result = match tx_result {
+            Some(res) => res,
+            None => return Ok(None),
         };
 
-        let tx_json: Value = match tx_res.json().await {
-            Ok(j) => j,
-            Err(_) => return Ok(None),
-        };
-
-        let tx_result = &tx_json["result"];
         let meta = &tx_result["meta"];
         if meta.is_null() {
             return Ok(None);
         }
 
         let pre_token_balances = meta["preTokenBalances"].as_array();
-        let post_token_balances = meta["postTokenBalances"].as_array();
+        let post_token_balances = meta["post_tokenBalances"].as_array().or_else(|| meta["postTokenBalances"].as_array());
 
         let mut token_mint = "".to_string();
         let mut token_symbol = "UNKNOWN".to_string();
@@ -265,7 +305,7 @@ impl SolanaStreamListener {
             execution_price_usd = price;
         }
 
-        // If DEX price is not yet available, derive price from native SOL spent on-chain
+        // Derive price from native SOL spent on-chain if DEX indexer has latency
         if execution_price_usd <= 0.0 && native_sol_delta > 0.0 && token_amount > 0.0 {
             execution_price_usd = (native_sol_delta * sol_price_usd) / token_amount;
         }
