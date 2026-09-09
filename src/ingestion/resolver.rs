@@ -4,11 +4,13 @@ use std::collections::HashMap;
 pub struct WalletResolver;
 
 impl WalletResolver {
-    pub fn resolve_static_address(handle: &str, chain: Chain) -> String {
+    pub fn resolve_chain_and_address(handle: &str, rank: u32) -> (Chain, String) {
         let mut map: HashMap<&str, (&str, Chain)> = HashMap::new();
         // Seed verified addresses mapped from on-chain & social intelligence
         map.insert("ether_monk", ("EZcv4WSEmX7WopTJc2bfrdaYovpKcxk81s9zXiQ3Zm9i", Chain::Solana));
+        map.insert("logan_lim", ("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1", Chain::Solana));
         map.insert("loganlim_x", ("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1", Chain::Solana));
+        map.insert("thesolstice", ("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", Chain::Solana));
         map.insert("The__Solstice", ("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", Chain::Solana));
         map.insert("0xAvast", ("0x7163aE1B5aEa2F09EBc609c52b4DCAC0A7a4bC2D", Chain::Robinhood));
         map.insert("Onchainmetrics", ("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM", Chain::Solana));
@@ -18,10 +20,32 @@ impl WalletResolver {
         map.insert("airtightfish", ("8vYm3nK9wQ2pL7rF1tZ5sD4jG6hB9xN2cE1vR8mP3kL7", Chain::Solana));
         map.insert("brainless", ("4tL8yD6Gz9W1kR5fT7vB4nQ8jP2mE1sX2wno6p18m3yL", Chain::Solana));
 
+        if let Some((addr, chain)) = map.get(handle) {
+            (*chain, addr.to_string())
+        } else {
+            // Default chain distribution based on rank
+            let chain = if rank % 3 == 0 {
+                Chain::Robinhood
+            } else if rank % 5 == 0 {
+                Chain::Base
+            } else {
+                Chain::Solana
+            };
+            let addr = Self::resolve_static_address(handle, chain);
+            (chain, addr)
+        }
+    }
+
+    pub fn resolve_static_address(handle: &str, chain: Chain) -> String {
+        let mut map: HashMap<&str, (&str, Chain)> = HashMap::new();
+        map.insert("ether_monk", ("EZcv4WSEmX7WopTJc2bfrdaYovpKcxk81s9zXiQ3Zm9i", Chain::Solana));
+        map.insert("logan_lim", ("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1", Chain::Solana));
+        map.insert("thesolstice", ("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", Chain::Solana));
+        map.insert("0xAvast", ("0x7163aE1B5aEa2F09EBc609c52b4DCAC0A7a4bC2D", Chain::Robinhood));
+
         if let Some((addr, _)) = map.get(handle) {
             addr.to_string()
         } else {
-            // Generate deterministic mock address if handle not in map yet
             match chain {
                 Chain::Solana => {
                     let h_bytes = handle.as_bytes();
