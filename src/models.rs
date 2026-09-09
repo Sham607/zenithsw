@@ -1,0 +1,181 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Chain {
+    Solana,
+    Robinhood,
+    Arbitrum,
+    Base,
+    Ethereum,
+}
+
+impl fmt::Display for Chain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Chain::Solana => write!(f, "SOLANA"),
+            Chain::Robinhood => write!(f, "ROBINHOOD"),
+            Chain::Arbitrum => write!(f, "ARBITRUM"),
+            Chain::Base => write!(f, "BASE"),
+            Chain::Ethereum => write!(f, "ETHEREUM"),
+        }
+    }
+}
+
+impl std::str::FromStr for Chain {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "SOLANA" | "SOL" => Ok(Chain::Solana),
+            "ROBINHOOD" | "RH" => Ok(Chain::Robinhood),
+            "ARBITRUM" | "ARB" => Ok(Chain::Arbitrum),
+            "BASE" => Ok(Chain::Base),
+            "ETHEREUM" | "ETH" => Ok(Chain::Ethereum),
+            _ => Err(format!("Unknown chain: {}", s)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WalletTier {
+    TierS, // Top Whale / Legend (PnL > $100k, instant copy eligibility)
+    TierA, // Alpha Hunter (PnL $30k - $100k, requires 2x confluence)
+    TierB, // Fast Mover (PnL < $30k, monitoring only)
+}
+
+impl fmt::Display for WalletTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WalletTier::TierS => write!(f, "TIER-S"),
+            WalletTier::TierA => write!(f, "TIER-A"),
+            WalletTier::TierB => write!(f, "TIER-B"),
+        }
+    }
+}
+
+impl std::str::FromStr for WalletTier {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "TIER-S" | "TIERS" | "S" => Ok(WalletTier::TierS),
+            "TIER-A" | "TIERA" | "A" => Ok(WalletTier::TierA),
+            "TIER-B" | "TIERB" | "B" => Ok(WalletTier::TierB),
+            _ => Ok(WalletTier::TierB),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartWallet {
+    pub id: Option<i64>,
+    pub rank: u32,
+    pub name: String,
+    pub handle: String,
+    pub chain: Chain,
+    pub address: String,
+    pub tier: WalletTier,
+    pub pnl_24h_usd: f64,
+    pub win_rate_pct: f64,
+    pub total_trades: u32,
+    pub is_active: bool,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActivityType {
+    Buy,
+    Sell,
+    Transfer,
+}
+
+impl fmt::Display for ActivityType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ActivityType::Buy => write!(f, "BUY"),
+            ActivityType::Sell => write!(f, "SELL"),
+            ActivityType::Transfer => write!(f, "TRANSFER"),
+        }
+    }
+}
+
+impl std::str::FromStr for ActivityType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "BUY" => Ok(ActivityType::Buy),
+            "SELL" => Ok(ActivityType::Sell),
+            _ => Ok(ActivityType::Transfer),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletActivity {
+    pub id: Option<i64>,
+    pub wallet_handle: String,
+    pub wallet_address: String,
+    pub chain: Chain,
+    pub activity_type: ActivityType,
+    pub token_symbol: String,
+    pub token_mint: String,
+    pub amount_usd: f64,
+    pub token_amount: f64,
+    pub execution_price_usd: f64,
+    pub tx_signature: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowSignal {
+    pub chain: Chain,
+    pub token_symbol: String,
+    pub token_mint: String,
+    pub whale_handle: String,
+    pub whale_address: String,
+    pub whale_tier: WalletTier,
+    pub whale_entry_price: f64,
+    pub current_pool_price: f64,
+    pub price_delta_pct: f64,
+    pub pool_liquidity_usd: f64,
+    pub is_passed: bool,
+    pub rejection_reason: Option<String>,
+    pub confluence_count: u32,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowPosition {
+    pub id: String,
+    pub chain: Chain,
+    pub token_symbol: String,
+    pub token_mint: String,
+    pub target_whale_handle: String,
+    pub target_whale_address: String,
+    pub entry_price: f64,
+    pub current_price: f64,
+    pub peak_price: f64,
+    pub amount_native: f64,
+    pub amount_usd: f64,
+    pub unrealized_pnl_pct: f64,
+    pub entry_time: DateTime<Utc>,
+    pub last_update: DateTime<Utc>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeRecord {
+    pub timestamp: DateTime<Utc>,
+    pub chain: Chain,
+    pub action: String,
+    pub symbol: String,
+    pub mint: String,
+    pub target_whale: String,
+    pub exit_reason: String,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub pnl_pct: f64,
+    pub pnl_usd: f64,
+    pub duration_secs: u64,
+}

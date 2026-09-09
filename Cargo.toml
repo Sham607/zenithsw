@@ -1,0 +1,40 @@
+[package]
+name = "zenithsw"
+version = "0.1.0"
+edition = "2021"
+authors = ["Gito <dev@suginode.local>", "Hinsyah <sham607>"]
+description = "ZenithSW - Multi-Chain Smart Money Shadow Trading Engine & TUI Dashboard"
+
+[lib]
+name = "zenithsw"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zenithsw"
+path = "src/main.rs"
+
+[[bin]]
+name = "zenithsw-engine"
+path = "src/bin/engine.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+ratatui = "0.29"
+crossterm = "0.28"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+dotenvy = "0.15"
+bs58 = "0.5"
+hex = "0.4"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+base64 = "0.22"
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
+regex = "1.10"
+
+[dev-dependencies]
+tempfile = "3.10"
