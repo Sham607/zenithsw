@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chain {
     Solana,
     Robinhood,
@@ -23,21 +24,40 @@ impl fmt::Display for Chain {
     }
 }
 
-impl std::str::FromStr for Chain {
+impl FromStr for Chain {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_uppercase().as_str() {
+        match s.trim().to_uppercase().as_str() {
             "SOLANA" | "SOL" => Ok(Chain::Solana),
             "ROBINHOOD" | "RH" => Ok(Chain::Robinhood),
             "ARBITRUM" | "ARB" => Ok(Chain::Arbitrum),
             "BASE" => Ok(Chain::Base),
             "ETHEREUM" | "ETH" => Ok(Chain::Ethereum),
-            _ => Err(format!("Unknown chain: {}", s)),
+            _ => Ok(Chain::Solana),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for Chain {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Chain::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for Chain {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalletTier {
     TierS, // Top Whale / Legend (PnL > $100k, instant copy eligibility)
     TierA, // Alpha Hunter (PnL $30k - $100k, requires 2x confluence)
@@ -54,15 +74,34 @@ impl fmt::Display for WalletTier {
     }
 }
 
-impl std::str::FromStr for WalletTier {
+impl FromStr for WalletTier {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_uppercase().as_str() {
+        match s.trim().to_uppercase().as_str() {
             "TIER-S" | "TIERS" | "S" => Ok(WalletTier::TierS),
             "TIER-A" | "TIERA" | "A" => Ok(WalletTier::TierA),
             "TIER-B" | "TIERB" | "B" => Ok(WalletTier::TierB),
             _ => Ok(WalletTier::TierB),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for WalletTier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        WalletTier::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for WalletTier {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -83,11 +122,16 @@ pub struct SmartWallet {
     pub source: String,             // "FOMO" | "ONCHAIN_INDEXER"
     #[serde(default = "default_reputation")]
     pub reputation_score: f64,      // 0.0 - 100.0
+    #[serde(default = "default_active")]
     pub is_active: bool,
     #[serde(default)]
     pub last_seen_at: Option<DateTime<Utc>>,
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_active() -> bool {
+    true
 }
 
 fn default_source() -> String {
@@ -98,7 +142,7 @@ fn default_reputation() -> f64 {
     85.0
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityType {
     Buy,
     Sell,
@@ -115,14 +159,33 @@ impl fmt::Display for ActivityType {
     }
 }
 
-impl std::str::FromStr for ActivityType {
+impl FromStr for ActivityType {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_uppercase().as_str() {
+        match s.trim().to_uppercase().as_str() {
             "BUY" => Ok(ActivityType::Buy),
             "SELL" => Ok(ActivityType::Sell),
             _ => Ok(ActivityType::Transfer),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        ActivityType::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for ActivityType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
     }
 }
 
