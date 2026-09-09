@@ -68,6 +68,7 @@ impl std::str::FromStr for WalletTier {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmartWallet {
+    #[serde(default)]
     pub id: Option<i64>,
     pub rank: u32,
     pub name: String,
@@ -78,9 +79,23 @@ pub struct SmartWallet {
     pub pnl_24h_usd: f64,
     pub win_rate_pct: f64,
     pub total_trades: u32,
+    #[serde(default = "default_source")]
+    pub source: String,             // "FOMO" | "ONCHAIN_INDEXER"
+    #[serde(default = "default_reputation")]
+    pub reputation_score: f64,      // 0.0 - 100.0
     pub is_active: bool,
+    #[serde(default)]
     pub last_seen_at: Option<DateTime<Utc>>,
+    #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_source() -> String {
+    "FOMO".to_string()
+}
+
+fn default_reputation() -> f64 {
+    85.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +128,7 @@ impl std::str::FromStr for ActivityType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletActivity {
+    #[serde(default)]
     pub id: Option<i64>,
     pub wallet_handle: String,
     pub wallet_address: String,
@@ -123,6 +139,12 @@ pub struct WalletActivity {
     pub amount_usd: f64,
     pub token_amount: f64,
     pub execution_price_usd: f64,
+    #[serde(default)]
+    pub whale_balance_before: f64,
+    #[serde(default)]
+    pub whale_balance_after: f64,
+    #[serde(default)]
+    pub sell_ratio_pct: f64,        // 0.0 for Buy, 0.0-100.0 for Sell (e.g. 50.0% partial, 100.0% full)
     pub tx_signature: String,
     pub timestamp: DateTime<Utc>,
 }
@@ -158,10 +180,18 @@ pub struct ShadowPosition {
     pub peak_price: f64,
     pub amount_native: f64,
     pub amount_usd: f64,
+    #[serde(default = "default_portion")]
+    pub remaining_portion_pct: f64, // 100.0% down to 0.0% on partial sells
     pub unrealized_pnl_pct: f64,
+    #[serde(default)]
+    pub realized_pnl_usd: f64,
     pub entry_time: DateTime<Utc>,
     pub last_update: DateTime<Utc>,
-    pub status: String,
+    pub status: String,             // "OPEN" | "PARTIAL_EXIT" | "CLOSED"
+}
+
+fn default_portion() -> f64 {
+    100.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +203,8 @@ pub struct TradeRecord {
     pub mint: String,
     pub target_whale: String,
     pub exit_reason: String,
+    #[serde(default = "default_portion")]
+    pub portion_sold_pct: f64,
     pub entry_price: f64,
     pub exit_price: f64,
     pub pnl_pct: f64,

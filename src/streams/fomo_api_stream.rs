@@ -3,60 +3,64 @@ use crate::db::SmartWalletDb;
 use crate::models::{ActivityType, Chain, WalletActivity};
 use anyhow::Result;
 use chrono::Utc;
+use reqwest::Client;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub struct FomoApiStreamListener {
-    config: Arc<Config>,
-    client: reqwest::Client,
+    config: Config,
+    client: Client,
+    user_id_cache: Arc<Mutex<HashMap<String, String>>>, // handle -> userId
     processed_swap_ids: Arc<Mutex<HashSet<String>>>,
-    user_id_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl FomoApiStreamListener {
     pub fn new(config: Arc<Config>) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(8))
-            .build()
-            .unwrap_or_default();
         Self {
-            config,
-            client,
-            processed_swap_ids: Arc::new(Mutex::new(HashSet::new())),
+            config: (*config).clone(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(6))
+                .build()
+                .unwrap_or_default(),
             user_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            processed_swap_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    /// Refresh User ID Cache from Leaderboard
+    /// Pre-populate userId mapping from leaderboard endpoint
     pub async fn refresh_user_ids(&self) -> Result<()> {
-        if let Some(token) = &self.config.fomo_auth_token {
-            let auth_header = if token.starts_with("Bearer ") {
-                token.to_string()
-            } else {
-                format!("Bearer {}", token)
-            };
+        let token = match &self.config.fomo_auth_token {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => return Ok(()),
+        };
 
-            let api_url = "https://prod-api.fomo.family/v2/leaderboard?timeframe=24h";
-            let req = self.client.get(api_url)
-                .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .header("Origin", "https://fomo.family")
-                .header("Referer", "https://fomo.family/")
-                .header("Accept", "application/json, text/plain, */*")
-                .header("privy-app-id", "cm6h485v300n3zj9yl6vpedq7")
-                .header("Authorization", auth_header);
+        let auth_header = if token.starts_with("Bearer ") {
+            token.to_string()
+        } else {
+            format!("Bearer {}", token)
+        };
 
-            if let Ok(resp) = req.send().await {
-                if resp.status().is_success() {
-                    if let Ok(json) = resp.json::<Value>().await {
-                        if let Some(items) = json.get("responseObject").and_then(|r| r.get("leaderboard")).and_then(|l| l.as_array()) {
-                            let mut cache = self.user_id_cache.lock().unwrap();
-                            for item in items {
-                                let handle = item.get("userHandle").and_then(|v| v.as_str()).unwrap_or("");
-                                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                if !handle.is_empty() && !id.is_empty() {
-                                    cache.insert(handle.to_string(), id.to_string());
-                                }
+        let url = "https://prod-api.fomo.family/v2/leaderboard?type=TOTAL_PNL&timeframe=ALL";
+        let req = self.client.get(url)
+            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .header("Origin", "https://fomo.family")
+            .header("Referer", "https://fomo.family/")
+            .header("Accept", "application/json, text/plain, */*")
+            .header("privy-app-id", "cm6h485v300n3zj9yl6vpedq7")
+            .header("Authorization", auth_header);
+
+        if let Ok(resp) = req.send().await {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<Value>().await {
+                    if let Some(items) = json.get("responseObject").and_then(|r| r.as_array()) {
+                        let mut map = self.user_id_cache.lock().unwrap();
+                        for item in items {
+                            let user_id = item.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+                            let handle = item.get("handle").and_then(|v| v.as_str()).unwrap_or("");
+                            if !user_id.is_empty() && !handle.is_empty() {
+                                map.insert(handle.to_string(), user_id.to_string());
                             }
                         }
                     }
@@ -66,7 +70,7 @@ impl FomoApiStreamListener {
         Ok(())
     }
 
-    /// Checks the live swaps for a target trader handle from FOMO API
+    /// Checks recent swaps for a given trader handle
     pub async fn check_trader_swaps(
         &self,
         handle: &str,
@@ -164,6 +168,12 @@ impl FomoApiStreamListener {
                     execution_price_usd = price;
                 }
 
+                let sell_ratio_pct = if activity_type == ActivityType::Sell {
+                    100.0
+                } else {
+                    0.0
+                };
+
                 let activity = WalletActivity {
                     id: None,
                     wallet_handle: handle.to_string(),
@@ -175,6 +185,9 @@ impl FomoApiStreamListener {
                     amount_usd,
                     token_amount: 1.0,
                     execution_price_usd,
+                    whale_balance_before: 0.0,
+                    whale_balance_after: 0.0,
+                    sell_ratio_pct,
                     tx_signature: swap_id.to_string(),
                     timestamp: Utc::now(),
                 };

@@ -2,80 +2,98 @@ use crate::db::SmartWalletDb;
 use crate::models::{ActivityType, Chain, WalletActivity};
 use anyhow::Result;
 use chrono::Utc;
+use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub struct SolanaStreamListener {
     rpc_url: String,
-    client: reqwest::Client,
     processed_signatures: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SolanaStreamListener {
     pub fn new(rpc_url: &str) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(6))
-            .build()
-            .unwrap_or_default();
         Self {
             rpc_url: rpc_url.to_string(),
-            client,
             processed_signatures: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    /// Pulls recent confirmed parsed transactions for target wallet using Helius RPC
-    pub async fn check_wallet_activity(
+    /// Pulls recent transactions for a wallet and converts them to WalletActivity
+    pub async fn check_recent_txs(
         &self,
         handle: &str,
         address: &str,
         db: Arc<SmartWalletDb>,
     ) -> Result<Option<WalletActivity>> {
-        let url = if self.rpc_url.contains("helius-rpc.com") {
+        if self.rpc_url.is_empty() {
+            return Ok(None);
+        }
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()?;
+
+        let helius_url = if self.rpc_url.contains("helius") {
+            let base = self.rpc_url.split('?').next().unwrap_or(&self.rpc_url);
             let api_key = self.rpc_url.split("api-key=").nth(1).unwrap_or("");
-            format!(
-                "https://api.helius.xyz/v0/addresses/{}/transactions?api-key={}&limit=3",
-                address, api_key
-            )
+            if !api_key.is_empty() {
+                format!("https://api.helius.xyz/v0/addresses/{}/transactions?api-key={}&limit=2", address, api_key)
+            } else {
+                format!("{}/v0/addresses/{}/transactions?limit=2", base, address)
+            }
         } else {
             return Ok(None);
         };
 
-        let res = match self.client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) if r.status().as_u16() == 429 => {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                return Ok(None);
-            }
-            _ => return Ok(None),
+        let res = match client.get(&helius_url).send().await {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
         };
 
-        let txs: Vec<Value> = res.json().await.unwrap_or_default();
+        if !res.status().is_success() {
+            return Ok(None);
+        }
+
+        let txs: Value = match res.json().await {
+            Ok(j) => j,
+            Err(_) => return Ok(None),
+        };
+
+        let tx_array = match txs.as_array() {
+            Some(arr) => arr,
+            None => return Ok(None),
+        };
+
         let now = Utc::now();
 
-        for tx in txs {
-            let tx_type = tx.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        for tx in tx_array {
             let signature = tx.get("signature").and_then(|v| v.as_str()).unwrap_or("");
-            let timestamp_num = tx.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-
             if signature.is_empty() {
                 continue;
             }
 
-            // Deduplication Check
+            // In-memory signature deduplication
             {
-                let mut cache = self.processed_signatures.lock().unwrap();
-                if cache.contains(signature) {
+                let mut processed = self.processed_signatures.lock().unwrap();
+                if processed.contains(signature) {
                     continue;
                 }
-                cache.insert(signature.to_string());
-                if cache.len() > 2000 {
-                    cache.clear();
+                processed.insert(signature.to_string());
+                if processed.len() > 1000 {
+                    let to_remove: Vec<String> = processed.iter().take(200).cloned().collect();
+                    for r in to_remove {
+                        processed.remove(&r);
+                    }
                 }
             }
 
-            // Check if transaction is within last 180 seconds
+            let tx_type = tx.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let timestamp_num = tx.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+            
+            // Only process fresh transactions (< 180s old)
             let tx_age_secs = if timestamp_num > 0 {
                 (now.timestamp() - timestamp_num).max(0)
             } else {
@@ -91,6 +109,9 @@ impl SolanaStreamListener {
                 let mut amount_usd = 0.0;
                 let mut token_amount = 0.0;
                 let mut price_usd = 0.0;
+                let mut whale_balance_before = 0.0;
+                let mut whale_balance_after = 0.0;
+                let mut sell_ratio_pct = 0.0;
 
                 if let Some(transfers) = token_transfers {
                     for t in transfers {
@@ -130,6 +151,35 @@ impl SolanaStreamListener {
                         };
                     }
 
+                    // Calculate whale balance before/after and sell portion
+                    if activity_type == ActivityType::Sell {
+                        // Check accountData balance changes if present
+                        if let Some(account_data) = tx.get("accountData").and_then(|v| v.as_array()) {
+                            for acc in account_data {
+                                let acc_owner = acc.get("account").and_then(|v| v.as_str()).unwrap_or("");
+                                if acc_owner == address {
+                                    if let Some(token_balances) = acc.get("tokenBalanceChanges").and_then(|v| v.as_array()) {
+                                        for tb in token_balances {
+                                            let tb_mint = tb.get("mint").and_then(|v| v.as_str()).unwrap_or("");
+                                            if tb_mint == token_mint {
+                                                let raw_amount = tb.get("rawTokenAmount").and_then(|r| r.get("tokenAmount")).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                                whale_balance_after = raw_amount.max(0.0);
+                                                whale_balance_before = whale_balance_after + token_amount;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if whale_balance_before > 0.0 {
+                            sell_ratio_pct = ((token_amount / whale_balance_before) * 100.0).clamp(1.0, 100.0);
+                        } else {
+                            // Default to full exit if balance breakdown isn't explicit
+                            sell_ratio_pct = 100.0;
+                        }
+                    }
+
                     let act = WalletActivity {
                         id: None,
                         wallet_handle: handle.to_string(),
@@ -141,6 +191,9 @@ impl SolanaStreamListener {
                         amount_usd,
                         token_amount,
                         execution_price_usd: price_usd,
+                        whale_balance_before,
+                        whale_balance_after,
+                        sell_ratio_pct,
                         tx_signature: signature.to_string(),
                         timestamp: now,
                     };
@@ -177,8 +230,9 @@ impl SolanaStreamListener {
                             .unwrap_or(0.0);
                         let liquidity_usd: f64 = pair.get("liquidity")
                             .and_then(|l| l.get("usd"))
-                            .and_then(|u| u.as_f64())
+                            .and_then(|v| v.as_f64())
                             .unwrap_or(0.0);
+
                         if price_usd > 0.0 {
                             return Ok((symbol, price_usd, liquidity_usd));
                         }
@@ -187,7 +241,7 @@ impl SolanaStreamListener {
             }
         }
 
-        // Source 2: Jupiter Price API v2 Fallback
+        // Source 2: Jupiter Price API v2
         let jup_url = format!("https://api.jup.ag/price/v2?ids={}", mint);
         if let Ok(res) = client.get(&jup_url).send().await {
             if let Ok(json) = res.json::<Value>().await {
@@ -196,8 +250,9 @@ impl SolanaStreamListener {
                         .and_then(|p| p.as_str())
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0.0);
+
                     if price_usd > 0.0 {
-                        return Ok(("JUP_TOKEN".to_string(), price_usd, 40000.0));
+                        return Ok(("JUP_TOKEN".to_string(), price_usd, 50_000.0));
                     }
                 }
             }

@@ -43,7 +43,9 @@ impl EvmExecutor {
             peak_price: entry_price,
             amount_native,
             amount_usd,
+            remaining_portion_pct: 100.0,
             unrealized_pnl_pct: 0.0,
+            realized_pnl_usd: 0.0,
             entry_time: now,
             last_update: now,
             status: "OPEN".to_string(),
@@ -51,6 +53,11 @@ impl EvmExecutor {
 
         self.db.upsert_position(&position)?;
         Ok(Some(position))
+    }
+
+    pub async fn execute_partial_shadow_sell(&self, position_id: &str, sell_ratio_pct: f64, exit_reason: &str, current_price: f64) -> Result<()> {
+        self.db.close_position_portion(position_id, sell_ratio_pct, exit_reason, current_price)?;
+        Ok(())
     }
 
     pub async fn execute_shadow_sell(&self, position_id: &str, exit_reason: &str, current_price: f64) -> Result<()> {

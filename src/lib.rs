@@ -2,6 +2,7 @@ pub mod config;
 pub mod db;
 pub mod execution;
 pub mod gating;
+pub mod indexer;
 pub mod ingestion;
 pub mod ipc;
 pub mod models;

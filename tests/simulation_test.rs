@@ -4,6 +4,7 @@ use zenithsw::config::Config;
 use zenithsw::db::SmartWalletDb;
 use zenithsw::execution::SolanaExecutor;
 use zenithsw::gating::ConfluenceEngine;
+use zenithsw::indexer::scoring::ReputationScorer;
 use zenithsw::ingestion::{FomoScraper, WalletResolver};
 use zenithsw::models::{
     ActivityType, Chain, ShadowSignal, SmartWallet, WalletActivity, WalletTier,
@@ -52,6 +53,8 @@ async fn test_database_wallet_and_activity_crud() {
         pnl_24h_usd: 254395.02,
         win_rate_pct: 85.0,
         total_trades: 37,
+        source: "FOMO".to_string(),
+        reputation_score: 95.0,
         is_active: true,
         last_seen_at: None,
         updated_at: now,
@@ -74,6 +77,9 @@ async fn test_database_wallet_and_activity_crud() {
         amount_usd: 5000.0,
         token_amount: 10000.0,
         execution_price_usd: 0.50,
+        whale_balance_before: 0.0,
+        whale_balance_after: 10000.0,
+        sell_ratio_pct: 0.0,
         tx_signature: "sig123".to_string(),
         timestamp: now,
     };
@@ -102,6 +108,8 @@ async fn test_gating_price_delta_max_5_pct() {
         pnl_24h_usd: 250000.0,
         win_rate_pct: 85.0,
         total_trades: 30,
+        source: "FOMO".to_string(),
+        reputation_score: 95.0,
         is_active: true,
         last_seen_at: None,
         updated_at: now,
@@ -118,6 +126,9 @@ async fn test_gating_price_delta_max_5_pct() {
         amount_usd: 2000.0,
         token_amount: 2000.0,
         execution_price_usd: 1.00,
+        whale_balance_before: 0.0,
+        whale_balance_after: 2000.0,
+        sell_ratio_pct: 0.0,
         tx_signature: "sig_alpha".to_string(),
         timestamp: now,
     };
@@ -159,6 +170,8 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
         pnl_24h_usd: 15000.0,
         win_rate_pct: 60.0,
         total_trades: 12,
+        source: "FOMO".to_string(),
+        reputation_score: 75.0,
         is_active: true,
         last_seen_at: None,
         updated_at: now,
@@ -175,6 +188,9 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
         amount_usd: 1000.0,
         token_amount: 1000.0,
         execution_price_usd: 1.00,
+        whale_balance_before: 0.0,
+        whale_balance_after: 1000.0,
+        sell_ratio_pct: 0.0,
         tx_signature: "sig_beta".to_string(),
         timestamp: now,
     };
@@ -211,6 +227,9 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
         amount_usd: 1200.0,
         token_amount: 1200.0,
         execution_price_usd: 1.01,
+        whale_balance_before: 0.0,
+        whale_balance_after: 1200.0,
+        sell_ratio_pct: 0.0,
         tx_signature: "sig_beta2".to_string(),
         timestamp: now,
     };
@@ -224,7 +243,7 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
 }
 
 #[tokio::test]
-async fn test_shadow_execution_and_mirror_exit() {
+async fn test_proportional_partial_and_full_mirror_exit() {
     let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
     let config = get_mock_config();
     let sol_exec = SolanaExecutor::new(config.clone(), db.clone());
@@ -247,17 +266,26 @@ async fn test_shadow_execution_and_mirror_exit() {
         timestamp: now,
     };
 
-    // 1. Shadow Buy
+    // 1. Open Position
     let pos = sol_exec.execute_shadow_buy(&signal).await.unwrap().unwrap();
     assert_eq!(pos.token_symbol, "PUMP");
     assert_eq!(pos.amount_usd, 15.0);
+    assert_eq!(pos.remaining_portion_pct, 100.0);
 
-    let active_positions = db.get_active_positions().unwrap();
-    assert_eq!(active_positions.len(), 1);
-
-    // 2. Mirror Exit on Target Whale Sell
+    // 2. Whale sells 50% partial bag -> Bot sells 50% partial shadow position
     sol_exec
-        .execute_shadow_sell(&pos.id, "SHADOW_MIRROR_EXIT", 0.125)
+        .execute_partial_shadow_sell(&pos.id, 50.0, "WHALE_PARTIAL_DUMP", 0.15)
+        .await
+        .unwrap();
+
+    let active_pos = db.get_active_positions().unwrap();
+    assert_eq!(active_pos.len(), 1);
+    assert_eq!(active_pos[0].remaining_portion_pct, 50.0);
+    assert_eq!(active_pos[0].status, "PARTIAL_EXIT");
+
+    // 3. Whale sells remaining 100% -> Bot closes position completely
+    sol_exec
+        .execute_shadow_sell(&pos.id, "WHALE_FULL_DUMP", 0.20)
         .await
         .unwrap();
 
@@ -265,9 +293,27 @@ async fn test_shadow_execution_and_mirror_exit() {
     assert_eq!(remaining_positions.len(), 0);
 
     let trades = db.get_recent_trades(10).unwrap();
-    assert_eq!(trades.len(), 1);
-    assert_eq!(trades[0].exit_reason, "SHADOW_MIRROR_EXIT");
-    assert!(trades[0].pnl_pct > 20.0);
+    assert_eq!(trades.len(), 2);
+    assert_eq!(trades[0].action, "SELL"); // Most recent
+    assert_eq!(trades[1].action, "PARTIAL_SELL");
+}
+
+#[test]
+fn test_indexer_reputation_scoring() {
+    // 1. Dev honeypot check -> Must be 0 score and rejected
+    let dev_score = ReputationScorer::evaluate("DevAddr1111", true, 5, 90.0, 10, 50000.0, 30);
+    assert!(dev_score.is_dev_or_creator);
+    assert_eq!(dev_score.reputation_score, 0.0);
+    assert!(!dev_score.is_eligible_tier_a);
+
+    // 2. Disposable wallet (< 3 days) -> Must be rejected
+    let fresh_score = ReputationScorer::evaluate("FreshAddr1111", false, 3, 80.0, 5, 20000.0, 1);
+    assert!(!fresh_score.is_eligible_tier_a);
+
+    // 3. Elite On-Chain Smart Money (>70 score, >$10k PnL, >60% Win Rate, multi-token)
+    let elite_score = ReputationScorer::evaluate("WhaleAddr1111", false, 4, 75.0, 25, 45000.0, 60);
+    assert!(elite_score.is_eligible_tier_a);
+    assert!(elite_score.reputation_score >= 70.0);
 }
 
 #[test]

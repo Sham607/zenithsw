@@ -6,6 +6,7 @@ use zenithsw::config::Config;
 use zenithsw::db::SmartWalletDb;
 use zenithsw::execution::{EvmExecutor, SolanaExecutor};
 use zenithsw::gating::ConfluenceEngine;
+use zenithsw::indexer::SmartMoneyIndexer;
 use zenithsw::ingestion::FomoScraper;
 use zenithsw::ipc::{IpcMessage, IpcServer};
 use zenithsw::models::{ActivityType, Chain};
@@ -41,8 +42,9 @@ async fn main() -> Result<()> {
     let confluence = Arc::new(ConfluenceEngine::new(config.clone(), db.clone()));
     let sol_exec = Arc::new(SolanaExecutor::new(config.clone(), db.clone()));
     let evm_exec = Arc::new(EvmExecutor::new(config.clone(), db.clone()));
+    let indexer = Arc::new(SmartMoneyIndexer::new(&config.solana_rpc_url, db.clone(), 600));
 
-    // Initial sync of Top 100 traders
+    // Initial sync of Top traders
     let _ = scraper.sync_to_db().await;
 
     // Spawn Background FOMO API Poller (Python Subprocess to bypass Cloudflare WAF 430)
@@ -54,7 +56,13 @@ async fn main() -> Result<()> {
         Err(e) => eprintln!("[FOMO POLLER] Failed to spawn poller child process: {}", e),
     }
 
-    // Task 1: Periodic Database Sync to IPC Broadcast (Syncs 100 Real On-Chain Wallets to TUI)
+    // Task 0: Background Direct On-Chain DEX Graph Indexer
+    let indexer_task = indexer.clone();
+    tokio::spawn(async move {
+        indexer_task.run_background_loop().await;
+    });
+
+    // Task 1: Periodic Database Sync to IPC Broadcast (Syncs Real On-Chain Wallets to TUI)
     let db_sync = db.clone();
     let ipc_sync = ipc_server.clone();
     let sync_sec = config.fomo_sync_interval_sec;
@@ -98,7 +106,7 @@ async fn main() -> Result<()> {
 
                     if activity_opt.is_none() {
                         activity_opt = match w.chain {
-                            Chain::Solana => sol_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
+                            Chain::Solana => sol_listener_stream.check_recent_txs(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
                             Chain::Arbitrum => arb_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
                             Chain::Base => base_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
                             _ => None,
@@ -112,16 +120,26 @@ async fn main() -> Result<()> {
                         println!("[ACTIVITY 🔥] {} by @{} ({}) -> Token: {} (${:.2})", act.activity_type, act.wallet_handle, act.chain, act.token_symbol, act.amount_usd);
                         let _ = ipc_stream.broadcast(&IpcMessage::ActivityBroadcast { activity: act.clone() });
 
-                        // Handle Shadow Mirror Exit
+                        // Handle Pure Shadow Mirror Exit (Proportional / Full)
                         if act.activity_type == ActivityType::Sell {
                             if let Ok(positions) = db_stream.get_active_positions() {
                                 for pos in positions {
                                     if pos.token_mint == act.token_mint && pos.target_whale_handle == act.wallet_handle {
-                                        println!("[SHADOW EXIT 🚨] Target @{} sold {} -> Triggering instant SELL!", pos.target_whale_handle, pos.token_symbol);
                                         let exit_price = if act.execution_price_usd > 0.0 { act.execution_price_usd } else { pos.current_price };
-                                        match pos.chain {
-                                            Chain::Solana => { let _ = sol_exec_stream.execute_shadow_sell(&pos.id, "SHADOW_MIRROR_EXIT", exit_price).await; }
-                                            _ => { let _ = evm_exec_stream.execute_shadow_sell(&pos.id, "SHADOW_MIRROR_EXIT", exit_price).await; }
+                                        let sell_ratio = act.sell_ratio_pct.clamp(1.0, 100.0);
+
+                                        if sell_ratio >= 95.0 {
+                                            println!("[SHADOW FULL EXIT 🔴] Target @{} sold 100% of {} -> Closing position completely!", pos.target_whale_handle, pos.token_symbol);
+                                            match pos.chain {
+                                                Chain::Solana => { let _ = sol_exec_stream.execute_shadow_sell(&pos.id, "WHALE_FULL_DUMP", exit_price).await; }
+                                                _ => { let _ = evm_exec_stream.execute_shadow_sell(&pos.id, "WHALE_FULL_DUMP", exit_price).await; }
+                                            }
+                                        } else {
+                                            println!("[SHADOW PARTIAL EXIT 🟡] Target @{} sold {:.1}% of {} -> Mirroring {:.1}% partial sell!", pos.target_whale_handle, sell_ratio, pos.token_symbol, sell_ratio);
+                                            match pos.chain {
+                                                Chain::Solana => { let _ = sol_exec_stream.execute_partial_shadow_sell(&pos.id, sell_ratio, "WHALE_PARTIAL_DUMP", exit_price).await; }
+                                                _ => { let _ = evm_exec_stream.execute_partial_shadow_sell(&pos.id, sell_ratio, "WHALE_PARTIAL_DUMP", exit_price).await; }
+                                            }
                                         }
                                     }
                                 }
@@ -164,19 +182,16 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Task 3: Live Position Lifecycle & Real-Time Price Tracker Worker (TP / SL / Trailing Stop)
+    // Task 3: Live Position Lifecycle & Real-Time Price Tracker Worker (Pure Whale Mirror Tracking)
     let db_pos_tracker = db.clone();
-    let sol_exec_tracker = sol_exec.clone();
-    let evm_exec_tracker = evm_exec.clone();
     let ipc_pos_tracker = ipc_server.clone();
-    let cfg_tracker = config.clone();
 
     tokio::spawn(async move {
-        println!("[POSITION TRACKER] Active position lifecycle & PnL manager online (Interval: 2s)");
+        println!("[POSITION TRACKER] Pure Whale Mirror Position & Floating PnL Tracker online (Interval: 2s)");
         loop {
             if let Ok(mut positions) = db_pos_tracker.get_active_positions() {
                 for pos in &mut positions {
-                    if pos.status != "OPEN" {
+                    if pos.status == "CLOSED" {
                         continue;
                     }
 
@@ -198,39 +213,6 @@ async fn main() -> Result<()> {
                         }
                         pos.last_update = Utc::now();
                         let _ = db_pos_tracker.upsert_position(pos);
-
-                        // 1. Take Profit Check (Default: +50.0%)
-                        if pos.unrealized_pnl_pct >= cfg_tracker.take_profit_pct {
-                            println!("[TAKE PROFIT 🎯] {} reached +{:.2}% -> Closing position!", pos.token_symbol, pos.unrealized_pnl_pct);
-                            let _ = match pos.chain {
-                                Chain::Solana => sol_exec_tracker.execute_shadow_sell(&pos.id, "TAKE_PROFIT", pos.current_price).await,
-                                _ => evm_exec_tracker.execute_shadow_sell(&pos.id, "TAKE_PROFIT", pos.current_price).await,
-                            };
-                            continue;
-                        }
-
-                        // 2. Stop Loss Check (Default: -15.0%)
-                        if pos.unrealized_pnl_pct <= -cfg_tracker.stop_loss_pct {
-                            println!("[STOP LOSS 🛑] {} hit -{:.2}% -> Cutting loss!", pos.token_symbol, pos.unrealized_pnl_pct);
-                            let _ = match pos.chain {
-                                Chain::Solana => sol_exec_tracker.execute_shadow_sell(&pos.id, "STOP_LOSS", pos.current_price).await,
-                                _ => evm_exec_tracker.execute_shadow_sell(&pos.id, "STOP_LOSS", pos.current_price).await,
-                            };
-                            continue;
-                        }
-
-                        // 3. Trailing Stop Check (e.g. Peak >= +10% and drops 10% from peak)
-                        if pos.entry_price > 0.0 && pos.peak_price >= pos.entry_price * 1.10 {
-                            let drop_from_peak_pct = ((pos.peak_price - pos.current_price) / pos.peak_price) * 100.0;
-                            if drop_from_peak_pct >= cfg_tracker.trailing_stop_pct {
-                                println!("[TRAILING STOP 📉] {} dropped {:.2}% from peak ${:.6} -> Closing!", pos.token_symbol, drop_from_peak_pct, pos.peak_price);
-                                let _ = match pos.chain {
-                                    Chain::Solana => sol_exec_tracker.execute_shadow_sell(&pos.id, "TRAILING_STOP", pos.current_price).await,
-                                    _ => evm_exec_tracker.execute_shadow_sell(&pos.id, "TRAILING_STOP", pos.current_price).await,
-                                };
-                                continue;
-                            }
-                        }
                     }
                 }
 

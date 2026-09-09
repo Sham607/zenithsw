@@ -88,6 +88,9 @@ impl EvmStreamListener {
                         amount_usd: 500.0, // Default estimated
                         token_amount: value_num,
                         execution_price_usd: 0.0,
+                        whale_balance_before: 0.0,
+                        whale_balance_after: 0.0,
+                        sell_ratio_pct: 0.0,
                         tx_signature: hash.to_string(),
                         timestamp: now,
                     };

@@ -1,6 +1,6 @@
 use crate::models::{ActivityType, WalletTier};
 use crate::tui::app::App;
-use chrono::{FixedOffset, Utc};
+use chrono::FixedOffset;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -10,42 +10,44 @@ use ratatui::{
 };
 
 pub fn render_ui(frame: &mut Frame, app: &App) {
-    let wib_time = Utc::now().with_timezone(&FixedOffset::east_opt(7 * 3600).unwrap());
-    let time_str = wib_time.format("%H:%M:%S WIB").to_string();
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header & Tabs
-            Constraint::Min(0),    // Main View
-            Constraint::Length(3), // Footer / Status bar
+            Constraint::Length(3), // Tab navigation
+            Constraint::Min(0),    // Main content
+            Constraint::Length(3), // Footer / status
         ])
         .split(frame.area());
 
-    // 1. Header & Tabs
+    // 1. Tab Bar Navigation [1]-[4]
     let tab_titles = vec![
-        "[1] LIVE STREAM ⚡",
-        "[2] TARGET WALLETS 🎯",
-        "[3] SHADOW POSITIONS 💼",
-        "[4] LATENCY & STATS 📊",
+        Line::from(vec![
+            Span::styled("[1]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" LIVE STREAM ⚡"),
+        ]),
+        Line::from(vec![
+            Span::styled("[2]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" TARGET WALLETS 🎯"),
+        ]),
+        Line::from(vec![
+            Span::styled("[3]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" SHADOW POSITIONS 💼"),
+        ]),
+        Line::from(vec![
+            Span::styled("[4]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" LATENCY & STATS 📊"),
+        ]),
     ];
 
     let tabs = Tabs::new(tab_titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    format!(" ZENITHSW v0.1.0 - SMART MONEY SHADOW ENGINE [{}] ", time_str),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )),
-        )
+        .block(Block::default().borders(Borders::ALL).title(" ZENITHSW - SMART MONEY SHADOW BOT "))
         .select(app.current_tab)
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
-                .bg(Color::Rgb(20, 20, 40)),
+                .add_modifier(Modifier::UNDERLINED),
         );
 
     frame.render_widget(tabs, chunks[0]);
@@ -98,9 +100,15 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
         let ts_str = wib_dt.format("%H:%M:%S").to_string();
 
         let (type_color, type_str) = match act.activity_type {
-            ActivityType::Buy => (Color::Green, "BOUGHT"),
-            ActivityType::Sell => (Color::Red, "SOLD"),
-            ActivityType::Transfer => (Color::Yellow, "TRANSFERRED"),
+            ActivityType::Buy => (Color::Green, "BOUGHT 🟢".to_string()),
+            ActivityType::Sell => {
+                if act.sell_ratio_pct > 0.0 && act.sell_ratio_pct < 95.0 {
+                    (Color::LightRed, format!("SOLD {:.0}% PARTIAL 🟡", act.sell_ratio_pct))
+                } else {
+                    (Color::Red, "SOLD 100% FULL DUMP 🔴".to_string())
+                }
+            }
+            ActivityType::Transfer => (Color::Yellow, "TRANSFERRED".to_string()),
         };
 
         let line1 = Line::from(vec![
@@ -132,7 +140,7 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(Span::styled(" Real-Time Smart Feed (Sub-Second Ingestion) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+                .title(Span::styled(" Real-Time Smart Feed (Sub-Second Ingestion & Bag Tracker) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         );
     frame.render_widget(act_list, chunks[0]);
 
@@ -174,14 +182,14 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(Span::styled(" Gating & Confluence Engine (Max Delta +5.0%) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                .title(Span::styled(" Gating Matrix (Max Delta +5.0% | Pure Whale Mirror) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         );
     frame.render_widget(sig_list, chunks[1]);
 }
 
 fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
     let header = Row::new(vec![
-        "Rank", "Name / Profile", "Handle", "Chain", "Tier", "Total Realized PnL", "Win Rate", "Trades", "Status",
+        "Rank", "Name / Profile", "Source", "Handle", "Chain", "Tier", "Total Realized PnL", "Win Rate", "Trades", "Status",
     ])
     .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     .bottom_margin(1);
@@ -196,6 +204,12 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
                 WalletTier::TierB => (Color::DarkGray, "[TIER-B]", "MONITOR 🟡"),
             };
 
+            let source_str = if w.source == "ONCHAIN_INDEXER" {
+                "[ONCHAIN 🌐]"
+            } else {
+                "[FOMO ⚡]"
+            };
+
             let formatted_pnl = if w.pnl_24h_usd >= 1_000_000.0 {
                 format!("+${:.2}M", w.pnl_24h_usd / 1_000_000.0)
             } else if w.pnl_24h_usd >= 1_000.0 {
@@ -207,6 +221,7 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
             Row::new(vec![
                 format!("#{:02}", w.rank),
                 w.name.clone(),
+                source_str.to_string(),
                 format!("@{}", w.handle),
                 w.chain.to_string(),
                 tier_str.to_string(),
@@ -222,22 +237,23 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(6),
-            Constraint::Percentage(18),
+            Constraint::Length(5),
             Constraint::Percentage(16),
-            Constraint::Percentage(10),
             Constraint::Percentage(12),
             Constraint::Percentage(14),
-            Constraint::Percentage(10),
+            Constraint::Percentage(9),
+            Constraint::Percentage(11),
+            Constraint::Percentage(13),
+            Constraint::Percentage(9),
             Constraint::Percentage(8),
-            Constraint::Percentage(12),
+            Constraint::Percentage(10),
         ],
     )
     .header(header)
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" FOMO.FAMILY TOP TRADERS WATCHLIST (AUTOMATICALLY SYNCED) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+            .title(Span::styled(" SMART MONEY TARGET WALLETS (FOMO + DIRECT ON-CHAIN INDEXER) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
     );
 
     frame.render_widget(table, area);
@@ -245,7 +261,7 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     let header = Row::new(vec![
-        "ID / Symbol", "Chain", "Target Whale", "Entry Price", "Current Price", "PnL ($)", "PnL (%)", "Status",
+        "ID / Symbol", "Chain", "Target Whale", "Entry Price", "Current Price", "Bag Remaining", "PnL ($)", "PnL (%)", "Status",
     ])
     .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     .bottom_margin(1);
@@ -260,13 +276,16 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
                 Color::Red
             };
 
+            let portion_str = format!("{:.0}%", pos.remaining_portion_pct);
+
             Row::new(vec![
                 pos.token_symbol.clone(),
                 pos.chain.to_string(),
                 format!("@{}", pos.target_whale_handle),
                 format!("${:.6}", pos.entry_price),
                 format!("${:.6}", pos.current_price),
-                format!("${:+.2}", pos.amount_usd * (pos.unrealized_pnl_pct / 100.0)),
+                portion_str,
+                format!("${:+.2}", (pos.amount_usd * (pos.remaining_portion_pct / 100.0)) * (pos.unrealized_pnl_pct / 100.0)),
                 format!("{:+.2}%", pos.unrealized_pnl_pct),
                 pos.status.clone(),
             ])
@@ -277,12 +296,13 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(15),
-            Constraint::Percentage(12),
-            Constraint::Percentage(18),
             Constraint::Percentage(14),
-            Constraint::Percentage(14),
+            Constraint::Percentage(10),
+            Constraint::Percentage(16),
+            Constraint::Percentage(13),
+            Constraint::Percentage(13),
             Constraint::Percentage(12),
+            Constraint::Percentage(11),
             Constraint::Percentage(10),
             Constraint::Percentage(10),
         ],
@@ -291,7 +311,7 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" ACTIVE SHADOW POSITIONS (SHADOW MIRROR EXIT ENABLED) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+            .title(Span::styled(" ACTIVE SHADOW POSITIONS (PURE PROPORTIONAL WHALE MIRROR EXIT) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
     );
 
     frame.render_widget(table, area);
@@ -313,14 +333,12 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" | Jito Anti-MEV Bundles: Active 🟢"),
         ]),
         Line::from(vec![
-            Span::raw(" • Arbitrum (Alchemy WS/RPC): "),
-            Span::styled(format!("{} ms", app.arbitrum_latency_ms), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw(" | Dynamic EIP-1559 Priority: Active 🟢"),
+            Span::raw(" • Direct On-Chain DEX Graph Indexer: "),
+            Span::styled("Active 🟢 (Raydium / Pump.fun Exploding Pool Reverse Profiler)", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
-            Span::raw(" • Base (Alchemy WS/RPC): "),
-            Span::styled(format!("{} ms", app.base_latency_ms), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw(" | Mempool Watcher: Active 🟢"),
+            Span::raw(" • Exit Mechanism: "),
+            Span::styled("Pure Whale Mirror (Proportional Partial & Full Exit)", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
             Span::raw(" • Calibrated Gating: Max Entry Delta = "),
@@ -336,7 +354,7 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
 
     // Trade History Table
     let header = Row::new(vec![
-        "Timestamp (WIB)", "Chain", "Symbol", "Whale Target", "Entry", "Exit", "PnL (%)", "PnL ($)", "Exit Reason",
+        "Timestamp (WIB)", "Chain", "Action", "Symbol", "Whale Target", "Entry", "Exit", "PnL (%)", "PnL ($)", "Exit Reason",
     ])
     .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     .bottom_margin(1);
@@ -352,6 +370,7 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
             Row::new(vec![
                 ts_str,
                 tr.chain.to_string(),
+                tr.action.clone(),
                 tr.symbol.clone(),
                 format!("@{}", tr.target_whale),
                 format!("${:.6}", tr.entry_price),
@@ -367,14 +386,15 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(12),
+            Constraint::Percentage(11),
+            Constraint::Percentage(9),
+            Constraint::Percentage(11),
             Constraint::Percentage(10),
-            Constraint::Percentage(10),
-            Constraint::Percentage(15),
-            Constraint::Percentage(12),
-            Constraint::Percentage(12),
-            Constraint::Percentage(10),
-            Constraint::Percentage(10),
+            Constraint::Percentage(14),
+            Constraint::Percentage(11),
+            Constraint::Percentage(11),
+            Constraint::Percentage(9),
+            Constraint::Percentage(9),
             Constraint::Percentage(15),
         ],
     )
