@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import time
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 
 DB_PATH = "data/smart_wallets.db"
@@ -42,7 +43,7 @@ def sync_leaderboard(token, conn):
             data = json.loads(resp.read().decode())
             items = data.get('responseObject', {}).get('leaderboard', [])
             if not items:
-                return 0
+                return (0, 200, None)
             
             cursor = conn.cursor()
             now = datetime.now(timezone.utc).isoformat()
@@ -94,32 +95,42 @@ def sync_leaderboard(token, conn):
                 """, (rank, name, handle, chain, address, tier, pnl, win_rate, num_trades, now))
                 
             conn.commit()
-            return len(items)
+            return (len(items), 200, None)
+    except urllib.error.HTTPError as e:
+        return (0, e.code, str(e))
     except Exception as e:
-        print(f"[SYNC ERROR] {e}", file=sys.stderr)
-        return 0
+        return (0, 500, str(e))
 
 def main():
-    token = load_token()
-    if not token:
-        print("Error: No FOMO_AUTH_TOKEN found in .env", file=sys.stderr)
-        sys.exit(1)
-        
     os.makedirs("data", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     
-    # Run continuous sync loop
-    print("🚀 FOMO Leaderboard Real-Time Syncer Active (Interval: 5s)")
-    try:
-        while True:
-            count = sync_leaderboard(token, conn)
-            if count > 0:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Successfully synced {count} Smart Wallets with Realized PnL & Win Rate.")
-            time.sleep(5)
-    except KeyboardInterrupt:
-        print("Stopping syncer...")
-    finally:
-        conn.close()
+    print("🚀 FOMO Leaderboard Syncer Active (Calibrated Interval: 30s + Adaptive Backoff)")
+    
+    backoff_sec = 30
+    while True:
+        token = load_token()
+        if not token:
+            print("[FOMO SYNC 🟡] No FOMO_AUTH_TOKEN in .env. Running on existing SQLite cached wallets.")
+            time.sleep(60)
+            continue
+            
+        count, status_code, err_msg = sync_leaderboard(token, conn)
+        
+        if status_code == 200 and count > 0:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [FOMO SYNC 🟢] Successfully synced {count} Smart Wallets with Realized PnL & Win Rate.")
+            backoff_sec = 30
+        elif status_code == 429:
+            backoff_sec = min(120, backoff_sec * 2)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [FOMO SYNC 🟡] Rate limit (429) hit. Pausing syncer for {backoff_sec}s (Engine continues on cached wallets).")
+        elif status_code == 401 or status_code == 430:
+            backoff_sec = 60
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [FOMO SYNC 🟡] Privy token expired ({status_code}). Engine continues running on cached on-chain wallets.")
+        else:
+            backoff_sec = 30
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [FOMO SYNC ⚠️] Sync status {status_code}: {err_msg}")
+            
+        time.sleep(backoff_sec)
 
 if __name__ == "__main__":
     main()

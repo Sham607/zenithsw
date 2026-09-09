@@ -85,12 +85,16 @@ async fn main() -> Result<()> {
         loop {
             if let Ok(wallets) = db_stream.get_active_wallets() {
                 for w in wallets {
-                    // Check FOMO API Direct Swaps first, fallback to Helius RPC
-                    let mut activity_opt = fomo_listener_stream
-                        .check_trader_swaps(&w.handle, &w.address, db_stream.clone())
-                        .await
-                        .ok()
-                        .flatten();
+                    // Check FOMO API Direct Swaps only for Tier-S Whales (to prevent Cloudflare 429), use Helius RPC for others
+                    let mut activity_opt = if w.tier == zenithsw::models::WalletTier::TierS {
+                        fomo_listener_stream
+                            .check_trader_swaps(&w.handle, &w.address, db_stream.clone())
+                            .await
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
 
                     if activity_opt.is_none() {
                         activity_opt = match w.chain {
