@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
                 if let Ok(mut state) = app_ipc.lock() {
                     state.is_connected_ipc = false;
                 }
-                sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(100)).await;
             }
         }
     });

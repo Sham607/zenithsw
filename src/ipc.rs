@@ -2,6 +2,7 @@ use crate::models::{ShadowPosition, ShadowSignal, SmartWallet, WalletActivity};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -38,6 +39,7 @@ pub enum IpcMessage {
 pub struct IpcServer {
     socket_path: String,
     tx: broadcast::Sender<String>,
+    latest_heartbeat: Arc<Mutex<Option<IpcMessage>>>,
 }
 
 impl IpcServer {
@@ -46,6 +48,7 @@ impl IpcServer {
         Self {
             socket_path: socket_path.to_string(),
             tx,
+            latest_heartbeat: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -60,22 +63,38 @@ impl IpcServer {
 
         let listener = UnixListener::bind(&self.socket_path)?;
         let tx = self.tx.clone();
+        let latest_hb = self.latest_heartbeat.clone();
 
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let mut rx = tx.subscribe();
+                let latest_hb_inner = latest_hb.clone();
                 tokio::spawn(async move {
                     let (_, mut write_half) = stream.into_split();
                     
-                    // Send initial heartbeat handshake line immediately
-                    let initial_hb = IpcMessage::Heartbeat {
-                        uptime_secs: 1,
-                        solana_latency_ms: 45,
-                        arbitrum_latency_ms: 38,
-                        base_latency_ms: 42,
-                        tracked_wallets_count: 5,
-                        active_positions_count: 0,
+                    // Send current heartbeat or initial handshake line immediately
+                    let initial_hb = {
+                        if let Ok(guard) = latest_hb_inner.lock() {
+                            guard.clone().unwrap_or(IpcMessage::Heartbeat {
+                                uptime_secs: 1,
+                                solana_latency_ms: 35,
+                                arbitrum_latency_ms: 28,
+                                base_latency_ms: 32,
+                                tracked_wallets_count: 100,
+                                active_positions_count: 0,
+                            })
+                        } else {
+                            IpcMessage::Heartbeat {
+                                uptime_secs: 1,
+                                solana_latency_ms: 35,
+                                arbitrum_latency_ms: 28,
+                                base_latency_ms: 32,
+                                tracked_wallets_count: 100,
+                                active_positions_count: 0,
+                            }
+                        }
                     };
+                    
                     if let Ok(json) = serde_json::to_string(&initial_hb) {
                         let _ = write_half.write_all(json.as_bytes()).await;
                         let _ = write_half.write_all(b"\n").await;
@@ -99,6 +118,11 @@ impl IpcServer {
     }
 
     pub fn broadcast(&self, msg: &IpcMessage) -> Result<()> {
+        if matches!(msg, IpcMessage::Heartbeat { .. }) {
+            if let Ok(mut guard) = self.latest_heartbeat.lock() {
+                *guard = Some(msg.clone());
+            }
+        }
         let json_str = serde_json::to_string(msg)?;
         let _ = self.tx.send(json_str);
         Ok(())
