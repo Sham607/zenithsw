@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
         indexer_worker.run_background_loop().await;
     });
 
-    // Task 2: High-Speed Concurrent Stream Ingestion Worker (<100ms Latency)
+    // Task 2: High-Speed Paced Stream Ingestion Worker (Zero 429 Drop, 200ms per wallet)
     let db_stream = db.clone();
     let sol_listener_stream = sol_listener.clone();
     let arb_listener_stream = arb_listener.clone();
@@ -65,42 +65,27 @@ async fn main() -> Result<()> {
     let sol_exec_stream = sol_exec.clone();
     let evm_exec_stream = evm_exec.clone();
     let ipc_stream = ipc_server.clone();
-    let poll_ms = config.stream_poll_interval_ms;
 
     tokio::spawn(async move {
-        println!("[STREAM WORKER] Concurrent Multi-Chain Streamer online (Cycle: {}ms)", poll_ms);
+        println!("[STREAM WORKER] Paced Multi-Chain Streamer online (5 RPS, Zero Rate-Limit Drop)");
         loop {
             if let Ok(wallets) = db_stream.get_active_wallets() {
-                let check_futures = wallets.into_iter().map(|w: SmartWallet| {
-                    let db = db_stream.clone();
-                    let fomo = fomo_listener_stream.clone();
-                    let sol = sol_listener_stream.clone();
-                    let arb = arb_listener_stream.clone();
-                    let base = base_listener_stream.clone();
+                for w in wallets {
+                    let mut activity_opt = if w.tier == WalletTier::TierS {
+                        fomo_listener_stream.check_trader_swaps(&w.handle, &w.address, db_stream.clone()).await.ok().flatten()
+                    } else {
+                        None
+                    };
 
-                    async move {
-                        let mut activity_opt = if w.tier == WalletTier::TierS {
-                            fomo.check_trader_swaps(&w.handle, &w.address, db.clone()).await.ok().flatten()
-                        } else {
-                            None
+                    if activity_opt.is_none() {
+                        activity_opt = match w.chain {
+                            Chain::Solana => sol_listener_stream.check_recent_txs(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
+                            Chain::Robinhood | Chain::Arbitrum => arb_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
+                            Chain::Base => base_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
+                            _ => None,
                         };
-
-                        if activity_opt.is_none() {
-                            activity_opt = match w.chain {
-                                Chain::Solana => sol.check_recent_txs(&w.handle, &w.address, db.clone()).await.ok().flatten(),
-                                Chain::Robinhood | Chain::Arbitrum => arb.check_wallet_activity(&w.handle, &w.address, db.clone()).await.ok().flatten(),
-                                Chain::Base => base.check_wallet_activity(&w.handle, &w.address, db.clone()).await.ok().flatten(),
-                                _ => None,
-                            };
-                        }
-
-                        (w, activity_opt)
                     }
-                });
 
-                let results = futures_util::future::join_all(check_futures).await;
-
-                for (w, activity_opt) in results {
                     if let Some(act) = activity_opt {
                         println!("[ACTIVITY 🔥] {} by @{} ({}) -> Token: {} (${:.2})", act.activity_type, act.wallet_handle, act.chain, act.token_symbol, act.amount_usd);
                         let _ = ipc_stream.broadcast(&IpcMessage::ActivityBroadcast { activity: act.clone() });
@@ -156,10 +141,13 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
+
+                    // Pacing 200ms between wallets (5 RPS total, zero 429)
+                    sleep(Duration::from_millis(200)).await;
                 }
             }
 
-            sleep(Duration::from_millis(poll_ms)).await;
+            sleep(Duration::from_millis(200)).await;
         }
     });
 
