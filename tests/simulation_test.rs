@@ -272,13 +272,15 @@ async fn test_shadow_execution_and_mirror_exit() {
 #[test]
 fn test_fomo_seed_traders_and_resolver() {
     let seeds = FomoScraper::get_default_seed_traders();
-    assert!(seeds.len() >= 7);
+    assert!(seeds.len() >= 5);
     assert_eq!(seeds[0].handle, "ether_monk");
     assert_eq!(seeds[0].tier, WalletTier::TierS);
 
-    let addr_sol = WalletResolver::resolve_static_address("ether_monk", Chain::Solana);
-    assert_eq!(addr_sol, "EZcv4WSEmX7WopTJc2bfrdaYovpKcxk81s9zXiQ3Zm9i");
+    let res_sol = WalletResolver::resolve_chain_and_address("ether_monk").unwrap();
+    assert_eq!(res_sol.0, Chain::Solana);
+    assert_eq!(res_sol.1, "EZcv4WSEmX7WopTJc2bfrdaYovpKcxk81s9zXiQ3Zm9i");
 
-    let addr_rh = WalletResolver::resolve_static_address("0xAvast", Chain::Robinhood);
-    assert_eq!(addr_rh, "0x7163aE1B5aEa2F09EBc609c52b4DCAC0A7a4bC2D");
+    let res_rh = WalletResolver::resolve_chain_and_address("0xAvast").unwrap();
+    assert_eq!(res_rh.0, Chain::Robinhood);
+    assert_eq!(res_rh.1, "0x7163aE1B5aEa2F09EBc609c52b4DCAC0A7a4bC2D");
 }

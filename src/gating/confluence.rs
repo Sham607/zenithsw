@@ -46,24 +46,17 @@ impl ConfluenceEngine {
             });
         }
 
-        // 2. Calculate Price Delta (Whale Entry vs Current Pool Price)
-        let price_delta_pct = if activity.execution_price_usd > 0.0 && current_pool_price > 0.0 {
-            ((current_pool_price - activity.execution_price_usd) / activity.execution_price_usd) * 100.0
-        } else {
-            0.0
-        };
-
-        // Gating Check A: Price Delta / Slippage Impact (Max +5.0% per user calibrated rule)
-        if price_delta_pct > self.config.max_price_delta_pct {
+        // 2. Strict Price Discovery Gate (Zero price is an immediate reject)
+        if activity.execution_price_usd <= 0.0 || current_pool_price <= 0.0 {
             is_passed = false;
             rejection_reason = Some(format!(
-                "PRICE_DELTA_TOO_HIGH (+{:.2}% > +{:.2}%)",
-                price_delta_pct, self.config.max_price_delta_pct
+                "INVALID_PRICE_OR_UNINDEXED_POOL (Whale: ${:.6}, Pool: ${:.6})",
+                activity.execution_price_usd, current_pool_price
             ));
         }
 
-        // Gating Check B: Pool Liquidity Safety Floor (>= $30,000)
-        if pool_liquidity_usd > 0.0 && pool_liquidity_usd < self.config.min_liquidity_usd {
+        // 3. Strict Liquidity Safety Floor (Zero or Sub-$30k Liquidity is rejected)
+        if pool_liquidity_usd < self.config.min_liquidity_usd {
             is_passed = false;
             if rejection_reason.is_none() {
                 rejection_reason = Some(format!(
@@ -73,8 +66,25 @@ impl ConfluenceEngine {
             }
         }
 
-        // Gating Check C: Multi-Wallet Confluence Rule
-        // Count recent smart buyers in last 300s (5m)
+        // 4. Calculate Price Delta (Whale Entry vs Current Pool Price)
+        let price_delta_pct = if activity.execution_price_usd > 0.0 && current_pool_price > 0.0 {
+            ((current_pool_price - activity.execution_price_usd) / activity.execution_price_usd) * 100.0
+        } else {
+            0.0
+        };
+
+        // Gating Check A: Price Delta / Slippage Impact (Max +5.0%)
+        if price_delta_pct > self.config.max_price_delta_pct {
+            is_passed = false;
+            if rejection_reason.is_none() {
+                rejection_reason = Some(format!(
+                    "PRICE_DELTA_TOO_HIGH (+{:.2}% > +{:.2}%)",
+                    price_delta_pct, self.config.max_price_delta_pct
+                ));
+            }
+        }
+
+        // Gating Check B: Multi-Wallet Confluence Rule (Tier-S instant, Tier-A requires 2+ buyers in 5m)
         let confluence_count = self.db.count_recent_buyers_for_mint(&activity.token_mint, 300).unwrap_or(1);
 
         if wallet.tier != WalletTier::TierS && confluence_count < 2 {

@@ -20,16 +20,21 @@ impl SolanaExecutor {
             return Ok(None);
         }
 
-        let now = Utc::now();
-        let position_id = format!("SOL-{}-{}", signal.token_symbol, now.timestamp());
         let entry_price = if signal.current_pool_price > 0.0 {
             signal.current_pool_price
         } else {
             signal.whale_entry_price
         };
 
+        if entry_price <= 0.0 {
+            eprintln!("[SOLANA EXEC ERROR] Cannot open shadow position with 0.0 price!");
+            return Ok(None);
+        }
+
+        let now = Utc::now();
+        let position_id = format!("SOL-{}-{}", signal.token_symbol, now.timestamp());
         let amount_usd = self.config.position_size_usd;
-        let amount_native = amount_usd / 140.0; // Approx 0.11 SOL proxy
+        let amount_native = amount_usd / 140.0; // Approx SOL proxy
 
         let position = ShadowPosition {
             id: position_id,
