@@ -1,7 +1,7 @@
 use crate::db::SmartWalletDb;
 use crate::models::{ActivityType, Chain, WalletActivity};
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -73,12 +73,26 @@ impl SolanaStreamListener {
             return Ok(None);
         }
 
+        let now = Utc::now();
+        let tx_age_secs = if block_time > 0 {
+            (now.timestamp() - block_time).max(0)
+        } else {
+            0
+        };
+
         // Deduplication & Signature diff check
         {
             let mut last_map = self.last_signatures.lock().unwrap();
             if let Some(last_sig) = last_map.get(address) {
                 if last_sig == signature {
                     return Ok(None); // No new transaction, skip
+                }
+            } else {
+                // First time discovering this wallet on startup:
+                // Record baseline signature. If tx is older than 2 minutes, ignore as historical past trade
+                last_map.insert(address.to_string(), signature.to_string());
+                if tx_age_secs > 120 {
+                    return Ok(None);
                 }
             }
             last_map.insert(address.to_string(), signature.to_string());
@@ -97,13 +111,6 @@ impl SolanaStreamListener {
                 }
             }
         }
-
-        let now = Utc::now();
-        let _tx_age_secs = if block_time > 0 {
-            (now.timestamp() - block_time).max(0)
-        } else {
-            0
-        };
 
         // 2. Fetch full parsed transaction via JSON-RPC getTransaction
         let tx_payload = serde_json::json!({
@@ -168,7 +175,7 @@ impl SolanaStreamListener {
                 }
             }
 
-            // Find changing SPL token (excluding native WSOL/USDC)
+            // Find changing SPL token (excluding native WSOL/USDC/USDT)
             for (mint, post_amt) in &post_map {
                 let is_collateral = mint == "So11111111111111111111111111111111111111112"
                     || mint == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -228,6 +235,28 @@ impl SolanaStreamListener {
             return Ok(None);
         }
 
+        // Calculate native SOL spent/received from transaction balance deltas
+        let mut native_sol_delta = 0.0;
+        let account_keys = tx_result["transaction"]["message"]["accountKeys"].as_array();
+        let pre_balances = meta["preBalances"].as_array();
+        let post_balances = meta["postBalances"].as_array();
+
+        if let (Some(keys), Some(pre_b), Some(post_b)) = (account_keys, pre_balances, post_balances) {
+            for (idx, key_obj) in keys.iter().enumerate() {
+                let pubkey_str = key_obj["pubkey"].as_str().or_else(|| key_obj.as_str()).unwrap_or("");
+                if pubkey_str == address {
+                    let pre_lamports = pre_b.get(idx).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let post_lamports = post_b.get(idx).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let diff = (pre_lamports - post_lamports).abs() / 1_000_000_000.0;
+                    if diff > 0.001 {
+                        native_sol_delta = diff;
+                    }
+                    break;
+                }
+            }
+        }
+
+        let sol_price_usd = 140.0;
         let mut execution_price_usd = 0.0;
         if let Ok((sym, price, _)) = Self::fetch_token_price(&token_mint).await {
             if sym != "UNKNOWN" {
@@ -236,10 +265,25 @@ impl SolanaStreamListener {
             execution_price_usd = price;
         }
 
+        // If DEX price is not yet available, derive price from native SOL spent on-chain
+        if execution_price_usd <= 0.0 && native_sol_delta > 0.0 && token_amount > 0.0 {
+            execution_price_usd = (native_sol_delta * sol_price_usd) / token_amount;
+        }
+
         let amount_usd = if token_amount > 0.0 && execution_price_usd > 0.0 {
             token_amount * execution_price_usd
+        } else if native_sol_delta > 0.0 {
+            native_sol_delta * sol_price_usd
         } else {
-            500.0
+            0.0
+        };
+
+        let tx_time = if block_time > 0 {
+            DateTime::from_timestamp(block_time, 0)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(now)
+        } else {
+            now
         };
 
         let activity = WalletActivity {
@@ -257,14 +301,14 @@ impl SolanaStreamListener {
             whale_balance_after,
             sell_ratio_pct,
             tx_signature: signature.to_string(),
-            timestamp: now,
+            timestamp: tx_time,
         };
 
         let _ = db.insert_activity(&activity);
         Ok(Some(activity))
     }
 
-    /// Fetches live price & liquidity with multi-source fallback (DexScreener + Jupiter Price API v2)
+    /// Fetches live price & liquidity with multi-source fallback (DexScreener + Pump.fun API + Jupiter API v2)
     pub async fn fetch_token_price(mint: &str) -> Result<(String, f64, f64)> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(4))
@@ -298,7 +342,29 @@ impl SolanaStreamListener {
             }
         }
 
-        // Source 2: Jupiter Price API v2
+        // Source 2: Pump.fun API for newly launched bonding curves
+        let pump_url = format!("https://frontend-api.pump.fun/coins/{}", mint);
+        if let Ok(res) = client.get(&pump_url).send().await {
+            if let Ok(json) = res.json::<Value>().await {
+                let symbol = json.get("symbol").and_then(|s| s.as_str()).unwrap_or("PUMP_TOKEN").to_string();
+                let usd_market_cap = json.get("usd_market_cap").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let virtual_sol_reserves = json.get("virtual_sol_reserves").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                
+                // Virtual liquidity in USD on Pump.fun curve (2x Virtual SOL in USD)
+                let liq_usd = (virtual_sol_reserves / 1_000_000_000.0) * 140.0 * 2.0;
+                let price_usd = if usd_market_cap > 0.0 {
+                    usd_market_cap / 1_000_000_000.0 // 1B total supply on pump.fun
+                } else {
+                    0.000005
+                };
+
+                if price_usd > 0.0 {
+                    return Ok((symbol, price_usd, liq_usd));
+                }
+            }
+        }
+
+        // Source 3: Jupiter Price API v2
         let jup_url = format!("https://api.jup.ag/price/v2?ids={}", mint);
         if let Ok(res) = client.get(&jup_url).send().await {
             if let Ok(json) = res.json::<Value>().await {
