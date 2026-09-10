@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table, Tabs},
+    widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Tabs},
     Frame,
 };
 
@@ -323,12 +323,16 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
                 Color::White
             };
 
-            let _upside_color = if t.upside_tier.contains("MICRO_CAP") {
-                Color::Cyan
+            let upside_style = if t.upside_tier.contains("NANO_CAP") {
+                Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)
+            } else if t.upside_tier.contains("MICRO_CAP") {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else if t.upside_tier.contains("LOW_CAP") {
+                Style::default().fg(Color::LightBlue)
             } else if t.upside_tier.contains("SMALL_CAP") {
-                Color::Magenta
+                Style::default().fg(Color::Magenta)
             } else {
-                Color::DarkGray
+                Style::default().fg(Color::DarkGray)
             };
 
             let mint_display = if t.token_mint.len() > 18 {
@@ -359,19 +363,18 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
             let upside_full = format!("{} [{}]", mcap_str, t.upside_tier);
 
             Row::new(vec![
-                format!("#{}", idx + 1),
-                t.token_symbol.clone(),
-                t.chain.to_string(),
-                mint_display,
-                cluster_display,
-                whale_usd_str,
-                upside_full,
-                liq_str,
-                format!("${:.6}", t.price_usd),
-                format!("{:+.1}% / {:+.1}%", t.change_24h_pct, t.change_1h_pct),
-                t.status.clone(),
+                Cell::from(format!("#{}", idx + 1)).style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Cell::from(t.token_symbol.clone()).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Cell::from(t.chain.to_string()),
+                Cell::from(mint_display).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(cluster_display),
+                Cell::from(whale_usd_str).style(Style::default().fg(Color::Green)),
+                Cell::from(upside_full).style(upside_style),
+                Cell::from(liq_str),
+                Cell::from(format!("${:.6}", t.price_usd)),
+                Cell::from(format!("{:+.1}% / {:+.1}%", t.change_24h_pct, t.change_1h_pct)),
+                Cell::from(t.status.clone()).style(Style::default().fg(status_color)),
             ])
-            .style(Style::default().fg(status_color))
         })
         .collect();
 

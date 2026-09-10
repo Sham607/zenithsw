@@ -289,9 +289,13 @@ impl FomoScraper {
                         let change_6h_pct = pair.get("priceChange").and_then(|pc| pc.get("h6")).and_then(|v| v.as_f64()).unwrap_or(0.0);
                         let change_1h_pct = pair.get("priceChange").and_then(|pc| pc.get("h1")).and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-                        // Classify Upside Potential (Micro/Small/Mid Cap)
-                        let upside_tier = if market_cap_usd > 0.0 && market_cap_usd < 15_000_000.0 {
-                            "MICRO_CAP 🚀 (<$15M)".to_string()
+                        // Classify Upside Potential (Nano/Micro/Low/Mid Cap)
+                        let upside_tier = if market_cap_usd > 0.0 && market_cap_usd < 1_000_000.0 {
+                            "NANO_CAP 🚀🚀 (<$1M)".to_string()
+                        } else if market_cap_usd >= 1_000_000.0 && market_cap_usd < 3_000_000.0 {
+                            "MICRO_CAP 🚀 ($1M-$3M)".to_string()
+                        } else if market_cap_usd >= 3_000_000.0 && market_cap_usd < 15_000_000.0 {
+                            "LOW_CAP 💎 ($3M-$15M)".to_string()
                         } else if market_cap_usd >= 15_000_000.0 && market_cap_usd < 50_000_000.0 {
                             "SMALL_CAP 💎 ($15M-$50M)".to_string()
                         } else {

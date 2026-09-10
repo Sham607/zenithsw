@@ -934,7 +934,17 @@ impl SmartWalletDb {
                     change_24h_pct, change_6h_pct, change_1h_pct, whale_count, total_whale_usd,
                     top_whale_handles, status, upside_tier, last_scanned_at
              FROM tracked_tokens
-             ORDER BY whale_count DESC, total_whale_usd DESC LIMIT ?1",
+             ORDER BY 
+                CASE 
+                    WHEN market_cap_usd > 0.0 AND market_cap_usd < 1000000.0 THEN 1
+                    WHEN market_cap_usd >= 1000000.0 AND market_cap_usd < 3000000.0 THEN 2
+                    WHEN market_cap_usd >= 3000000.0 AND market_cap_usd < 15000000.0 THEN 3
+                    WHEN market_cap_usd >= 15000000.0 AND market_cap_usd < 50000000.0 THEN 4
+                    ELSE 5 
+                END ASC,
+                whale_count DESC, 
+                total_whale_usd DESC 
+             LIMIT ?1",
         )?;
 
         let rows = stmt.query_map(params![limit], |row| {
