@@ -15,24 +15,29 @@ engine:
 	cargo run --release --bin zenithsw-engine
 
 start: release
-	@if ! pgrep -f "target/release/zenithsw-engine" > /dev/null; then \
-		echo "🚀 Auto-launching ZenithSW Engine Daemon..."; \
-		nohup ./target/release/zenithsw-engine > data/engine.log 2>&1 & \
+	@if systemctl --user is-active --quiet zenithsw-engine.service; then \
+		echo "🟢 ZenithSW Engine Daemon is active (systemd)."; \
+	elif ! pgrep -f "target/release/zenithsw-engine" > /dev/null; then \
+		echo "🚀 Auto-launching ZenithSW Engine Daemon via systemd..."; \
+		systemctl --user start zenithsw-engine.service || (nohup ./target/release/zenithsw-engine > data/engine.log 2>&1 &); \
 		sleep 1; \
 	fi
 	@cargo run --release --bin zenithsw
 
 stop:
 	@echo "Stopping ZenithSW Engine Daemon..."
+	@systemctl --user stop zenithsw-engine.service 2>/dev/null || true
 	@pkill -x zenithsw-engine || true
 	@echo "[OK] Engine stopped."
 
-restart: stop
-	@sleep 1
-	@echo "Starting ZenithSW Engine Daemon..."
-	@./target/release/zenithsw-engine &
+restart:
+	@echo "Restarting ZenithSW Engine Daemon..."
+	@systemctl --user restart zenithsw-engine.service 2>/dev/null || ./target/release/zenithsw-engine &
 	@sleep 1
 	@echo "[OK] Engine restarted."
+
+logs:
+	@journalctl --user -u zenithsw-engine.service -f
 
 reset:
 	@echo "Resetting Smart Wallets Database and Cache..."
