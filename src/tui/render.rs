@@ -337,8 +337,40 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
     )
     .bottom_margin(1);
 
-    let rows: Vec<Row> = app
+    // Count shadows per master handle
+    let mut shadow_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for w in &app.wallets {
+        if w.handle.contains("_sub_")
+            || w.source.contains("CLUSTER")
+            || w.source.contains("DETECTIVE")
+        {
+            let root = w
+                .handle
+                .split("_sub_")
+                .next()
+                .unwrap_or(&w.handle)
+                .to_string();
+            *shadow_counts.entry(root).or_insert(0) += 1;
+        }
+    }
+
+    // Filter to master wallets to prevent flat table duplication
+    let displayed_wallets: Vec<&crate::models::SmartWallet> = app
         .wallets
+        .iter()
+        .filter(|w| {
+            // Include non-shadow wallets, or include shadow wallets only if their root master is not in the list
+            if w.handle.contains("_sub_") {
+                let root = w.handle.split("_sub_").next().unwrap_or(&w.handle);
+                !app.wallets.iter().any(|m| m.handle == root)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let rows: Vec<Row> = displayed_wallets
         .iter()
         .map(|w| {
             let (tier_color, tier_str, status_str) = match w.tier {
@@ -347,10 +379,20 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
                 WalletTier::TierB => (Color::DarkGray, "[TIER-B]", "MONITOR 🟡"),
             };
 
-            let source_str = if w.source.contains("CLUSTER") || w.source.contains("DETECTIVE") {
+            let shadow_count = shadow_counts.get(&w.handle).copied().unwrap_or(0);
+
+            let source_str = if shadow_count > 0 {
+                "[CLUSTER 🕵️]"
+            } else if w.source.contains("CLUSTER") || w.source.contains("DETECTIVE") {
                 "[DETECTIVE 🕵️]"
             } else if w.source.contains("NANSEN") {
                 "[NANSEN 🧠]"
+            } else if w.source.contains("DUNE") {
+                "[DUNE 🎯]"
+            } else if w.source.contains("OKX") {
+                "[OKX 🌐]"
+            } else if w.source.contains("SOLANA_TRACKER") {
+                "[TRACKER ⚡]"
             } else if w.source.contains("ONCHAIN") {
                 "[ONCHAIN 🌐]"
             } else if w.source.contains("FOMO") {
@@ -377,9 +419,15 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
                 w.address.clone()
             };
 
+            let name_display = if shadow_count > 0 {
+                format!("{} (+{} shadows 🕵️)", w.name, shadow_count)
+            } else {
+                w.name.clone()
+            };
+
             Row::new(vec![
                 format!("#{:02}", w.rank),
-                w.name.clone(),
+                name_display,
                 source_str.to_string(),
                 format!("@{}", w.handle),
                 w.chain.to_string(),
@@ -398,22 +446,26 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Length(5),
-            Constraint::Percentage(15),
+            Constraint::Percentage(18),
             Constraint::Percentage(10),
             Constraint::Percentage(12),
             Constraint::Percentage(8),
             Constraint::Percentage(9),
-            Constraint::Percentage(12),
-            Constraint::Percentage(8),
+            Constraint::Percentage(11),
+            Constraint::Percentage(7),
             Constraint::Percentage(6),
-            Constraint::Percentage(15),
+            Constraint::Percentage(14),
             Constraint::Percentage(9),
         ],
     )
     .header(header)
     .block(
         Block::default().borders(Borders::ALL).title(Span::styled(
-            " SMART MONEY TARGET WALLETS (SORTED BY REALIZED PNL & ON-CHAIN REPUTATION) ",
+            format!(
+                " SMART MONEY TARGET WALLETS (SHOWING {} CLUSTERS / MASTERS | TOTAL TRACKED: {}) ",
+                displayed_wallets.len(),
+                app.wallets.len()
+            ),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
