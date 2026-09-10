@@ -22,29 +22,58 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
     // 1. Tab Bar Navigation [1]-[5]
     let tab_titles = vec![
         Line::from(vec![
-            Span::styled("[1]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[1]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" LIVE STREAM ⚡"),
         ]),
         Line::from(vec![
-            Span::styled("[2]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[2]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" TARGET WALLETS 🎯"),
         ]),
         Line::from(vec![
-            Span::styled("[3]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[3]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" WHALE GEMS RADAR 💎"),
         ]),
         Line::from(vec![
-            Span::styled("[4]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[4]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" SHADOW POSITIONS 💼"),
         ]),
         Line::from(vec![
-            Span::styled("[5]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[5]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" LATENCY & STATS 📊"),
         ]),
     ];
 
     let tabs = Tabs::new(tab_titles)
-        .block(Block::default().borders(Borders::ALL).title(" ZENITHSW - SMART MONEY SHADOW BOT "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" ZENITHSW - SMART MONEY SHADOW BOT "),
+        )
         .select(app.current_tab)
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
@@ -68,9 +97,19 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
 
     // 3. Footer / Status bar
     let ipc_status = if app.is_connected_ipc {
-        Span::styled(" [ENGINE: ONLINE 🟢] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        Span::styled(
+            " [ENGINE: ONLINE 🟢] ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
-        Span::styled(" [ENGINE: STANDALONE/OFFLINE 🟡] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        Span::styled(
+            " [ENGINE: STANDALONE/OFFLINE 🟡] ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
     };
 
     let footer_text = Line::from(vec![
@@ -80,11 +119,20 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         Span::raw(" Switch Tabs | "),
         Span::styled("[Q]", Style::default().fg(Color::Red)),
         Span::raw(" Quit | Tracked Wallets: "),
-        Span::styled(format!("{}", app.wallets.len()), Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("{}", app.wallets.len()),
+            Style::default().fg(Color::Yellow),
+        ),
         Span::raw(" | Tracked Gems: "),
-        Span::styled(format!("{}", app.tracked_tokens.len()), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("{}", app.tracked_tokens.len()),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::raw(" | Active Positions: "),
-        Span::styled(format!("{}", app.positions.len()), Style::default().fg(Color::Green)),
+        Span::styled(
+            format!("{}", app.positions.len()),
+            Style::default().fg(Color::Green),
+        ),
     ]);
 
     let footer = Paragraph::new(footer_text)
@@ -103,14 +151,19 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
     // Left: Live Whale Activities
     let mut act_items = Vec::new();
     for act in app.activities.iter().rev().take(15) {
-        let wib_dt = act.timestamp.with_timezone(&FixedOffset::east_opt(7 * 3600).unwrap());
+        let wib_dt = act
+            .timestamp
+            .with_timezone(&FixedOffset::east_opt(7 * 3600).unwrap());
         let ts_str = wib_dt.format("%H:%M:%S").to_string();
 
         let (type_color, type_str) = match act.activity_type {
             ActivityType::Buy => (Color::Green, "BOUGHT 🟢".to_string()),
             ActivityType::Sell => {
                 if act.sell_ratio_pct > 0.0 && act.sell_ratio_pct < 95.0 {
-                    (Color::LightRed, format!("SOLD {:.0}% PARTIAL 🟡", act.sell_ratio_pct))
+                    (
+                        Color::LightRed,
+                        format!("SOLD {:.0}% PARTIAL 🟡", act.sell_ratio_pct),
+                    )
                 } else {
                     (Color::Red, "SOLD 100% FULL DUMP 🔴".to_string())
                 }
@@ -119,35 +172,70 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
         };
 
         let line1 = Line::from(vec![
-            Span::styled(format!("[{}] ", ts_str), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("[{}] ", act.chain), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("@{} ", act.wallet_handle), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled(type_str, Style::default().fg(type_color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" ${:.2}", act.amount_usd), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("[{}] ", ts_str),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("[{}] ", act.chain),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("@{} ", act.wallet_handle),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                type_str,
+                Style::default().fg(type_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ${:.2}", act.amount_usd),
+                Style::default().fg(Color::Yellow),
+            ),
         ]);
 
         let mint_display = if act.token_mint.len() > 18 {
-            format!("{}...{}", &act.token_mint[..8], &act.token_mint[act.token_mint.len() - 6..])
+            format!(
+                "{}...{}",
+                &act.token_mint[..8],
+                &act.token_mint[act.token_mint.len() - 6..]
+            )
         } else {
             act.token_mint.clone()
         };
 
         let line2 = Line::from(vec![
             Span::raw("   └─ Token: "),
-            Span::styled(&act.token_symbol, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &act.token_symbol,
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" | Contract: "),
-            Span::styled(mint_display, Style::default().fg(Color::DarkGray).add_modifier(Modifier::UNDERLINED)),
+            Span::styled(
+                mint_display,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
         ]);
 
         act_items.push(ListItem::new(vec![line1, line2]));
     }
 
-    let act_list = List::new(act_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(" Real-Time Smart Feed (Multi-Chain Stream & Smart Contract Ingestion) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
-        );
+    let act_list = List::new(act_items).block(
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            " Real-Time Smart Feed (Multi-Chain Stream & Smart Contract Ingestion) ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
+    );
     frame.render_widget(act_list, chunks[0]);
 
     // Right: Shadow Confluence Signals & Decisions
@@ -160,14 +248,31 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
         };
 
         let line1 = Line::from(vec![
-            Span::styled(format!("[{}] ", sig.chain), Style::default().fg(Color::Cyan)),
-            Span::styled(&sig.token_symbol, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("[{}] ", sig.chain),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                &sig.token_symbol,
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" -> "),
-            Span::styled(status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                status_text,
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]);
 
         let mint_display = if sig.token_mint.len() > 18 {
-            format!("{}...{}", &sig.token_mint[..8], &sig.token_mint[sig.token_mint.len() - 6..])
+            format!(
+                "{}...{}",
+                &sig.token_mint[..8],
+                &sig.token_mint[sig.token_mint.len() - 6..]
+            )
         } else {
             sig.token_mint.clone()
         };
@@ -185,29 +290,51 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw("   └─ Contract: "),
                 Span::styled(mint_display, Style::default().fg(Color::DarkGray)),
                 Span::raw(" | Delta: "),
-                Span::styled(format!("+{:.2}%", sig.price_delta_pct), Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("+{:.2}%", sig.price_delta_pct),
+                    Style::default().fg(Color::Green),
+                ),
                 Span::raw(" | Target: "),
-                Span::styled(format!("@{}", sig.whale_handle), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("@{}", sig.whale_handle),
+                    Style::default().fg(Color::Yellow),
+                ),
             ]));
         }
 
         sig_items.push(ListItem::new(sublines));
     }
 
-    let sig_list = List::new(sig_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(" Gating Matrix (Max Delta +10.0% | Min Liq $5k | Pure Whale Mirror) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-        );
+    let sig_list = List::new(sig_items).block(
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            " Gating Matrix (Max Delta +10.0% | Min Liq $5k | Pure Whale Mirror) ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    );
     frame.render_widget(sig_list, chunks[1]);
 }
 
 fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
     let header = Row::new(vec![
-        "Rank", "Name / Profile", "Source", "Handle", "Chain", "Tier", "Total Realized PnL", "Win Rate", "Trades", "Wallet Address / Contract", "Status",
+        "Rank",
+        "Name / Profile",
+        "Source",
+        "Handle",
+        "Chain",
+        "Tier",
+        "Total Realized PnL",
+        "Win Rate",
+        "Trades",
+        "Wallet Address / Contract",
+        "Status",
     ])
-    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
     .bottom_margin(1);
 
     let rows: Vec<Row> = app
@@ -220,7 +347,9 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
                 WalletTier::TierB => (Color::DarkGray, "[TIER-B]", "MONITOR 🟡"),
             };
 
-            let source_str = if w.source.contains("NANSEN") {
+            let source_str = if w.source.contains("CLUSTER") || w.source.contains("DETECTIVE") {
+                "[DETECTIVE 🕵️]"
+            } else if w.source.contains("NANSEN") {
                 "[NANSEN 🧠]"
             } else if w.source.contains("ONCHAIN") {
                 "[ONCHAIN 🌐]"
@@ -239,7 +368,11 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
             };
 
             let addr_display = if w.address.len() > 18 {
-                format!("{}...{}", &w.address[..8], &w.address[w.address.len() - 6..])
+                format!(
+                    "{}...{}",
+                    &w.address[..8],
+                    &w.address[w.address.len() - 6..]
+                )
             } else {
                 w.address.clone()
             };
@@ -279,9 +412,12 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
     )
     .header(header)
     .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(" SMART MONEY TARGET WALLETS (SORTED BY REALIZED PNL & ON-CHAIN REPUTATION) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            " SMART MONEY TARGET WALLETS (SORTED BY REALIZED PNL & ON-CHAIN REPUTATION) ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
     );
 
     frame.render_widget(table, area);
@@ -313,20 +449,25 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, t)| {
-            let status_color = if t.status.contains("ACCUMULATION_BOTTOM") || t.status.contains("Ready Buy") {
-                Color::Green
-            } else if t.status.contains("PULLBACK") || t.status.contains("OVERSOLD") {
-                Color::Yellow
-            } else if t.status.contains("LOCAL_TOP") {
-                Color::Red
-            } else {
-                Color::White
-            };
+            let status_color =
+                if t.status.contains("ACCUMULATION_BOTTOM") || t.status.contains("Ready Buy") {
+                    Color::Green
+                } else if t.status.contains("PULLBACK") || t.status.contains("OVERSOLD") {
+                    Color::Yellow
+                } else if t.status.contains("LOCAL_TOP") {
+                    Color::Red
+                } else {
+                    Color::White
+                };
 
             let upside_style = if t.upside_tier.contains("NANO_CAP") {
-                Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD)
             } else if t.upside_tier.contains("MICRO_CAP") {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else if t.upside_tier.contains("LOW_CAP") {
                 Style::default().fg(Color::LightBlue)
             } else if t.upside_tier.contains("SMALL_CAP") {
@@ -336,7 +477,11 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
             };
 
             let mint_display = if t.token_mint.len() > 18 {
-                format!("{}...{}", &t.token_mint[..8], &t.token_mint[t.token_mint.len() - 6..])
+                format!(
+                    "{}...{}",
+                    &t.token_mint[..8],
+                    &t.token_mint[t.token_mint.len() - 6..]
+                )
             } else {
                 t.token_mint.clone()
             };
@@ -363,8 +508,16 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
             let upside_full = format!("{} [{}]", mcap_str, t.upside_tier);
 
             Row::new(vec![
-                Cell::from(format!("#{}", idx + 1)).style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Cell::from(t.token_symbol.clone()).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Cell::from(format!("#{}", idx + 1)).style(
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(t.token_symbol.clone()).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Cell::from(t.chain.to_string()),
                 Cell::from(mint_display).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(cluster_display),
@@ -372,7 +525,10 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
                 Cell::from(upside_full).style(upside_style),
                 Cell::from(liq_str),
                 Cell::from(format!("${:.6}", t.price_usd)),
-                Cell::from(format!("{:+.1}% / {:+.1}%", t.change_24h_pct, t.change_1h_pct)),
+                Cell::from(format!(
+                    "{:+.1}% / {:+.1}%",
+                    t.change_24h_pct, t.change_1h_pct
+                )),
                 Cell::from(t.status.clone()).style(Style::default().fg(status_color)),
             ])
         })
@@ -409,9 +565,22 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     let header = Row::new(vec![
-        "Symbol", "Chain", "Contract / Mint Address", "Target Whale", "Entry Price", "Current Price", "Bag %", "PnL ($)", "PnL (%)", "Status",
+        "Symbol",
+        "Chain",
+        "Contract / Mint Address",
+        "Target Whale",
+        "Entry Price",
+        "Current Price",
+        "Bag %",
+        "PnL ($)",
+        "PnL (%)",
+        "Status",
     ])
-    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
     .bottom_margin(1);
 
     let rows: Vec<Row> = app
@@ -426,7 +595,11 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
 
             let portion_str = format!("{:.0}%", pos.remaining_portion_pct);
             let mint_display = if pos.token_mint.len() > 18 {
-                format!("{}...{}", &pos.token_mint[..8], &pos.token_mint[pos.token_mint.len() - 6..])
+                format!(
+                    "{}...{}",
+                    &pos.token_mint[..8],
+                    &pos.token_mint[pos.token_mint.len() - 6..]
+                )
             } else {
                 pos.token_mint.clone()
             };
@@ -445,7 +618,11 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
                 format!("${:.6}", pos.entry_price),
                 format!("${:.6}", pos.current_price),
                 portion_str,
-                format!("${:+.2}", (pos.amount_usd * (pos.remaining_portion_pct / 100.0)) * (pos.unrealized_pnl_pct / 100.0)),
+                format!(
+                    "${:+.2}",
+                    (pos.amount_usd * (pos.remaining_portion_pct / 100.0))
+                        * (pos.unrealized_pnl_pct / 100.0)
+                ),
                 format!("{:+.2}%", pos.unrealized_pnl_pct),
                 pos.status.clone(),
             ])
@@ -470,9 +647,12 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     )
     .header(header)
     .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(" ACTIVE SHADOW POSITIONS (LIVE REAL-TIME FLOATING PNL & CONTRACT DISPLAY) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            " ACTIVE SHADOW POSITIONS (LIVE REAL-TIME FLOATING PNL & CONTRACT DISPLAY) ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
     );
 
     frame.render_widget(table, area);
@@ -485,51 +665,107 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     let info_text = vec![
-        Line::from(vec![
-            Span::styled("Multi-Chain Stream Health & Network Latencies:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "Multi-Chain Stream Health & Network Latencies:",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::from(vec![
             Span::raw(" • Solana (Helius Dedicated WS/RPC): "),
-            Span::styled(format!("{} ms", app.solana_latency_ms), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} ms", app.solana_latency_ms),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" | Jito Anti-MEV Bundles: Active 🟢"),
         ]),
         Line::from(vec![
             Span::raw(" • Robinhood / Arbitrum (Alchemy EVM): "),
-            Span::styled(format!("{} ms", app.arbitrum_latency_ms), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} ms", app.arbitrum_latency_ms),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" | Full Asset Transfers Stream: Active 🟢"),
         ]),
         Line::from(vec![
             Span::raw(" • Exit Mechanism: "),
-            Span::styled("Pure Whale Mirror (Proportional Partial & Full Exit)", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Pure Whale Mirror (Proportional Partial & Full Exit)",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::raw(" • Active Calibrated Gating: Max Entry Delta = "),
-            Span::styled("+10.0%", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "+10.0%",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" | Min Pool Liquidity = "),
-            Span::styled("$5,000", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "$5,000",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" | Position Size = "),
-            Span::styled("$5.00", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "$5.00",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
     ];
 
-    let info_block = Paragraph::new(info_text)
-        .block(Block::default().borders(Borders::ALL).title(" Pipeline Latency & Active Settings "));
+    let info_block = Paragraph::new(info_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Pipeline Latency & Active Settings "),
+    );
     frame.render_widget(info_block, chunks[0]);
 
     // Trade History Table
     let header = Row::new(vec![
-        "Timestamp (WIB)", "Chain", "Action", "Symbol", "Contract / Mint", "Whale Target", "Entry", "Exit", "PnL (%)", "PnL ($)", "Exit Reason",
+        "Timestamp (WIB)",
+        "Chain",
+        "Action",
+        "Symbol",
+        "Contract / Mint",
+        "Whale Target",
+        "Entry",
+        "Exit",
+        "PnL (%)",
+        "PnL ($)",
+        "Exit Reason",
     ])
-    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
     .bottom_margin(1);
 
     let rows: Vec<Row> = app
         .trades
         .iter()
         .map(|tr| {
-            let wib_dt = tr.timestamp.with_timezone(&FixedOffset::east_opt(7 * 3600).unwrap());
+            let wib_dt = tr
+                .timestamp
+                .with_timezone(&FixedOffset::east_opt(7 * 3600).unwrap());
             let ts_str = wib_dt.format("%H:%M:%S").to_string();
-            let pnl_color = if tr.pnl_pct >= 0.0 { Color::Green } else { Color::Red };
+            let pnl_color = if tr.pnl_pct >= 0.0 {
+                Color::Green
+            } else {
+                Color::Red
+            };
 
             let mint_display = if tr.mint.len() > 16 {
                 format!("{}...{}", &tr.mint[..7], &tr.mint[tr.mint.len() - 5..])
@@ -572,9 +808,12 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
     )
     .header(header)
     .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(" RECENT SHADOW EXECUTIONS AUDIT LOG (WITH SMART CONTRACT MINT) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            " RECENT SHADOW EXECUTIONS AUDIT LOG (WITH SMART CONTRACT MINT) ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
     );
 
     frame.render_widget(table, chunks[1]);

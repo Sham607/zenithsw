@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-static PRICE_CACHE: OnceLock<RwLock<HashMap<String, (String, f64, f64, Instant)>>> = OnceLock::new();
+static PRICE_CACHE: OnceLock<RwLock<HashMap<String, (String, f64, f64, Instant)>>> =
+    OnceLock::new();
 
 fn get_price_cache() -> &'static RwLock<HashMap<String, (String, f64, f64, Instant)>> {
     PRICE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
@@ -189,7 +190,9 @@ impl SolanaStreamListener {
         }
 
         let pre_token_balances = meta["preTokenBalances"].as_array();
-        let post_token_balances = meta["post_tokenBalances"].as_array().or_else(|| meta["postTokenBalances"].as_array());
+        let post_token_balances = meta["post_tokenBalances"]
+            .as_array()
+            .or_else(|| meta["postTokenBalances"].as_array());
 
         let mut token_mint = "".to_string();
         let mut token_symbol = "UNKNOWN".to_string();
@@ -354,28 +357,39 @@ impl SolanaStreamListener {
                         let mut best_price = 0.0;
 
                         for pair in pairs {
-                            let base_addr = pair.get("baseToken").and_then(|b| b.get("address")).and_then(|s| s.as_str()).unwrap_or("");
-                            
+                            let base_addr = pair
+                                .get("baseToken")
+                                .and_then(|b| b.get("address"))
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("");
+
                             // STRICT: Base token address MUST match query mint (case-insensitive)
                             if !base_addr.eq_ignore_ascii_case(mint) {
                                 continue;
                             }
 
                             let dex_id = pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
-                            let sym = pair.get("baseToken").and_then(|b| b.get("symbol")).and_then(|s| s.as_str()).unwrap_or("");
-                            let price: f64 = pair.get("priceUsd")
+                            let sym = pair
+                                .get("baseToken")
+                                .and_then(|b| b.get("symbol"))
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("");
+                            let price: f64 = pair
+                                .get("priceUsd")
                                 .and_then(|p| p.as_str())
                                 .and_then(|s| s.parse().ok())
                                 .unwrap_or(0.0);
-                            
-                            let mut liq: f64 = pair.get("liquidity")
+
+                            let mut liq: f64 = pair
+                                .get("liquidity")
                                 .and_then(|l| l.get("usd"))
                                 .and_then(|v| v.as_f64())
                                 .unwrap_or(0.0);
 
                             // For Pump.fun bonding curves where liquidity object is null/0, derive virtual liquidity from marketCap / fdv
                             if dex_id == "pumpfun" && liq <= 0.0 {
-                                let mcap: f64 = pair.get("marketCap")
+                                let mcap: f64 = pair
+                                    .get("marketCap")
                                     .or_else(|| pair.get("fdv"))
                                     .and_then(|v| v.as_f64())
                                     .unwrap_or(0.0);
@@ -403,7 +417,15 @@ impl SolanaStreamListener {
                         let effective_liq = max_liq.max(total_liq);
                         if best_price > 0.0 {
                             if let Ok(mut cache) = get_price_cache().write() {
-                                cache.insert(mint.to_string(), (best_symbol.clone(), best_price, effective_liq, Instant::now()));
+                                cache.insert(
+                                    mint.to_string(),
+                                    (
+                                        best_symbol.clone(),
+                                        best_price,
+                                        effective_liq,
+                                        Instant::now(),
+                                    ),
+                                );
                             }
                             return Ok((best_symbol, best_price, effective_liq));
                         }
@@ -424,12 +446,28 @@ impl SolanaStreamListener {
                             .map(|addr| addr.eq_ignore_ascii_case(mint))
                             .unwrap_or(false)
                     }) {
-                        let symbol = pair.get("baseToken").and_then(|b| b.get("symbol")).and_then(|s| s.as_str()).unwrap_or("TOKEN").to_string();
-                        let price_usd: f64 = pair.get("priceUsd").and_then(|p| p.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-                        let liquidity_usd: f64 = pair.get("liquidity").and_then(|l| l.get("usd")).and_then(|v| v.as_f64()).unwrap_or(35000.0);
+                        let symbol = pair
+                            .get("baseToken")
+                            .and_then(|b| b.get("symbol"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("TOKEN")
+                            .to_string();
+                        let price_usd: f64 = pair
+                            .get("priceUsd")
+                            .and_then(|p| p.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0.0);
+                        let liquidity_usd: f64 = pair
+                            .get("liquidity")
+                            .and_then(|l| l.get("usd"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(35000.0);
                         if price_usd > 0.0 {
                             if let Ok(mut cache) = get_price_cache().write() {
-                                cache.insert(mint.to_string(), (symbol.clone(), price_usd, liquidity_usd, Instant::now()));
+                                cache.insert(
+                                    mint.to_string(),
+                                    (symbol.clone(), price_usd, liquidity_usd, Instant::now()),
+                                );
                             }
                             return Ok((symbol, price_usd, liquidity_usd));
                         }

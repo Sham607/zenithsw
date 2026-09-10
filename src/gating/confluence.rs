@@ -60,7 +60,10 @@ impl ConfluenceEngine {
                 price_delta_pct: 0.0,
                 pool_liquidity_usd,
                 is_passed: false,
-                rejection_reason: Some(format!("REJECTED_BASE_ASSET_OR_STABLECOIN ({})", activity.token_symbol)),
+                rejection_reason: Some(format!(
+                    "REJECTED_BASE_ASSET_OR_STABLECOIN ({})",
+                    activity.token_symbol
+                )),
                 confluence_count: 0,
                 timestamp: now,
             });
@@ -68,9 +71,15 @@ impl ConfluenceEngine {
 
         // 1c. Duplicate Whale & Max Token Exposure Check on Active Positions
         if let Ok(active_positions) = self.db.get_active_positions() {
-            if let Some(pos) = active_positions.iter().find(|p| p.token_mint.eq_ignore_ascii_case(&activity.token_mint) && p.chain == activity.chain) {
+            if let Some(pos) = active_positions.iter().find(|p| {
+                p.token_mint.eq_ignore_ascii_case(&activity.token_mint) && p.chain == activity.chain
+            }) {
                 // Reject if THIS specific whale address is already part of this active position
-                if pos.target_whale_address.to_lowercase().contains(&activity.wallet_address.to_lowercase()) {
+                if pos
+                    .target_whale_address
+                    .to_lowercase()
+                    .contains(&activity.wallet_address.to_lowercase())
+                {
                     return Ok(ShadowSignal {
                         chain: activity.chain,
                         token_symbol: activity.token_symbol.clone(),
@@ -83,7 +92,10 @@ impl ConfluenceEngine {
                         price_delta_pct: 0.0,
                         pool_liquidity_usd,
                         is_passed: false,
-                        rejection_reason: Some(format!("REJECTED_WHALE_ALREADY_IN_POSITION (@{})", activity.wallet_handle)),
+                        rejection_reason: Some(format!(
+                            "REJECTED_WHALE_ALREADY_IN_POSITION (@{})",
+                            activity.wallet_handle
+                        )),
                         confluence_count: 0,
                         timestamp: now,
                     });
@@ -104,7 +116,10 @@ impl ConfluenceEngine {
                         price_delta_pct: 0.0,
                         pool_liquidity_usd,
                         is_passed: false,
-                        rejection_reason: Some(format!("REJECTED_MAX_TOKEN_EXPOSURE_REACHED (${:.2} >= ${:.2})", pos.amount_usd, max_exposure_usd)),
+                        rejection_reason: Some(format!(
+                            "REJECTED_MAX_TOKEN_EXPOSURE_REACHED (${:.2} >= ${:.2})",
+                            pos.amount_usd, max_exposure_usd
+                        )),
                         confluence_count: 0,
                         timestamp: now,
                     });
@@ -219,7 +234,10 @@ impl ConfluenceEngine {
         // Gating Check B: Multi-Wallet Confluence Rule
         // Tier-S & Tier-A (Rank 1-15): Direct copy execution
         // Tier-B (Rank >15): Passive monitoring only, requires >= 2 multi-wallet confluence
-        let confluence_count = self.db.count_recent_buyers_for_mint(&activity.token_mint, 300).unwrap_or(1);
+        let confluence_count = self
+            .db
+            .count_recent_buyers_for_mint(&activity.token_mint, 300)
+            .unwrap_or(1);
 
         if wallet.tier == WalletTier::TierB && confluence_count < 2 {
             is_passed = false;

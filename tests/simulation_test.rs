@@ -431,7 +431,10 @@ async fn test_qualified_wallets_and_auto_tp_protocol() {
     assert_eq!(pos.remaining_portion_pct, 100.0);
 
     // Simulate +100% price pump (Entry 1.0 -> 2.0)
-    sol_exec.execute_partial_shadow_sell(&pos.id, 50.0, "AUTO_TP_100PCT_FREE_ROLL", 2.0).await.unwrap();
+    sol_exec
+        .execute_partial_shadow_sell(&pos.id, 50.0, "AUTO_TP_100PCT_FREE_ROLL", 2.0)
+        .await
+        .unwrap();
 
     let active_pos = db.get_active_positions().unwrap();
     assert_eq!(active_pos.len(), 1);
@@ -516,7 +519,9 @@ async fn test_multi_whale_averaging_and_same_whale_deduplication() {
         timestamp: now,
     };
 
-    let sig1 = confluence.evaluate_activity(&act1, &whale1, 0.010, 250000.0).unwrap();
+    let sig1 = confluence
+        .evaluate_activity(&act1, &whale1, 0.010, 250000.0)
+        .unwrap();
     assert!(sig1.is_passed, "Whale 1 initial buy should pass gating");
 
     let pos1 = sol_exec.execute_shadow_buy(&sig1).await.unwrap().unwrap();
@@ -543,10 +548,18 @@ async fn test_multi_whale_averaging_and_same_whale_deduplication() {
         timestamp: now,
     };
 
-    let sig1_repeat = confluence.evaluate_activity(&act1_repeat, &whale1, 0.012, 250000.0).unwrap();
-    assert!(!sig1_repeat.is_passed, "Same whale repeat buy MUST be rejected");
+    let sig1_repeat = confluence
+        .evaluate_activity(&act1_repeat, &whale1, 0.012, 250000.0)
+        .unwrap();
     assert!(
-        sig1_repeat.rejection_reason.unwrap().contains("REJECTED_WHALE_ALREADY_IN_POSITION"),
+        !sig1_repeat.is_passed,
+        "Same whale repeat buy MUST be rejected"
+    );
+    assert!(
+        sig1_repeat
+            .rejection_reason
+            .unwrap()
+            .contains("REJECTED_WHALE_ALREADY_IN_POSITION"),
         "Rejection reason must be REJECTED_WHALE_ALREADY_IN_POSITION"
     );
 
@@ -569,23 +582,40 @@ async fn test_multi_whale_averaging_and_same_whale_deduplication() {
         timestamp: now,
     };
 
-    let sig2 = confluence.evaluate_activity(&act2, &whale2, 0.020, 250000.0).unwrap();
+    let sig2 = confluence
+        .evaluate_activity(&act2, &whale2, 0.020, 250000.0)
+        .unwrap();
     assert!(sig2.is_passed, "Different whale buy MUST pass gating");
 
     let _pos2 = sol_exec.execute_shadow_buy(&sig2).await.unwrap().unwrap();
-    
+
     // Position should be consolidated into 1 unified position
     let active_positions = db.get_active_positions().unwrap();
-    assert_eq!(active_positions.len(), 1, "There should be exactly 1 unified position");
-    
+    assert_eq!(
+        active_positions.len(),
+        1,
+        "There should be exactly 1 unified position"
+    );
+
     let unified_pos = &active_positions[0];
-    assert_eq!(unified_pos.amount_usd, 20.0, "Total USD must be $20 ($10 + $10)");
-    assert_eq!(unified_pos.amount_native, 1500.0, "Total tokens must be 1500 (1000 + 500)");
-    
+    assert_eq!(
+        unified_pos.amount_usd, 20.0,
+        "Total USD must be $20 ($10 + $10)"
+    );
+    assert_eq!(
+        unified_pos.amount_native, 1500.0,
+        "Total tokens must be 1500 (1000 + 500)"
+    );
+
     // Weighted avg entry = $20 / 1500 = 0.013333333333333334
     let expected_avg = 20.0 / 1500.0;
-    assert!((unified_pos.entry_price - expected_avg).abs() < 1e-6, "Avg entry price must be weighted average (${:.6} vs ${:.6})", unified_pos.entry_price, expected_avg);
-    
+    assert!(
+        (unified_pos.entry_price - expected_avg).abs() < 1e-6,
+        "Avg entry price must be weighted average (${:.6} vs ${:.6})",
+        unified_pos.entry_price,
+        expected_avg
+    );
+
     // Handles and addresses must include both whales
     assert!(unified_pos.target_whale_handle.contains("whale_alpha"));
     assert!(unified_pos.target_whale_handle.contains("whale_beta"));
@@ -640,10 +670,15 @@ async fn test_min_whale_buy_and_price_impact_gating() {
         timestamp: now,
     };
 
-    let sig_dust = confluence.evaluate_activity(&dust_act, &whale, 0.015, 100_000.0).unwrap();
+    let sig_dust = confluence
+        .evaluate_activity(&dust_act, &whale, 0.015, 100_000.0)
+        .unwrap();
     assert!(!sig_dust.is_passed, "Dust buy under $250 must be rejected");
     assert!(
-        sig_dust.rejection_reason.unwrap().contains("REJECTED_WHALE_BUY_TOO_SMALL"),
+        sig_dust
+            .rejection_reason
+            .unwrap()
+            .contains("REJECTED_WHALE_BUY_TOO_SMALL"),
         "Rejection reason must indicate buy too small"
     );
 
@@ -666,10 +701,18 @@ async fn test_min_whale_buy_and_price_impact_gating() {
         timestamp: now,
     };
 
-    let sig_high_impact = confluence.evaluate_activity(&high_impact_act, &whale, 0.015, 50_000.0).unwrap(); // 10000 / 50000 = 20% > 15.0%
-    assert!(!sig_high_impact.is_passed, "High price impact buy must be rejected");
+    let sig_high_impact = confluence
+        .evaluate_activity(&high_impact_act, &whale, 0.015, 50_000.0)
+        .unwrap(); // 10000 / 50000 = 20% > 15.0%
     assert!(
-        sig_high_impact.rejection_reason.unwrap().contains("PRICE_IMPACT_TOO_HIGH"),
+        !sig_high_impact.is_passed,
+        "High price impact buy must be rejected"
+    );
+    assert!(
+        sig_high_impact
+            .rejection_reason
+            .unwrap()
+            .contains("PRICE_IMPACT_TOO_HIGH"),
         "Rejection reason must indicate price impact too high"
     );
 
@@ -692,8 +735,13 @@ async fn test_min_whale_buy_and_price_impact_gating() {
         timestamp: now,
     };
 
-    let sig_valid = confluence.evaluate_activity(&valid_act, &whale, 0.015, 900_000.0).unwrap();
-    assert!(sig_valid.is_passed, "Valid high conviction buy must pass gating");
+    let sig_valid = confluence
+        .evaluate_activity(&valid_act, &whale, 0.015, 900_000.0)
+        .unwrap();
+    assert!(
+        sig_valid.is_passed,
+        "Valid high conviction buy must pass gating"
+    );
     assert_eq!(sig_valid.rejection_reason, None);
 }
 
@@ -760,9 +808,14 @@ async fn test_market_cap_range_gating_50k_to_20m() {
         timestamp: now,
     };
 
-    let sig_low = confluence.evaluate_activity(&act_low, &whale, 0.003, 35_000.0).unwrap();
+    let sig_low = confluence
+        .evaluate_activity(&act_low, &whale, 0.003, 35_000.0)
+        .unwrap();
     assert!(!sig_low.is_passed);
-    assert!(sig_low.rejection_reason.unwrap().contains("REJECTED_MARKET_CAP_TOO_LOW"));
+    assert!(sig_low
+        .rejection_reason
+        .unwrap()
+        .contains("REJECTED_MARKET_CAP_TOO_LOW"));
 
     // 2. Insert Tracked Token with MC = $50M (> $20M max)
     let token_high_mc = zenithsw::models::TrackedToken {
@@ -802,9 +855,14 @@ async fn test_market_cap_range_gating_50k_to_20m() {
         timestamp: now,
     };
 
-    let sig_high = confluence.evaluate_activity(&act_high, &whale, 5.0, 500_000.0).unwrap();
+    let sig_high = confluence
+        .evaluate_activity(&act_high, &whale, 5.0, 500_000.0)
+        .unwrap();
     assert!(!sig_high.is_passed);
-    assert!(sig_high.rejection_reason.unwrap().contains("REJECTED_MARKET_CAP_TOO_HIGH"));
+    assert!(sig_high
+        .rejection_reason
+        .unwrap()
+        .contains("REJECTED_MARKET_CAP_TOO_HIGH"));
 
     // 3. Insert Tracked Token with MC = $850k (In sweet spot $50k - $20M) -> PASS!
     let token_sweet = zenithsw::models::TrackedToken {
@@ -844,7 +902,67 @@ async fn test_market_cap_range_gating_50k_to_20m() {
         timestamp: now,
     };
 
-    let sig_sweet = confluence.evaluate_activity(&act_sweet, &whale, 0.085, 120_000.0).unwrap();
+    let sig_sweet = confluence
+        .evaluate_activity(&act_sweet, &whale, 0.085, 120_000.0)
+        .unwrap();
     assert!(sig_sweet.is_passed);
     assert_eq!(sig_sweet.rejection_reason, None);
+}
+
+#[tokio::test]
+async fn test_whale_cluster_detective_and_subsidiary_discovery() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let now = Utc::now();
+
+    // 1. Seed Parent Whale Tier-S
+    let parent = SmartWallet {
+        id: None,
+        rank: 1,
+        name: "Unipcs Master".to_string(),
+        handle: "unipcs".to_string(),
+        chain: Chain::Solana,
+        address: "FJDy9FDRy6bwGEUKuAC98bUtN8MkpE2pT7Dj7HE3Z7Q1".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 150_000.0,
+        win_rate_pct: 88.0,
+        total_trades: 120,
+        source: "ONCHAIN_TOP".to_string(),
+        reputation_score: 98.0,
+        is_active: true,
+        last_seen_at: Some(now),
+        updated_at: now,
+    };
+    db.upsert_wallet(&parent).unwrap();
+
+    // 2. Discover Subsidiary / Child Wallet via Forensic Trace
+    let child_wallet = SmartWallet {
+        id: None,
+        rank: 51,
+        name: "Unipcs Master Shadow #1".to_string(),
+        handle: "unipcs_sub_e2a1".to_string(),
+        chain: Chain::Robinhood,
+        address: "0x5a8e12d1f7148886fe35f6fa04f5a2c2b60ac354".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 52_500.0,
+        win_rate_pct: 83.6,
+        total_trades: 35,
+        source: "CLUSTER_DETECTIVE".to_string(),
+        reputation_score: 93.1,
+        is_active: true,
+        last_seen_at: Some(now),
+        updated_at: now,
+    };
+    db.upsert_wallet(&child_wallet).unwrap();
+
+    // 3. Verify querying by tier and address
+    let tier_s_wallets = db.get_wallets_by_tier(WalletTier::TierS).unwrap();
+    assert_eq!(tier_s_wallets.len(), 2);
+
+    let retrieved_child = db
+        .get_wallet_by_address("0x5a8e12d1f7148886fe35f6fa04f5a2c2b60ac354")
+        .unwrap()
+        .unwrap();
+    assert_eq!(retrieved_child.source, "CLUSTER_DETECTIVE");
+    assert_eq!(retrieved_child.handle, "unipcs_sub_e2a1");
+    assert_eq!(retrieved_child.tier, WalletTier::TierS);
 }

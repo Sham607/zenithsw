@@ -22,14 +22,20 @@ fn main() {
     let sol_privkey_b58 = bs58::encode(&sol_keypair_bytes).into_string();
 
     println!("☀️ [SOLANA SVM BURNER WALLET]");
-    println!("   • Public Address (Fund & Watch-Only): {}", sol_pubkey_b58);
+    println!(
+        "   • Public Address (Fund & Watch-Only): {}",
+        sol_pubkey_b58
+    );
     println!("   • Private Key Format: Base58 (64-byte Ed25519)");
     println!();
 
     // 2. Robinhood / Arbitrum EVM Keypair (Secp256k1 + Keccak256)
     let evm_secret = SecretKey::random(&mut OsRng);
     let evm_priv_hex = format!("0x{}", hex::encode(evm_secret.to_bytes()));
-    let evm_pub_point = evm_secret.public_key().to_projective().to_encoded_point(false);
+    let evm_pub_point = evm_secret
+        .public_key()
+        .to_projective()
+        .to_encoded_point(false);
     let evm_pub_bytes = &evm_pub_point.as_bytes()[1..]; // Strip 0x04 uncompressed prefix (64 bytes)
 
     let mut hasher = Keccak256::new();
@@ -59,7 +65,11 @@ fn main() {
     let _ = std::fs::create_dir_all("data/credentials");
     let cred_path = "data/credentials/burner_keypairs.json";
     if let Ok(mut f) = std::fs::File::create(cred_path) {
-        let _ = f.write_all(serde_json::to_string_pretty(&creds_json).unwrap().as_bytes());
+        let _ = f.write_all(
+            serde_json::to_string_pretty(&creds_json)
+                .unwrap()
+                .as_bytes(),
+        );
         println!("💾 Burner credentials securely written to: {}", cred_path);
     }
 
@@ -73,7 +83,9 @@ fn main() {
             if line.starts_with("SOLANA_PRIVATE_KEY=") {
                 new_lines.push(format!("SOLANA_PRIVATE_KEY={}", sol_privkey_b58));
                 has_sol_pk = true;
-            } else if line.starts_with("EVM_PRIVATE_KEY=") || line.starts_with("ROBINHOOD_PRIVATE_KEY=") {
+            } else if line.starts_with("EVM_PRIVATE_KEY=")
+                || line.starts_with("ROBINHOOD_PRIVATE_KEY=")
+            {
                 new_lines.push(format!("EVM_PRIVATE_KEY={}", evm_priv_hex));
                 has_evm_pk = true;
             } else {

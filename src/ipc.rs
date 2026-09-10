@@ -79,7 +79,7 @@ impl IpcServer {
                 let latest_hb_inner = latest_hb.clone();
                 tokio::spawn(async move {
                     let (_, mut write_half) = stream.into_split();
-                    
+
                     // Send current heartbeat or initial handshake line immediately
                     let initial_hb = {
                         if let Ok(guard) = latest_hb_inner.lock() {
@@ -102,7 +102,7 @@ impl IpcServer {
                             }
                         }
                     };
-                    
+
                     if let Ok(json) = serde_json::to_string(&initial_hb) {
                         let _ = write_half.write_all(json.as_bytes()).await;
                         let _ = write_half.write_all(b"\n").await;

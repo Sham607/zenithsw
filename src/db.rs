@@ -139,7 +139,9 @@ impl SmartWalletDb {
              CREATE INDEX IF NOT EXISTS idx_signals_mint ON shadow_signals(token_mint);
              CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON shadow_signals(timestamp);",
         )?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn new_in_memory() -> Result<Self> {
@@ -249,7 +251,9 @@ impl SmartWalletDb {
                  last_scanned_at TEXT NOT NULL
              );",
         )?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn upsert_wallet(&self, wallet: &SmartWallet) -> Result<()> {
@@ -322,7 +326,11 @@ impl SmartWalletDb {
 
             let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
             let tier = WalletTier::from_str(&tier_str).unwrap_or(WalletTier::TierB);
-            let last_seen_at = last_seen_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc)));
+            let last_seen_at = last_seen_str.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            });
             let updated_at = DateTime::parse_from_rfc3339(&updated_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -335,6 +343,69 @@ impl SmartWalletDb {
                 chain,
                 address,
                 tier,
+                pnl_24h_usd,
+                win_rate_pct,
+                total_trades,
+                source,
+                reputation_score,
+                is_active: is_active_int == 1,
+                last_seen_at,
+                updated_at,
+            })
+        })?;
+
+        let mut wallets = Vec::new();
+        for r in rows {
+            wallets.push(r?);
+        }
+        Ok(wallets)
+    }
+
+    pub fn get_wallets_by_tier(&self, tier: WalletTier) -> Result<Vec<SmartWallet>> {
+        let conn = self.conn.lock().unwrap();
+        let tier_str1 = tier.to_string();
+        let tier_str2 = format!("Tier{}", tier_str1.trim_start_matches("TIER-"));
+        let mut stmt = conn.prepare(
+            "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at
+             FROM wallets WHERE is_active = 1 AND (tier = ?1 OR tier = ?2 OR tier LIKE ?3) ORDER BY pnl_24h_usd DESC, reputation_score DESC",
+        )?;
+        let like_str = format!("%{}%", tier);
+        let rows = stmt.query_map(params![tier_str1, tier_str2, like_str], |row| {
+            let id: Option<i64> = row.get(0)?;
+            let rank: u32 = row.get(1)?;
+            let name: String = row.get(2)?;
+            let handle: String = row.get(3)?;
+            let chain_str: String = row.get(4)?;
+            let address: String = row.get(5)?;
+            let tier_s: String = row.get(6)?;
+            let pnl_24h_usd: f64 = row.get(7)?;
+            let win_rate_pct: f64 = row.get(8)?;
+            let total_trades: u32 = row.get(9)?;
+            let source: String = row.get(10).unwrap_or_else(|_| "FOMO".to_string());
+            let reputation_score: f64 = row.get(11).unwrap_or(80.0);
+            let is_active_int: i32 = row.get(12)?;
+            let last_seen_str: Option<String> = row.get(13)?;
+            let updated_str: String = row.get(14)?;
+
+            let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
+            let t = WalletTier::from_str(&tier_s).unwrap_or(tier);
+            let last_seen_at = last_seen_str.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            });
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+            Ok(SmartWallet {
+                id,
+                rank,
+                name,
+                handle,
+                chain,
+                address,
+                tier: t,
                 pnl_24h_usd,
                 win_rate_pct,
                 total_trades,
@@ -378,7 +449,11 @@ impl SmartWalletDb {
 
             let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
             let tier = WalletTier::from_str(&tier_str).unwrap_or(WalletTier::TierB);
-            let last_seen_at = last_seen_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc)));
+            let last_seen_at = last_seen_str.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            });
             let updated_at = DateTime::parse_from_rfc3339(&updated_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -434,7 +509,11 @@ impl SmartWalletDb {
 
             let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
             let tier = WalletTier::from_str(&tier_str).unwrap_or(WalletTier::TierB);
-            let last_seen_at = last_seen_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc)));
+            let last_seen_at = last_seen_str.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            });
             let updated_at = DateTime::parse_from_rfc3339(&updated_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -748,41 +827,82 @@ impl SmartWalletDb {
     }
 
     /// Closes a shadow position partially (e.g. 50% partial exit) or completely (100% full exit)
-    pub fn close_position_portion(&self, id: &str, portion_pct: f64, exit_reason: &str, exit_price: f64) -> Result<()> {
+    pub fn close_position_portion(
+        &self,
+        id: &str,
+        portion_pct: f64,
+        exit_reason: &str,
+        exit_price: f64,
+    ) -> Result<()> {
         let portion_clamped = portion_pct.clamp(1.0, 100.0);
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT entry_price, amount_usd, remaining_portion_pct, realized_pnl_usd, entry_time, chain, token_symbol, token_mint, target_whale_handle FROM shadow_positions WHERE id = ?1")?;
-        let pos_opt = stmt.query_row(params![id], |row| {
-            let entry_price: f64 = row.get(0)?;
-            let amount_usd: f64 = row.get(1)?;
-            let remaining_portion_pct: f64 = row.get(2).unwrap_or(100.0);
-            let realized_pnl_usd: f64 = row.get(3).unwrap_or(0.0);
-            let entry_str: String = row.get(4)?;
-            let chain_str: String = row.get(5)?;
-            let symbol: String = row.get(6)?;
-            let mint: String = row.get(7)?;
-            let target_whale: String = row.get(8)?;
-            Ok((entry_price, amount_usd, remaining_portion_pct, realized_pnl_usd, entry_str, chain_str, symbol, mint, target_whale))
-        }).optional()?;
+        let pos_opt = stmt
+            .query_row(params![id], |row| {
+                let entry_price: f64 = row.get(0)?;
+                let amount_usd: f64 = row.get(1)?;
+                let remaining_portion_pct: f64 = row.get(2).unwrap_or(100.0);
+                let realized_pnl_usd: f64 = row.get(3).unwrap_or(0.0);
+                let entry_str: String = row.get(4)?;
+                let chain_str: String = row.get(5)?;
+                let symbol: String = row.get(6)?;
+                let mint: String = row.get(7)?;
+                let target_whale: String = row.get(8)?;
+                Ok((
+                    entry_price,
+                    amount_usd,
+                    remaining_portion_pct,
+                    realized_pnl_usd,
+                    entry_str,
+                    chain_str,
+                    symbol,
+                    mint,
+                    target_whale,
+                ))
+            })
+            .optional()?;
 
-        if let Some((entry_price, amount_usd, remaining_portion_pct, current_realized_pnl, entry_str, chain_str, symbol, mint, target_whale)) = pos_opt {
+        if let Some((
+            entry_price,
+            amount_usd,
+            remaining_portion_pct,
+            current_realized_pnl,
+            entry_str,
+            chain_str,
+            symbol,
+            mint,
+            target_whale,
+        )) = pos_opt
+        {
             let now = Utc::now();
             let entry_time = DateTime::parse_from_rfc3339(&entry_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or(now);
             let duration_secs = (now - entry_time).num_seconds().max(0) as u64;
-            
+
             // Calculate portion sold
             let actual_sold_pct = portion_clamped.min(remaining_portion_pct);
             let sold_usd_basis = amount_usd * (actual_sold_pct / 100.0);
-            let pnl_pct = if entry_price > 0.0 { ((exit_price - entry_price) / entry_price) * 100.0 } else { 0.0 };
+            let pnl_pct = if entry_price > 0.0 {
+                ((exit_price - entry_price) / entry_price) * 100.0
+            } else {
+                0.0
+            };
             let pnl_usd_this_trade = sold_usd_basis * (pnl_pct / 100.0);
             let new_remaining_portion = (remaining_portion_pct - actual_sold_pct).max(0.0);
             let new_realized_pnl = current_realized_pnl + pnl_usd_this_trade;
 
             let is_full_close = new_remaining_portion <= 1.0 || actual_sold_pct >= 95.0;
-            let new_status = if is_full_close { "CLOSED" } else { "PARTIAL_EXIT" };
-            let action_type = if is_full_close { "SELL" } else { "PARTIAL_SELL" };
+            let new_status = if is_full_close {
+                "CLOSED"
+            } else {
+                "PARTIAL_EXIT"
+            };
+            let action_type = if is_full_close {
+                "SELL"
+            } else {
+                "PARTIAL_SELL"
+            };
             let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
 
             // Record into trade_history

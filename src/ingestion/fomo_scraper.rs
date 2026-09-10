@@ -51,21 +51,45 @@ impl FomoScraper {
             if let Ok(resp) = req.send().await {
                 if resp.status().is_success() {
                     if let Ok(json) = resp.json::<Value>().await {
-                        if let Some(items) = json.get("responseObject").and_then(|r| r.get("leaderboard")).and_then(|l| l.as_array()) {
+                        if let Some(items) = json
+                            .get("responseObject")
+                            .and_then(|r| r.get("leaderboard"))
+                            .and_then(|l| l.as_array())
+                        {
                             let mut wallets = Vec::new();
                             for (idx, item) in items.iter().enumerate() {
-                                let name = item.get("displayName").and_then(|v| v.as_str()).unwrap_or("Trader").to_string();
-                                let handle = item.get("userHandle").and_then(|v| v.as_str()).unwrap_or("trader").to_string();
-                                let sol_addr = item.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let evm_addr = item.get("evmAddress").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                
-                                let pnl = item.get("totalPnL").and_then(|v| v.as_f64())
+                                let name = item
+                                    .get("displayName")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Trader")
+                                    .to_string();
+                                let handle = item
+                                    .get("userHandle")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("trader")
+                                    .to_string();
+                                let sol_addr = item
+                                    .get("address")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let evm_addr = item
+                                    .get("evmAddress")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                let pnl = item
+                                    .get("totalPnL")
+                                    .and_then(|v| v.as_f64())
                                     .or_else(|| item.get("pnl").and_then(|v| v.as_f64()))
                                     .unwrap_or(0.0);
-                                
-                                let num_trades = item.get("numTrades").and_then(|v| v.as_u64())
-                                    .or_else(|| item.get("swapCount").and_then(|v| v.as_u64()))
-                                    .unwrap_or(20) as u32;
+
+                                let num_trades =
+                                    item.get("numTrades")
+                                        .and_then(|v| v.as_u64())
+                                        .or_else(|| item.get("swapCount").and_then(|v| v.as_u64()))
+                                        .unwrap_or(20) as u32;
 
                                 let rank = (idx + 1) as u32;
 
@@ -158,7 +182,11 @@ impl FomoScraper {
                 if let Ok(resp) = req.send().await {
                     if resp.status().is_success() {
                         if let Ok(json) = resp.json::<Value>().await {
-                            if let Some(arr) = json.get("responseObject").and_then(|r| r.get("leaderboard")).and_then(|l| l.as_array()) {
+                            if let Some(arr) = json
+                                .get("responseObject")
+                                .and_then(|r| r.get("leaderboard"))
+                                .and_then(|l| l.as_array())
+                            {
                                 items_opt = Some(arr.clone());
                             }
                         }
@@ -169,10 +197,26 @@ impl FomoScraper {
 
         if let Some(items) = items_opt {
             for (idx, item) in items.iter().take(50).enumerate() {
-                let handle = item.get("userHandle").and_then(|v| v.as_str()).unwrap_or("trader").to_string();
-                let name = item.get("displayName").and_then(|v| v.as_str()).unwrap_or("Trader").to_string();
-                let sol_addr = item.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let evm_addr = item.get("evmAddress").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let handle = item
+                    .get("userHandle")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("trader")
+                    .to_string();
+                let name = item
+                    .get("displayName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Trader")
+                    .to_string();
+                let sol_addr = item
+                    .get("address")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let evm_addr = item
+                    .get("evmAddress")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let pnl = item.get("totalPnL").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let rank = (idx + 1) as u32;
 
@@ -234,11 +278,16 @@ impl FomoScraper {
             // Load Verified Seed Gems with live DexScreener verification
             let seed_path = "data/default_whale_gems.json";
             if let Ok(data) = fs::read_to_string(seed_path) {
-                if let Ok(seeds) = serde_json::from_str::<Vec<(String, String, String, u32, f64, String)>>(&data) {
+                if let Ok(seeds) =
+                    serde_json::from_str::<Vec<(String, String, String, u32, f64, String)>>(&data)
+                {
                     for (_sym, mint, _chain_str, _count, val, handles_str) in seeds {
                         let entry = token_map.entry(mint).or_default();
                         entry.total_usd = val;
-                        entry.whale_handles = handles_str.split(',').map(|s| s.trim().trim_start_matches('@').to_string()).collect();
+                        entry.whale_handles = handles_str
+                            .split(',')
+                            .map(|s| s.trim().trim_start_matches('@').to_string())
+                            .collect();
                     }
                 }
             }
@@ -246,7 +295,11 @@ impl FomoScraper {
 
         // Sort tokens by total whale holding USD descending
         let mut sorted_tokens: Vec<(String, TokenHoldingAgg)> = token_map.into_iter().collect();
-        sorted_tokens.sort_by(|a, b| b.1.total_usd.partial_cmp(&a.1.total_usd).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_tokens.sort_by(|a, b| {
+            b.1.total_usd
+                .partial_cmp(&a.1.total_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let mut tracked_tokens = Vec::new();
 
@@ -256,8 +309,17 @@ impl FomoScraper {
                 continue;
             }
 
-            let dex_url = format!("https://api.dexscreener.com/latest/dex/tokens/{}", token_addr);
-            let dex_resp = match self.client.get(&dex_url).header("User-Agent", "Mozilla/5.0").send().await {
+            let dex_url = format!(
+                "https://api.dexscreener.com/latest/dex/tokens/{}",
+                token_addr
+            );
+            let dex_resp = match self
+                .client
+                .get(&dex_url)
+                .header("User-Agent", "Mozilla/5.0")
+                .send()
+                .await
+            {
                 Ok(r) => r,
                 Err(_) => continue,
             };
@@ -265,29 +327,65 @@ impl FomoScraper {
             if let Ok(dex_json) = dex_resp.json::<Value>().await {
                 if let Some(pairs) = dex_json.get("pairs").and_then(|p| p.as_array()) {
                     if let Some(pair) = pairs.first() {
-                        let symbol = pair.get("baseToken").and_then(|b| b.get("symbol")).and_then(|s| s.as_str()).unwrap_or("UNKNOWN").to_string();
-                        
+                        let symbol = pair
+                            .get("baseToken")
+                            .and_then(|b| b.get("symbol"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("UNKNOWN")
+                            .to_string();
+
                         if is_blacklisted_asset(&token_addr, &symbol) {
                             continue;
                         }
 
-                        let chain_str = pair.get("chainId").and_then(|c| c.as_str()).unwrap_or("solana");
+                        let chain_str = pair
+                            .get("chainId")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("solana");
                         let chain = match chain_str.to_lowercase().as_str() {
                             "solana" => Chain::Solana,
                             "arbitrum" => Chain::Robinhood,
                             "base" => Chain::Base,
-                            _ => if token_addr.starts_with("0x") { Chain::Robinhood } else { Chain::Solana },
+                            _ => {
+                                if token_addr.starts_with("0x") {
+                                    Chain::Robinhood
+                                } else {
+                                    Chain::Solana
+                                }
+                            }
                         };
 
-                        let price_usd = pair.get("priceUsd").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                        let liquidity_usd = pair.get("liquidity").and_then(|l| l.get("usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        let market_cap_usd = pair.get("marketCap").and_then(|m| m.as_f64())
+                        let price_usd = pair
+                            .get("priceUsd")
+                            .and_then(|p| p.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let liquidity_usd = pair
+                            .get("liquidity")
+                            .and_then(|l| l.get("usd"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let market_cap_usd = pair
+                            .get("marketCap")
+                            .and_then(|m| m.as_f64())
                             .or_else(|| pair.get("fdv").and_then(|f| f.as_f64()))
                             .unwrap_or(0.0);
 
-                        let change_24h_pct = pair.get("priceChange").and_then(|pc| pc.get("h24")).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        let change_6h_pct = pair.get("priceChange").and_then(|pc| pc.get("h6")).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        let change_1h_pct = pair.get("priceChange").and_then(|pc| pc.get("h1")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let change_24h_pct = pair
+                            .get("priceChange")
+                            .and_then(|pc| pc.get("h24"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let change_6h_pct = pair
+                            .get("priceChange")
+                            .and_then(|pc| pc.get("h6"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let change_1h_pct = pair
+                            .get("priceChange")
+                            .and_then(|pc| pc.get("h1"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
 
                         // Classify Upside Potential (Nano/Micro/Low/Mid Cap)
                         let upside_tier = if market_cap_usd > 0.0 && market_cap_usd < 1_000_000.0 {
@@ -305,7 +403,10 @@ impl FomoScraper {
                         // Classify Bottom vs Pucuk Status
                         let status = if change_24h_pct > 100.0 || change_6h_pct > 35.0 {
                             "LOCAL_TOP 🔴 (Wait Pullback)".to_string()
-                        } else if change_24h_pct >= -30.0 && change_24h_pct <= 25.0 && liquidity_usd >= 15_000.0 {
+                        } else if change_24h_pct >= -30.0
+                            && change_24h_pct <= 25.0
+                            && liquidity_usd >= 15_000.0
+                        {
                             "ACCUMULATION_BOTTOM 🟢 (Ready Buy)".to_string()
                         } else if change_24h_pct < -30.0 {
                             "OVERSOLD_RECOVERY 🟡 (Watch Floor)".to_string()
@@ -313,7 +414,13 @@ impl FomoScraper {
                             "NEUTRAL_BASE ⚪".to_string()
                         };
 
-                        let top_handles = agg.whale_handles.iter().take(3).map(|h| format!("@{}", h)).collect::<Vec<_>>().join(", ");
+                        let top_handles = agg
+                            .whale_handles
+                            .iter()
+                            .take(3)
+                            .map(|h| format!("@{}", h))
+                            .collect::<Vec<_>>()
+                            .join(", ");
 
                         let tracked = TrackedToken {
                             token_mint: token_addr.clone(),

@@ -120,7 +120,10 @@ impl FomoApiStreamListener {
         };
 
         let json: Value = resp.json().await.unwrap_or_default();
-        let swaps = json.get("responseObject").and_then(|r| r.get("swaps")).and_then(|s| s.as_array());
+        let swaps = json
+            .get("responseObject")
+            .and_then(|r| r.get("swaps"))
+            .and_then(|s| s.as_array());
 
         if let Some(swaps_list) = swaps {
             for swap in swaps_list {
@@ -144,9 +147,17 @@ impl FomoApiStreamListener {
                     }
                 }
 
-                let in_token = swap.get("inTokenAddress").and_then(|v| v.as_str()).unwrap_or("");
-                let out_token = swap.get("outTokenAddress").and_then(|v| v.as_str()).unwrap_or("");
-                let amount_usd = swap.get("humanUsdAmountIn").and_then(|v| v.as_f64())
+                let in_token = swap
+                    .get("inTokenAddress")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let out_token = swap
+                    .get("outTokenAddress")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let amount_usd = swap
+                    .get("humanUsdAmountIn")
+                    .and_then(|v| v.as_f64())
                     .or_else(|| swap.get("humanUsdAmountOut").and_then(|v| v.as_f64()))
                     .unwrap_or(50.0);
 
@@ -155,13 +166,26 @@ impl FomoApiStreamListener {
                     || in_token.contains("0x");
 
                 let (activity_type, token_mint, mut token_symbol) = if is_buy {
-                    (ActivityType::Buy, out_token.to_string(), "FOMO_COIN".to_string())
+                    (
+                        ActivityType::Buy,
+                        out_token.to_string(),
+                        "FOMO_COIN".to_string(),
+                    )
                 } else {
-                    (ActivityType::Sell, in_token.to_string(), "FOMO_COIN".to_string())
+                    (
+                        ActivityType::Sell,
+                        in_token.to_string(),
+                        "FOMO_COIN".to_string(),
+                    )
                 };
 
                 let mut execution_price_usd = 0.0;
-                if let Ok((sym, price, _)) = crate::streams::solana_stream::SolanaStreamListener::fetch_token_price(&token_mint).await {
+                if let Ok((sym, price, _)) =
+                    crate::streams::solana_stream::SolanaStreamListener::fetch_token_price(
+                        &token_mint,
+                    )
+                    .await
+                {
                     if sym != "UNKNOWN" {
                         token_symbol = sym;
                     }

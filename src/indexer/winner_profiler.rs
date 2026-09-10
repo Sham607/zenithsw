@@ -16,7 +16,12 @@ pub struct SmartMoneyIndexer {
 }
 
 impl SmartMoneyIndexer {
-    pub fn new(solana_rpc_url: &str, arbitrum_rpc_url: &str, db: Arc<SmartWalletDb>, _scan_interval_secs: u64) -> Self {
+    pub fn new(
+        solana_rpc_url: &str,
+        arbitrum_rpc_url: &str,
+        db: Arc<SmartWalletDb>,
+        _scan_interval_secs: u64,
+    ) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(12))
             .build()
@@ -37,7 +42,10 @@ impl SmartMoneyIndexer {
     pub async fn scan_and_index(&self) -> Result<Vec<SmartWallet>> {
         println!("[SMART MONEY INDEXER 🌐] Scanning trending DEX gainers on Solana & Robinhood (Arbitrum EVM)...");
         let discovered = self.profiler.discover_active_smart_wallets().await?;
-        println!("[SMART MONEY INDEXER ✅] Scan complete. Discovered & evaluated {} candidate wallets.", discovered.len());
+        println!(
+            "[SMART MONEY INDEXER ✅] Scan complete. Discovered & evaluated {} candidate wallets.",
+            discovered.len()
+        );
         Ok(discovered)
     }
 }
@@ -69,7 +77,10 @@ impl WinnerProfiler {
         let mut discovered_wallets = Vec::new();
 
         // 1. Fetch live top boosted tokens from DexScreener
-        let boosted_tokens = self.fetch_trending_boosted_tokens().await.unwrap_or_default();
+        let boosted_tokens = self
+            .fetch_trending_boosted_tokens()
+            .await
+            .unwrap_or_default();
         if boosted_tokens.is_empty() {
             println!("[INDEXER ⚠️] DexScreener API returned 0 boosted tokens or rate-limited. Retrying next cycle.");
             return Ok(discovered_wallets);
@@ -80,9 +91,13 @@ impl WinnerProfiler {
         // 2. Profile early buyers with STRICT scoring
         for token in boosted_tokens.iter().take(8) {
             let buyers = if token.chain == Chain::Solana {
-                self.extract_early_buyers_solana(&token.token_address).await.unwrap_or_default()
+                self.extract_early_buyers_solana(&token.token_address)
+                    .await
+                    .unwrap_or_default()
             } else {
-                self.extract_early_buyers_evm(&token.token_address).await.unwrap_or_default()
+                self.extract_early_buyers_evm(&token.token_address)
+                    .await
+                    .unwrap_or_default()
             };
 
             for buyer in buyers {
@@ -95,9 +110,21 @@ impl WinnerProfiler {
                     continue;
                 }
 
-                let (wallet_chain, handle, name, estimated_pnl_usd, win_rate_pct, tx_count, tier, reputation_score) = match token.chain {
+                let (
+                    wallet_chain,
+                    handle,
+                    name,
+                    estimated_pnl_usd,
+                    win_rate_pct,
+                    tx_count,
+                    tier,
+                    reputation_score,
+                ) = match token.chain {
                     Chain::Solana => {
-                        let (sol_bal, tx_count, _age_days) = self.fetch_solana_wallet_metrics(&buyer).await.unwrap_or((0.0, 5, 1.0));
+                        let (sol_bal, tx_count, _age_days) = self
+                            .fetch_solana_wallet_metrics(&buyer)
+                            .await
+                            .unwrap_or((0.0, 5, 1.0));
                         let estimated_pnl_usd = if sol_bal >= 2.0 {
                             (sol_bal * 140.0 * 2.5).round()
                         } else {
@@ -127,7 +154,15 @@ impl WinnerProfiler {
                             (40.0 + (sol_bal * 2.0).min(20.0)).clamp(30.0, 59.0)
                         };
 
-                        let handle = format!("sol_{}_{}", if buyer.len() > 4 { &buyer[..4] } else { &buyer }, if buyer.len() > 4 { &buyer[buyer.len() - 4..] } else { "" });
+                        let handle = format!(
+                            "sol_{}_{}",
+                            if buyer.len() > 4 { &buyer[..4] } else { &buyer },
+                            if buyer.len() > 4 {
+                                &buyer[buyer.len() - 4..]
+                            } else {
+                                ""
+                            }
+                        );
                         let name = if sol_bal >= 10.0 {
                             format!("Whale {:.1} SOL", sol_bal)
                         } else if sol_bal >= 2.0 {
@@ -136,11 +171,23 @@ impl WinnerProfiler {
                             format!("Micro Trader #{}", &buyer[..4])
                         };
 
-                        (Chain::Solana, handle, name, estimated_pnl_usd, win_rate_pct, tx_count as u32, tier, reputation_score)
+                        (
+                            Chain::Solana,
+                            handle,
+                            name,
+                            estimated_pnl_usd,
+                            win_rate_pct,
+                            tx_count as u32,
+                            tier,
+                            reputation_score,
+                        )
                     }
                     _ => {
                         // Robinhood / Arbitrum EVM
-                        let (eth_bal, tx_count, _age_days) = self.fetch_evm_wallet_metrics(&buyer).await.unwrap_or((0.0, 5, 1.0));
+                        let (eth_bal, tx_count, _age_days) = self
+                            .fetch_evm_wallet_metrics(&buyer)
+                            .await
+                            .unwrap_or((0.0, 5, 1.0));
                         let estimated_pnl_usd = if eth_bal >= 0.5 {
                             (eth_bal * 2500.0 * 2.5).round()
                         } else {
@@ -170,20 +217,46 @@ impl WinnerProfiler {
                             (40.0 + (eth_bal * 10.0).min(20.0)).clamp(30.0, 59.0)
                         };
 
-                        let handle = format!("rh_{}_{}", if buyer.len() > 6 { &buyer[..6] } else { &buyer }, if buyer.len() > 4 { &buyer[buyer.len() - 4..] } else { "" });
+                        let handle = format!(
+                            "rh_{}_{}",
+                            if buyer.len() > 6 { &buyer[..6] } else { &buyer },
+                            if buyer.len() > 4 {
+                                &buyer[buyer.len() - 4..]
+                            } else {
+                                ""
+                            }
+                        );
                         let name = if eth_bal >= 5.0 {
                             format!("RH Whale {:.2} ETH", eth_bal)
                         } else if eth_bal >= 1.0 {
                             format!("RH Pro {:.2} ETH", eth_bal)
                         } else {
-                            format!("RH Trader #{}", if buyer.len() > 6 { &buyer[2..6] } else { &buyer })
+                            format!(
+                                "RH Trader #{}",
+                                if buyer.len() > 6 {
+                                    &buyer[2..6]
+                                } else {
+                                    &buyer
+                                }
+                            )
                         };
 
-                        (Chain::Robinhood, handle, name, estimated_pnl_usd, win_rate_pct, tx_count as u32, tier, reputation_score)
+                        (
+                            Chain::Robinhood,
+                            handle,
+                            name,
+                            estimated_pnl_usd,
+                            win_rate_pct,
+                            tx_count as u32,
+                            tier,
+                            reputation_score,
+                        )
                     }
                 };
 
-                let rank = (16 + (self.db.get_active_wallets().map(|w| w.len()).unwrap_or(0) as u32)).min(99);
+                let rank = (16
+                    + (self.db.get_active_wallets().map(|w| w.len()).unwrap_or(0) as u32))
+                    .min(99);
 
                 let wallet = SmartWallet {
                     id: None,
@@ -205,7 +278,7 @@ impl WinnerProfiler {
 
                 let _ = self.db.upsert_wallet(&wallet);
                 println!("[INDEXER 🎯 EVALUATED] Added {} (@{}) on {} -> Tier: {:?} | Status: {} | WinRate: {:.1}% | Trades: {} | PnL: +${:.0}", 
-                    wallet.name, wallet.handle, wallet.chain, wallet.tier, 
+                    wallet.name, wallet.handle, wallet.chain, wallet.tier,
                     if wallet.tier == WalletTier::TierB { "MONITOR 🟡" } else { "EXECUTE 🟢" },
                     wallet.win_rate_pct, wallet.total_trades, wallet.pnl_24h_usd);
                 discovered_wallets.push(wallet);
@@ -243,7 +316,9 @@ impl WinnerProfiler {
                 let chain_id = item["chainId"].as_str().unwrap_or("").to_lowercase();
                 let token_address = item["tokenAddress"].as_str().unwrap_or("").to_string();
 
-                if token_address.is_empty() || crate::models::is_blacklisted_asset(&token_address, "") {
+                if token_address.is_empty()
+                    || crate::models::is_blacklisted_asset(&token_address, "")
+                {
                     continue;
                 }
 
@@ -282,7 +357,13 @@ impl WinnerProfiler {
             "params": [address]
         });
 
-        if let Ok(res) = self.client.post(&self.helius_rpc_url).json(&bal_payload).send().await {
+        if let Ok(res) = self
+            .client
+            .post(&self.helius_rpc_url)
+            .json(&bal_payload)
+            .send()
+            .await
+        {
             if let Ok(json) = res.json::<Value>().await {
                 if let Some(lamports) = json["result"]["value"].as_f64() {
                     sol_bal = lamports / 1_000_000_000.0;
@@ -300,12 +381,20 @@ impl WinnerProfiler {
             "params": [address, { "limit": 50 }]
         });
 
-        if let Ok(res) = self.client.post(&self.helius_rpc_url).json(&sig_payload).send().await {
+        if let Ok(res) = self
+            .client
+            .post(&self.helius_rpc_url)
+            .json(&sig_payload)
+            .send()
+            .await
+        {
             if let Ok(json) = res.json::<Value>().await {
                 if let Some(arr) = json["result"].as_array() {
                     tx_count = arr.len().max(1);
                     if let Some(oldest) = arr.last() {
-                        let bt = oldest["blockTime"].as_i64().unwrap_or(Utc::now().timestamp());
+                        let bt = oldest["blockTime"]
+                            .as_i64()
+                            .unwrap_or(Utc::now().timestamp());
                         let diff_secs = (Utc::now().timestamp() - bt).max(3600);
                         age_days = (diff_secs as f64) / 86400.0;
                     }
@@ -334,7 +423,13 @@ impl WinnerProfiler {
             "params": [address, "latest"]
         });
 
-        if let Ok(res) = self.client.post(&self.arbitrum_rpc_url).json(&bal_payload).send().await {
+        if let Ok(res) = self
+            .client
+            .post(&self.arbitrum_rpc_url)
+            .json(&bal_payload)
+            .send()
+            .await
+        {
             if let Ok(json) = res.json::<Value>().await {
                 if let Some(hex_str) = json["result"].as_str() {
                     if let Ok(val) = u128::from_str_radix(hex_str.trim_start_matches("0x"), 16) {
@@ -354,7 +449,13 @@ impl WinnerProfiler {
             "params": [address, "latest"]
         });
 
-        if let Ok(res) = self.client.post(&self.arbitrum_rpc_url).json(&tx_payload).send().await {
+        if let Ok(res) = self
+            .client
+            .post(&self.arbitrum_rpc_url)
+            .json(&tx_payload)
+            .send()
+            .await
+        {
             if let Ok(json) = res.json::<Value>().await {
                 if let Some(hex_str) = json["result"].as_str() {
                     if let Ok(count) = usize::from_str_radix(hex_str.trim_start_matches("0x"), 16) {
@@ -383,7 +484,13 @@ impl WinnerProfiler {
             ]
         });
 
-        let res = match self.client.post(&self.helius_rpc_url).json(&payload).send().await {
+        let res = match self
+            .client
+            .post(&self.helius_rpc_url)
+            .json(&payload)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(_) => return Ok(Vec::new()),
         };
@@ -428,7 +535,13 @@ impl WinnerProfiler {
             }]
         });
 
-        let res = match self.client.post(&self.arbitrum_rpc_url).json(&payload).send().await {
+        let res = match self
+            .client
+            .post(&self.arbitrum_rpc_url)
+            .json(&payload)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(_) => return Ok(Vec::new()),
         };
@@ -464,7 +577,13 @@ impl WinnerProfiler {
             ]
         });
 
-        let res = match self.client.post(&self.helius_rpc_url).json(&payload).send().await {
+        let res = match self
+            .client
+            .post(&self.helius_rpc_url)
+            .json(&payload)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(_) => return Ok(None),
         };

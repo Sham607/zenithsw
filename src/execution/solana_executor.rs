@@ -217,7 +217,10 @@ impl SolanaExecutor {
     }
 
     /// Executes End-to-End Shadow Buy on Solana
-    pub async fn execute_shadow_buy(&self, signal: &ShadowSignal) -> Result<Option<ShadowPosition>> {
+    pub async fn execute_shadow_buy(
+        &self,
+        signal: &ShadowSignal,
+    ) -> Result<Option<ShadowPosition>> {
         if !signal.is_passed {
             return Ok(None);
         }
@@ -235,7 +238,11 @@ impl SolanaExecutor {
 
         let now = Utc::now();
         let amount_usd = self.config.position_size_usd;
-        let new_tokens = if entry_price > 0.0 { amount_usd / entry_price } else { 0.0 };
+        let new_tokens = if entry_price > 0.0 {
+            amount_usd / entry_price
+        } else {
+            0.0
+        };
         let position_id = format!("SOL-{}", signal.token_mint);
 
         let sol_price = 140.0; // Dynamic or fallback price
@@ -300,12 +307,18 @@ impl SolanaExecutor {
 
         // Check if position already exists for this token mint on Solana -> Average in!
         if let Ok(active_pos) = self.db.get_active_positions() {
-            if let Some(mut existing) = active_pos.into_iter().find(|p| p.token_mint.eq_ignore_ascii_case(&signal.token_mint) && p.chain == Chain::Solana) {
+            if let Some(mut existing) = active_pos.into_iter().find(|p| {
+                p.token_mint.eq_ignore_ascii_case(&signal.token_mint) && p.chain == Chain::Solana
+            }) {
                 let prev_usd = existing.amount_usd;
                 let prev_tokens = existing.amount_native;
                 let total_usd = prev_usd + amount_usd;
                 let total_tokens = prev_tokens + new_tokens;
-                let weighted_avg_entry = if total_tokens > 0.0 { total_usd / total_tokens } else { entry_price };
+                let weighted_avg_entry = if total_tokens > 0.0 {
+                    total_usd / total_tokens
+                } else {
+                    entry_price
+                };
 
                 println!(
                     "[POSITION AVERAGING ➕] Adding ${:.2} to existing {} position (ID: {}). Prev Entry: ${:.6} -> New Avg Entry: ${:.6} (Total: ${:.2})",
@@ -322,10 +335,17 @@ impl SolanaExecutor {
                 existing.status = "OPEN".to_string();
 
                 if !existing.target_whale_handle.contains(&signal.whale_handle) {
-                    existing.target_whale_handle = format!("{}, @{}", existing.target_whale_handle, signal.whale_handle);
+                    existing.target_whale_handle =
+                        format!("{}, @{}", existing.target_whale_handle, signal.whale_handle);
                 }
-                if !existing.target_whale_address.contains(&signal.whale_address) {
-                    existing.target_whale_address = format!("{}, {}", existing.target_whale_address, signal.whale_address);
+                if !existing
+                    .target_whale_address
+                    .contains(&signal.whale_address)
+                {
+                    existing.target_whale_address = format!(
+                        "{}, {}",
+                        existing.target_whale_address, signal.whale_address
+                    );
                 }
 
                 self.db.upsert_position(&existing)?;
@@ -378,9 +398,16 @@ impl SolanaExecutor {
                         );
                         // Query token account balance and calculate amount
                         let token_amount_raw = 100_000_000u64; // Token units proxy or RPC fetched
-                        let sell_units = ((token_amount_raw as f64) * (sell_ratio_pct / 100.0)) as u64;
-                        if let Ok(quote) = self.fetch_jupiter_quote(&pos.token_mint, wsol_mint, sell_units.max(1), 150).await {
-                            if let Ok(signed_tx) = self.build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key).await {
+                        let sell_units =
+                            ((token_amount_raw as f64) * (sell_ratio_pct / 100.0)) as u64;
+                        if let Ok(quote) = self
+                            .fetch_jupiter_quote(&pos.token_mint, wsol_mint, sell_units.max(1), 150)
+                            .await
+                        {
+                            if let Ok(signed_tx) = self
+                                .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
+                                .await
+                            {
                                 let _ = self.broadcast_tx(&signed_tx).await;
                             }
                         }

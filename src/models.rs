@@ -119,9 +119,9 @@ pub struct SmartWallet {
     pub win_rate_pct: f64,
     pub total_trades: u32,
     #[serde(default = "default_source")]
-    pub source: String,             // "FOMO" | "ONCHAIN_INDEXER"
+    pub source: String, // "FOMO" | "ONCHAIN_INDEXER"
     #[serde(default = "default_reputation")]
-    pub reputation_score: f64,      // 0.0 - 100.0
+    pub reputation_score: f64, // 0.0 - 100.0
     #[serde(default = "default_active")]
     pub is_active: bool,
     #[serde(default)]
@@ -207,7 +207,7 @@ pub struct WalletActivity {
     #[serde(default)]
     pub whale_balance_after: f64,
     #[serde(default)]
-    pub sell_ratio_pct: f64,        // 0.0 for Buy, 0.0-100.0 for Sell (e.g. 50.0% partial, 100.0% full)
+    pub sell_ratio_pct: f64, // 0.0 for Buy, 0.0-100.0 for Sell (e.g. 50.0% partial, 100.0% full)
     pub tx_signature: String,
     pub timestamp: DateTime<Utc>,
 }
@@ -250,7 +250,7 @@ pub struct ShadowPosition {
     pub realized_pnl_usd: f64,
     pub entry_time: DateTime<Utc>,
     pub last_update: DateTime<Utc>,
-    pub status: String,             // "OPEN" | "PARTIAL_EXIT" | "CLOSED"
+    pub status: String, // "OPEN" | "PARTIAL_EXIT" | "CLOSED"
 }
 
 pub fn default_portion() -> f64 {
@@ -264,12 +264,14 @@ pub fn is_blacklisted_asset(mint: &str, symbol: &str) -> bool {
 
     // Blacklisted base/stablecoin symbols
     let blacklisted_symbols = [
-        "USDC", "USDT", "USD₮0", "USDT0", "DAI", "USDE", "USDS", "PYUSD",
-        "BUSD", "TUSD", "EURC", "USDG", "UZDT", "WETH", "ETH", "WSOL",
-        "SOL", "WBTC", "BTC", "ARB", "OTM", "WERC"
+        "USDC", "USDT", "USD₮0", "USDT0", "DAI", "USDE", "USDS", "PYUSD", "BUSD", "TUSD", "EURC",
+        "USDG", "UZDT", "WETH", "ETH", "WSOL", "SOL", "WBTC", "BTC", "ARB", "OTM", "WERC",
     ];
 
-    if blacklisted_symbols.iter().any(|&s| sym_upper == s || sym_upper == format!("W{}", s)) {
+    if blacklisted_symbols
+        .iter()
+        .any(|&s| sym_upper == s || sym_upper == format!("W{}", s))
+    {
         return true;
     }
 
@@ -290,7 +292,7 @@ pub fn is_blacklisted_asset(mint: &str, symbol: &str) -> bool {
         // Solana
         "epjfwdd5aufqssqem2qn1xzybapc8g4weggkzwytdt1v", // USDC Sol
         "es9vmfrzacerrmjfrf4h2fyd4kconkcy11mcce8benwny", // USDT Sol
-        "so11111111111111111111111111111111111111112", // WSOL Sol
+        "so11111111111111111111111111111111111111112",  // WSOL Sol
     ];
 
     if blacklisted_mints.iter().any(|&m| mint_lower == m) {

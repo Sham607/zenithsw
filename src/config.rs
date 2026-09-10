@@ -23,18 +23,18 @@ pub struct Config {
     pub stream_poll_interval_ms: u64,
 
     // Gating parameters
-    pub max_price_delta_pct: f64,   // Max +5.0% price impact / slippage delta
-    pub min_liquidity_usd: f64,      // Min $30,000 liquidity in pool
-    pub position_size_usd: f64,      // $15 default position size
-    pub min_whale_buy_usd: f64,      // Min $250 whale order size to filter dust transactions
-    pub max_price_impact_pct: f64,   // Max 15.0% price impact on pool to prevent buying local tops
-    pub min_market_cap_usd: f64,     // Min $50k market cap
-    pub max_market_cap_usd: f64,     // Max $20M market cap
-    pub trailing_stop_pct: f64,      // 10% trailing stop
-    pub stop_loss_pct: f64,          // 15% stop loss
-    pub take_profit_pct: f64,        // 50% take profit
-    pub shadow_exit_enabled: bool,   // Mirror sell when whale dumps
-    pub confluence_mode: String,     // "TIER_S_OR_DUAL_A"
+    pub max_price_delta_pct: f64, // Max +5.0% price impact / slippage delta
+    pub min_liquidity_usd: f64,   // Min $30,000 liquidity in pool
+    pub position_size_usd: f64,   // $15 default position size
+    pub min_whale_buy_usd: f64,   // Min $250 whale order size to filter dust transactions
+    pub max_price_impact_pct: f64, // Max 15.0% price impact on pool to prevent buying local tops
+    pub min_market_cap_usd: f64,  // Min $50k market cap
+    pub max_market_cap_usd: f64,  // Max $20M market cap
+    pub trailing_stop_pct: f64,   // 10% trailing stop
+    pub stop_loss_pct: f64,       // 15% stop loss
+    pub take_profit_pct: f64,     // 50% take profit
+    pub shadow_exit_enabled: bool, // Mirror sell when whale dumps
+    pub confluence_mode: String,  // "TIER_S_OR_DUAL_A"
     pub dry_run: bool,
 
     // Persistence & IPC
@@ -46,18 +46,23 @@ impl Config {
     pub fn load() -> Result<Self> {
         let _ = dotenv();
 
-        let solana_rpc_url = env::var("SOLANA_RPC_URL")
-            .unwrap_or_else(|_| "https://mainnet.helius-rpc.com/?api-key=def963d9-3753-4fe1-a609-f0534ead614f".to_string());
-        
-        let solana_ws_url = env::var("SOLANA_WS_URL")
-            .unwrap_or_else(|_| "wss://mainnet.helius-rpc.com/?api-key=def963d9-3753-4fe1-a609-f0534ead614f".to_string());
+        let solana_rpc_url = env::var("SOLANA_RPC_URL").unwrap_or_else(|_| {
+            "https://mainnet.helius-rpc.com/?api-key=def963d9-3753-4fe1-a609-f0534ead614f"
+                .to_string()
+        });
+
+        let solana_ws_url = env::var("SOLANA_WS_URL").unwrap_or_else(|_| {
+            "wss://mainnet.helius-rpc.com/?api-key=def963d9-3753-4fe1-a609-f0534ead614f".to_string()
+        });
 
         let solana_private_key = env::var("SOLANA_PRIVATE_KEY").ok();
 
-        let arbitrum_rpc_url = env::var("ARBITRUM_RPC_URL")
-            .unwrap_or_else(|_| "https://arb-mainnet.g.alchemy.com/v2/alch_PS21nEmHejPxYhypdUH1A".to_string());
-        let arbitrum_ws_url = env::var("ARBITRUM_WS_URL")
-            .unwrap_or_else(|_| "wss://arb-mainnet.g.alchemy.com/v2/alch_PS21nEmHejPxYhypdUH1A".to_string());
+        let arbitrum_rpc_url = env::var("ARBITRUM_RPC_URL").unwrap_or_else(|_| {
+            "https://arb-mainnet.g.alchemy.com/v2/alch_PS21nEmHejPxYhypdUH1A".to_string()
+        });
+        let arbitrum_ws_url = env::var("ARBITRUM_WS_URL").unwrap_or_else(|_| {
+            "wss://arb-mainnet.g.alchemy.com/v2/alch_PS21nEmHejPxYhypdUH1A".to_string()
+        });
 
         let base_rpc_url = env::var("BASE_RPC_URL")
             .unwrap_or_else(|_| "https://base-mainnet.g.alchemy.com/v2/demo".to_string());
@@ -66,7 +71,9 @@ impl Config {
 
         let evm_private_key = env::var("EVM_PRIVATE_KEY").ok();
 
-        let fomo_auth_token = env::var("FOMO_AUTH_TOKEN").ok().filter(|s| !s.trim().is_empty());
+        let fomo_auth_token = env::var("FOMO_AUTH_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
 
         let fomo_sync_interval_sec = env::var("FOMO_SYNC_INTERVAL_SEC")
             .ok()
@@ -132,18 +139,17 @@ impl Config {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(true);
 
-        let confluence_mode = env::var("CONFLUENCE_MODE")
-            .unwrap_or_else(|_| "TIER_S_OR_DUAL_A".to_string());
+        let confluence_mode =
+            env::var("CONFLUENCE_MODE").unwrap_or_else(|_| "TIER_S_OR_DUAL_A".to_string());
 
         let dry_run = env::var("DRY_RUN")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(true);
 
-        let db_path = env::var("DB_PATH")
-            .unwrap_or_else(|_| "data/smart_wallets.db".to_string());
+        let db_path = env::var("DB_PATH").unwrap_or_else(|_| "data/smart_wallets.db".to_string());
 
-        let ipc_socket_path = env::var("IPC_SOCKET_PATH")
-            .unwrap_or_else(|_| "/tmp/zenithsw.sock".to_string());
+        let ipc_socket_path =
+            env::var("IPC_SOCKET_PATH").unwrap_or_else(|_| "/tmp/zenithsw.sock".to_string());
 
         Ok(Self {
             solana_rpc_url,

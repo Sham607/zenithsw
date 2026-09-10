@@ -28,7 +28,10 @@ async fn main() -> Result<()> {
 
     // Initial seed: Verified smart wallets into SQLite database
     let default_seeds = FomoScraper::get_default_seed_traders();
-    println!("[INIT] Syncing {} verified elite smart wallets into database...", default_seeds.len());
+    println!(
+        "[INIT] Syncing {} verified elite smart wallets into database...",
+        default_seeds.len()
+    );
     for s in &default_seeds {
         let _ = db.upsert_wallet(s);
     }
@@ -39,7 +42,10 @@ async fn main() -> Result<()> {
 
     // Initialize Stream Listeners
     let sol_listener = Arc::new(SolanaStreamListener::new(&config.solana_rpc_url));
-    let arb_listener = Arc::new(EvmStreamListener::new(&config.arbitrum_rpc_url, Chain::Robinhood));
+    let arb_listener = Arc::new(EvmStreamListener::new(
+        &config.arbitrum_rpc_url,
+        Chain::Robinhood,
+    ));
     let base_listener = Arc::new(EvmStreamListener::new(&config.base_rpc_url, Chain::Base));
     let fomo_listener = Arc::new(FomoApiStreamListener::new(Arc::new(config.clone())));
 
@@ -49,7 +55,12 @@ async fn main() -> Result<()> {
     let evm_exec = Arc::new(EvmExecutor::new(config.clone(), db.clone()));
 
     // Task 1: Direct On-Chain DEX Graph Indexer Worker (Every 10 minutes)
-    let indexer = Arc::new(SmartMoneyIndexer::new(&config.solana_rpc_url, &config.arbitrum_rpc_url, db.clone(), 600));
+    let indexer = Arc::new(SmartMoneyIndexer::new(
+        &config.solana_rpc_url,
+        &config.arbitrum_rpc_url,
+        db.clone(),
+        600,
+    ));
     let indexer_worker = indexer.clone();
     tokio::spawn(async move {
         // Initial immediate indexer pass + loop
@@ -63,7 +74,10 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         println!("[RADAR WORKER] Whale Portfolio & Gems Harvester online (Scanning Top 50 7D Leaderboard)...");
         loop {
-            match fomo_scraper_worker.harvest_7d_whale_holdings_and_radar().await {
+            match fomo_scraper_worker
+                .harvest_7d_whale_holdings_and_radar()
+                .await
+            {
                 Ok(tokens) => {
                     println!("[RADAR HARVEST 💎] Successfully analyzed and tracked {} whale conviction tokens", tokens.len());
                     let _ = ipc_radar.broadcast(&IpcMessage::TrackedTokensUpdate { tokens });
@@ -93,53 +107,128 @@ async fn main() -> Result<()> {
             if let Ok(wallets) = db_stream.get_active_wallets() {
                 for w in wallets {
                     let mut activity_opt = if w.source == "FOMO" && w.tier == WalletTier::TierS {
-                        fomo_listener_stream.check_trader_swaps(&w.handle, &w.address, db_stream.clone()).await.ok().flatten()
+                        fomo_listener_stream
+                            .check_trader_swaps(&w.handle, &w.address, db_stream.clone())
+                            .await
+                            .ok()
+                            .flatten()
                     } else {
                         None
                     };
 
                     if activity_opt.is_none() {
                         activity_opt = match w.chain {
-                            Chain::Solana => sol_listener_stream.check_recent_txs(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
-                            Chain::Robinhood | Chain::Arbitrum => arb_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
-                            Chain::Base => base_listener_stream.check_wallet_activity(&w.handle, &w.address, db_stream.clone()).await.ok().flatten(),
+                            Chain::Solana => sol_listener_stream
+                                .check_recent_txs(&w.handle, &w.address, db_stream.clone())
+                                .await
+                                .ok()
+                                .flatten(),
+                            Chain::Robinhood | Chain::Arbitrum => arb_listener_stream
+                                .check_wallet_activity(&w.handle, &w.address, db_stream.clone())
+                                .await
+                                .ok()
+                                .flatten(),
+                            Chain::Base => base_listener_stream
+                                .check_wallet_activity(&w.handle, &w.address, db_stream.clone())
+                                .await
+                                .ok()
+                                .flatten(),
                             _ => None,
                         };
                     }
 
                     if let Some(act) = activity_opt {
-                        println!("[ACTIVITY 🔥] {} by @{} ({}) -> Token: {} (${:.2})", act.activity_type, act.wallet_handle, act.chain, act.token_symbol, act.amount_usd);
-                        let _ = ipc_stream.broadcast(&IpcMessage::ActivityBroadcast { activity: act.clone() });
+                        println!(
+                            "[ACTIVITY 🔥] {} by @{} ({}) -> Token: {} (${:.2})",
+                            act.activity_type,
+                            act.wallet_handle,
+                            act.chain,
+                            act.token_symbol,
+                            act.amount_usd
+                        );
+                        let _ = ipc_stream.broadcast(&IpcMessage::ActivityBroadcast {
+                            activity: act.clone(),
+                        });
 
                         // Handle Pure Shadow Mirror Exit (Proportional / Full per whale contribution)
                         if act.activity_type == ActivityType::Sell {
                             if let Ok(positions) = db_stream.get_active_positions() {
                                 for pos in positions {
-                                    if pos.token_mint.eq_ignore_ascii_case(&act.token_mint) && pos.chain == act.chain {
+                                    if pos.token_mint.eq_ignore_ascii_case(&act.token_mint)
+                                        && pos.chain == act.chain
+                                    {
                                         let whale_addr_lower = act.wallet_address.to_lowercase();
-                                        let is_participant = pos.target_whale_address.to_lowercase().contains(&whale_addr_lower)
-                                            || pos.target_whale_handle.to_lowercase().contains(&act.wallet_handle.to_lowercase());
+                                        let is_participant = pos
+                                            .target_whale_address
+                                            .to_lowercase()
+                                            .contains(&whale_addr_lower)
+                                            || pos
+                                                .target_whale_handle
+                                                .to_lowercase()
+                                                .contains(&act.wallet_handle.to_lowercase());
 
                                         if is_participant {
-                                            let exit_price = if act.execution_price_usd > 0.0 { act.execution_price_usd } else { pos.current_price };
-                                            let raw_sell_ratio = act.sell_ratio_pct.clamp(1.0, 100.0);
-                                            
+                                            let exit_price = if act.execution_price_usd > 0.0 {
+                                                act.execution_price_usd
+                                            } else {
+                                                pos.current_price
+                                            };
+                                            let raw_sell_ratio =
+                                                act.sell_ratio_pct.clamp(1.0, 100.0);
+
                                             // Count participating whales to compute weighted exit ratio
-                                            let whale_count = pos.target_whale_address.split(',').count().max(1) as f64;
+                                            let whale_count =
+                                                pos.target_whale_address.split(',').count().max(1)
+                                                    as f64;
                                             let whale_weight = 1.0 / whale_count;
-                                            let effective_sell_ratio = (raw_sell_ratio * whale_weight).clamp(1.0, 100.0);
+                                            let effective_sell_ratio =
+                                                (raw_sell_ratio * whale_weight).clamp(1.0, 100.0);
 
                                             if raw_sell_ratio >= 95.0 && whale_count <= 1.0 {
                                                 println!("[SHADOW FULL EXIT 🔴] Target @{} sold 100% of {} -> Closing position completely!", act.wallet_handle, pos.token_symbol);
                                                 match pos.chain {
-                                                    Chain::Solana => { let _ = sol_exec_stream.execute_shadow_sell(&pos.id, "WHALE_FULL_DUMP", exit_price).await; }
-                                                    _ => { let _ = evm_exec_stream.execute_shadow_sell(&pos.id, "WHALE_FULL_DUMP", exit_price).await; }
+                                                    Chain::Solana => {
+                                                        let _ = sol_exec_stream
+                                                            .execute_shadow_sell(
+                                                                &pos.id,
+                                                                "WHALE_FULL_DUMP",
+                                                                exit_price,
+                                                            )
+                                                            .await;
+                                                    }
+                                                    _ => {
+                                                        let _ = evm_exec_stream
+                                                            .execute_shadow_sell(
+                                                                &pos.id,
+                                                                "WHALE_FULL_DUMP",
+                                                                exit_price,
+                                                            )
+                                                            .await;
+                                                    }
                                                 }
                                             } else {
                                                 println!("[SHADOW PROPORTIONAL EXIT 🟡] Target @{} sold {:.1}% of {} (Weighted: {:.1}%, {} whales in pos) -> Partial exit!", act.wallet_handle, raw_sell_ratio, pos.token_symbol, effective_sell_ratio, whale_count);
                                                 match pos.chain {
-                                                    Chain::Solana => { let _ = sol_exec_stream.execute_partial_shadow_sell(&pos.id, effective_sell_ratio, "WHALE_PARTIAL_DUMP", exit_price).await; }
-                                                    _ => { let _ = evm_exec_stream.execute_partial_shadow_sell(&pos.id, effective_sell_ratio, "WHALE_PARTIAL_DUMP", exit_price).await; }
+                                                    Chain::Solana => {
+                                                        let _ = sol_exec_stream
+                                                            .execute_partial_shadow_sell(
+                                                                &pos.id,
+                                                                effective_sell_ratio,
+                                                                "WHALE_PARTIAL_DUMP",
+                                                                exit_price,
+                                                            )
+                                                            .await;
+                                                    }
+                                                    _ => {
+                                                        let _ = evm_exec_stream
+                                                            .execute_partial_shadow_sell(
+                                                                &pos.id,
+                                                                effective_sell_ratio,
+                                                                "WHALE_PARTIAL_DUMP",
+                                                                exit_price,
+                                                            )
+                                                            .await;
+                                                    }
                                                 }
                                             }
                                         }
@@ -148,10 +237,11 @@ async fn main() -> Result<()> {
                             }
                         } else if act.activity_type == ActivityType::Buy {
                             // Fetch real-time pool price & liquidity across Solana/EVM
-                            let (current_price, pool_liq) = SolanaStreamListener::fetch_token_price(&act.token_mint)
-                                .await
-                                .map(|(_, p, l)| (p, l))
-                                .unwrap_or((act.execution_price_usd, 35000.0));
+                            let (current_price, pool_liq) =
+                                SolanaStreamListener::fetch_token_price(&act.token_mint)
+                                    .await
+                                    .map(|(_, p, l)| (p, l))
+                                    .unwrap_or((act.execution_price_usd, 35000.0));
 
                             let mut act_to_eval = act.clone();
                             if act_to_eval.execution_price_usd <= 0.0 && current_price > 0.0 {
@@ -159,21 +249,39 @@ async fn main() -> Result<()> {
                             }
 
                             // Strict Gating & Confluence Evaluation
-                            if let Ok(sig) = confluence_stream.evaluate_activity(&act_to_eval, &w, current_price, pool_liq) {
-                                let _ = ipc_stream.broadcast(&IpcMessage::SignalBroadcast { signal: sig.clone() });
+                            if let Ok(sig) = confluence_stream.evaluate_activity(
+                                &act_to_eval,
+                                &w,
+                                current_price,
+                                pool_liq,
+                            ) {
+                                let _ = ipc_stream.broadcast(&IpcMessage::SignalBroadcast {
+                                    signal: sig.clone(),
+                                });
 
                                 if sig.is_passed {
                                     println!("[EXECUTE 🚀] Passed strict gating! Executing shadow buy for {}", sig.token_symbol);
                                     let pos_opt = match sig.chain {
-                                        Chain::Solana => sol_exec_stream.execute_shadow_buy(&sig).await.ok().flatten(),
-                                        _ => evm_exec_stream.execute_shadow_buy(&sig).await.ok().flatten(),
+                                        Chain::Solana => sol_exec_stream
+                                            .execute_shadow_buy(&sig)
+                                            .await
+                                            .ok()
+                                            .flatten(),
+                                        _ => evm_exec_stream
+                                            .execute_shadow_buy(&sig)
+                                            .await
+                                            .ok()
+                                            .flatten(),
                                     };
 
                                     if let Some(new_pos) = pos_opt {
                                         println!("[POSITION OPENED ✅] ID: {}, Token: {}, Entry: ${:.6}, Amount: ${:.2}", new_pos.id, new_pos.token_symbol, new_pos.entry_price, new_pos.amount_usd);
                                     }
                                 } else {
-                                    println!("[GATING REJECT ❌] Token: {} rejected: {:?}", sig.token_symbol, sig.rejection_reason);
+                                    println!(
+                                        "[GATING REJECT ❌] Token: {} rejected: {:?}",
+                                        sig.token_symbol, sig.rejection_reason
+                                    );
                                 }
                             }
                         }
@@ -222,26 +330,67 @@ async fn main() -> Result<()> {
                         pos.current_price = live_price;
                         pos.peak_price = pos.peak_price.max(live_price);
                         if pos.entry_price > 0.0 {
-                            pos.unrealized_pnl_pct = ((pos.current_price - pos.entry_price) / pos.entry_price) * 100.0;
+                            pos.unrealized_pnl_pct =
+                                ((pos.current_price - pos.entry_price) / pos.entry_price) * 100.0;
                         }
                         pos.last_update = Utc::now();
                         let _ = db_pos_tracker.upsert_position(pos);
 
                         // 1. Independent Auto Take Profit (50% Partial Exit at +100% PnL to free-roll initial capital)
-                        if pos.unrealized_pnl_pct >= 100.0 && pos.status == "OPEN" && pos.remaining_portion_pct >= 90.0 {
+                        if pos.unrealized_pnl_pct >= 100.0
+                            && pos.status == "OPEN"
+                            && pos.remaining_portion_pct >= 90.0
+                        {
                             println!("[AUTO-TP +100% 🎯] Position {} ({}) reached +{:.1}% >= +100.0%! Executing 50% partial exit to secure initial capital (Free-Roll Moonbag)!", pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
                             match pos.chain {
-                                Chain::Solana => { let _ = sol_exec_pos.execute_partial_shadow_sell(&pos.id, 50.0, "AUTO_TP_100PCT_FREE_ROLL", live_price).await; }
-                                _ => { let _ = evm_exec_pos.execute_partial_shadow_sell(&pos.id, 50.0, "AUTO_TP_100PCT_FREE_ROLL", live_price).await; }
+                                Chain::Solana => {
+                                    let _ = sol_exec_pos
+                                        .execute_partial_shadow_sell(
+                                            &pos.id,
+                                            50.0,
+                                            "AUTO_TP_100PCT_FREE_ROLL",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
+                                _ => {
+                                    let _ = evm_exec_pos
+                                        .execute_partial_shadow_sell(
+                                            &pos.id,
+                                            50.0,
+                                            "AUTO_TP_100PCT_FREE_ROLL",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
                             }
                         }
 
                         // 2. Trailing Profit-Lock Floor on Moonbag (+100% -> Floor +25.0%)
-                        if pos.status == "PARTIAL_EXIT" && pos.remaining_portion_pct <= 55.0 && pos.unrealized_pnl_pct <= 25.0 {
+                        if pos.status == "PARTIAL_EXIT"
+                            && pos.remaining_portion_pct <= 55.0
+                            && pos.unrealized_pnl_pct <= 25.0
+                        {
                             println!("[PROFIT-LOCK FLOOR 🛡️] Position {} ({}) moonbag dropped to +{:.1}% <= +25.0%! Closing remaining portion to lock gains!", pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
                             match pos.chain {
-                                Chain::Solana => { let _ = sol_exec_pos.execute_shadow_sell(&pos.id, "PROFIT_LOCK_FLOOR_EXIT", live_price).await; }
-                                _ => { let _ = evm_exec_pos.execute_shadow_sell(&pos.id, "PROFIT_LOCK_FLOOR_EXIT", live_price).await; }
+                                Chain::Solana => {
+                                    let _ = sol_exec_pos
+                                        .execute_shadow_sell(
+                                            &pos.id,
+                                            "PROFIT_LOCK_FLOOR_EXIT",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
+                                _ => {
+                                    let _ = evm_exec_pos
+                                        .execute_shadow_sell(
+                                            &pos.id,
+                                            "PROFIT_LOCK_FLOOR_EXIT",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
                             }
                         }
 
@@ -249,8 +398,24 @@ async fn main() -> Result<()> {
                         if pos.unrealized_pnl_pct <= -20.0 && pos.status != "CLOSED" {
                             println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) hit {:.1}% <= -20.0%! Force closing immediately to protect capital!", pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
                             match pos.chain {
-                                Chain::Solana => { let _ = sol_exec_pos.execute_shadow_sell(&pos.id, "EMERGENCY_HARD_SL_CUTLOSS", live_price).await; }
-                                _ => { let _ = evm_exec_pos.execute_shadow_sell(&pos.id, "EMERGENCY_HARD_SL_CUTLOSS", live_price).await; }
+                                Chain::Solana => {
+                                    let _ = sol_exec_pos
+                                        .execute_shadow_sell(
+                                            &pos.id,
+                                            "EMERGENCY_HARD_SL_CUTLOSS",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
+                                _ => {
+                                    let _ = evm_exec_pos
+                                        .execute_shadow_sell(
+                                            &pos.id,
+                                            "EMERGENCY_HARD_SL_CUTLOSS",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -275,9 +440,15 @@ async fn main() -> Result<()> {
         loop {
             sync_tick += 1;
             let uptime_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-            let total_tracked_count = db_heartbeat.get_active_wallets().map(|w| w.len()).unwrap_or(0);
+            let total_tracked_count = db_heartbeat
+                .get_active_wallets()
+                .map(|w| w.len())
+                .unwrap_or(0);
             let qualified_wallets = db_heartbeat.get_qualified_wallets().unwrap_or_default();
-            let active_positions_count = db_heartbeat.get_active_positions().map(|p: Vec<ShadowPosition>| p.len()).unwrap_or(0);
+            let active_positions_count = db_heartbeat
+                .get_active_positions()
+                .map(|p: Vec<ShadowPosition>| p.len())
+                .unwrap_or(0);
 
             let hb = IpcMessage::Heartbeat {
                 uptime_secs,
@@ -292,7 +463,9 @@ async fn main() -> Result<()> {
             // Sync qualified elite target wallets (Tier-S & Tier-A only) and trade executions audit log every 4 seconds
             if sync_tick % 2 == 0 {
                 if !qualified_wallets.is_empty() {
-                    let _ = ipc_heartbeat.broadcast(&IpcMessage::WalletSync { wallets: qualified_wallets });
+                    let _ = ipc_heartbeat.broadcast(&IpcMessage::WalletSync {
+                        wallets: qualified_wallets,
+                    });
                 }
                 if let Ok(trades) = db_heartbeat.get_recent_trades(50) {
                     let _ = ipc_heartbeat.broadcast(&IpcMessage::TradeSync { trades });

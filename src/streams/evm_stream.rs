@@ -79,7 +79,11 @@ impl EvmStreamListener {
         if let Ok(res) = res_in {
             if res.status().is_success() {
                 if let Ok(json_res) = res.json::<Value>().await {
-                    if let Some(txs) = json_res.get("result").and_then(|r| r.get("transfers")).and_then(|t| t.as_array()) {
+                    if let Some(txs) = json_res
+                        .get("result")
+                        .and_then(|r| r.get("transfers"))
+                        .and_then(|t| t.as_array())
+                    {
                         all_transfers.extend(txs.clone());
                     }
                 }
@@ -89,7 +93,11 @@ impl EvmStreamListener {
         if let Ok(res) = res_out {
             if res.status().is_success() {
                 if let Ok(json_res) = res.json::<Value>().await {
-                    if let Some(txs) = json_res.get("result").and_then(|r| r.get("transfers")).and_then(|t| t.as_array()) {
+                    if let Some(txs) = json_res
+                        .get("result")
+                        .and_then(|r| r.get("transfers"))
+                        .and_then(|t| t.as_array())
+                    {
                         all_transfers.extend(txs.clone());
                     }
                 }
@@ -102,15 +110,24 @@ impl EvmStreamListener {
 
         // Sort transfers by blockTimestamp descending
         all_transfers.sort_by(|a, b| {
-            let ts_a = a.get("metadata").and_then(|m| m.get("blockTimestamp")).and_then(|t| t.as_str()).unwrap_or("");
-            let ts_b = b.get("metadata").and_then(|m| m.get("blockTimestamp")).and_then(|t| t.as_str()).unwrap_or("");
+            let ts_a = a
+                .get("metadata")
+                .and_then(|m| m.get("blockTimestamp"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let ts_b = b
+                .get("metadata")
+                .and_then(|m| m.get("blockTimestamp"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
             ts_b.cmp(ts_a)
         });
 
         // Pick the most recent valid transfer
         for tx in all_transfers {
             let hash = tx.get("hash").and_then(|h| h.as_str()).unwrap_or("");
-            let raw_contract = tx.get("rawContract")
+            let raw_contract = tx
+                .get("rawContract")
                 .and_then(|r| r.get("address"))
                 .and_then(|a| a.as_str())
                 .unwrap_or("");
@@ -130,7 +147,11 @@ impl EvmStreamListener {
             }
 
             let now = Utc::now();
-            let tx_age_secs = if let Some(ts_str) = tx.get("metadata").and_then(|m| m.get("blockTimestamp")).and_then(|t| t.as_str()) {
+            let tx_age_secs = if let Some(ts_str) = tx
+                .get("metadata")
+                .and_then(|m| m.get("blockTimestamp"))
+                .and_then(|t| t.as_str())
+            {
                 if let Ok(dt) = DateTime::parse_from_rfc3339(ts_str) {
                     (now.timestamp() - dt.timestamp()).max(0)
                 } else {
@@ -179,7 +200,8 @@ impl EvmStreamListener {
             let mut token_symbol = asset.to_string();
             let mut execution_price_usd = 0.0;
 
-            if let Ok((sym, price, _)) = SolanaStreamListener::fetch_token_price(raw_contract).await {
+            if let Ok((sym, price, _)) = SolanaStreamListener::fetch_token_price(raw_contract).await
+            {
                 if sym != "UNKNOWN" && !sym.is_empty() {
                     token_symbol = sym;
                 }

@@ -39,7 +39,9 @@ impl ReputationScorer {
                 multi_token_wins,
                 is_eligible_tier_a: false,
                 is_eligible_tier_s: false,
-                rejection_reason: Some("REJECTED: Wallet is Token Creator/Deployer (Insider Trap)".to_string()),
+                rejection_reason: Some(
+                    "REJECTED: Wallet is Token Creator/Deployer (Insider Trap)".to_string(),
+                ),
             };
         }
 
@@ -55,7 +57,9 @@ impl ReputationScorer {
                 multi_token_wins,
                 is_eligible_tier_a: false,
                 is_eligible_tier_s: false,
-                rejection_reason: Some("REJECTED: Disposable / Fresh Wallet (<3 days old)".to_string()),
+                rejection_reason: Some(
+                    "REJECTED: Disposable / Fresh Wallet (<3 days old)".to_string(),
+                ),
             };
         }
 
@@ -71,13 +75,15 @@ impl ReputationScorer {
                 multi_token_wins,
                 is_eligible_tier_a: false,
                 is_eligible_tier_s: false,
-                rejection_reason: Some("REJECTED: One-hit Wonder (No multi-token consistency)".to_string()),
+                rejection_reason: Some(
+                    "REJECTED: One-hit Wonder (No multi-token consistency)".to_string(),
+                ),
             };
         }
 
         // 4. Compute composite score
         let mut score = 50.0;
-        
+
         // Win rate weight (+- 20)
         score += ((win_rate_pct - 50.0) / 50.0) * 20.0;
 
@@ -99,8 +105,10 @@ impl ReputationScorer {
 
         let reputation_score = score.clamp(0.0, 100.0);
         // Realized PnL Priority: Large verified real PnL is primary eligibility criterion
-        let is_eligible_tier_s = estimated_pnl_usd >= 50_000.0 || (reputation_score >= 80.0 && estimated_pnl_usd >= 25_000.0);
-        let is_eligible_tier_a = estimated_pnl_usd >= 10_000.0 || (reputation_score >= 65.0 && estimated_pnl_usd >= 5_000.0);
+        let is_eligible_tier_s = estimated_pnl_usd >= 50_000.0
+            || (reputation_score >= 80.0 && estimated_pnl_usd >= 25_000.0);
+        let is_eligible_tier_a = estimated_pnl_usd >= 10_000.0
+            || (reputation_score >= 65.0 && estimated_pnl_usd >= 5_000.0);
 
         WalletScoreResult {
             address: address.to_string(),
