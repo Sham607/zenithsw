@@ -27,7 +27,9 @@ pub struct Config {
     pub min_liquidity_usd: f64,      // Min $30,000 liquidity in pool
     pub position_size_usd: f64,      // $15 default position size
     pub min_whale_buy_usd: f64,      // Min $250 whale order size to filter dust transactions
-    pub max_price_impact_pct: f64,   // Max 3.5% price impact on pool to prevent buying local tops
+    pub max_price_impact_pct: f64,   // Max 15.0% price impact on pool to prevent buying local tops
+    pub min_market_cap_usd: f64,     // Min $50k market cap
+    pub max_market_cap_usd: f64,     // Max $20M market cap
     pub trailing_stop_pct: f64,      // 10% trailing stop
     pub stop_loss_pct: f64,          // 15% stop loss
     pub take_profit_pct: f64,        // 50% take profit
@@ -99,7 +101,17 @@ impl Config {
         let max_price_impact_pct = env::var("MAX_PRICE_IMPACT_PCT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3.5);
+            .unwrap_or(15.0);
+
+        let min_market_cap_usd = env::var("MIN_MARKET_CAP_USD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50000.0);
+
+        let max_market_cap_usd = env::var("MAX_MARKET_CAP_USD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20000000.0);
 
         let trailing_stop_pct = env::var("TRAILING_STOP_PCT")
             .ok()
@@ -150,6 +162,8 @@ impl Config {
             position_size_usd,
             min_whale_buy_usd,
             max_price_impact_pct,
+            min_market_cap_usd,
+            max_market_cap_usd,
             trailing_stop_pct,
             stop_loss_pct,
             take_profit_pct,

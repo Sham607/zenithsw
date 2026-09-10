@@ -27,7 +27,9 @@ fn get_mock_config() -> Config {
         min_liquidity_usd: 30000.0,
         position_size_usd: 15.0,
         min_whale_buy_usd: 250.0,
-        max_price_impact_pct: 3.5,
+        max_price_impact_pct: 15.0,
+        min_market_cap_usd: 50000.0,
+        max_market_cap_usd: 20000000.0,
         trailing_stop_pct: 10.0,
         stop_loss_pct: 15.0,
         take_profit_pct: 50.0,
@@ -645,7 +647,7 @@ async fn test_min_whale_buy_and_price_impact_gating() {
         "Rejection reason must indicate buy too small"
     );
 
-    // 2. Whale Big Buy with High Price Impact ($5,000 buy on $50,000 pool = 10% impact > 3.5%) -> MUST BE REJECTED!
+    // 2. Whale Big Buy with High Price Impact ($10,000 buy on $50,000 pool = 20% impact > 15.0%) -> MUST BE REJECTED!
     let high_impact_act = WalletActivity {
         id: None,
         wallet_address: whale.address.clone(),
@@ -654,17 +656,17 @@ async fn test_min_whale_buy_and_price_impact_gating() {
         activity_type: ActivityType::Buy,
         token_symbol: "JUGGERNAUT".to_string(),
         token_mint: mint.clone(),
-        amount_usd: 5000.0,
-        token_amount: 333_333.0,
+        amount_usd: 10000.0,
+        token_amount: 666_666.0,
         execution_price_usd: 0.015,
         whale_balance_before: 0.0,
-        whale_balance_after: 333_333.0,
+        whale_balance_after: 666_666.0,
         sell_ratio_pct: 0.0,
         tx_signature: "tx_high_impact".to_string(),
         timestamp: now,
     };
 
-    let sig_high_impact = confluence.evaluate_activity(&high_impact_act, &whale, 0.015, 50_000.0).unwrap(); // 5000 / 50000 = 10% > 3.5%
+    let sig_high_impact = confluence.evaluate_activity(&high_impact_act, &whale, 0.015, 50_000.0).unwrap(); // 10000 / 50000 = 20% > 15.0%
     assert!(!sig_high_impact.is_passed, "High price impact buy must be rejected");
     assert!(
         sig_high_impact.rejection_reason.unwrap().contains("PRICE_IMPACT_TOO_HIGH"),
@@ -693,4 +695,156 @@ async fn test_min_whale_buy_and_price_impact_gating() {
     let sig_valid = confluence.evaluate_activity(&valid_act, &whale, 0.015, 900_000.0).unwrap();
     assert!(sig_valid.is_passed, "Valid high conviction buy must pass gating");
     assert_eq!(sig_valid.rejection_reason, None);
+}
+
+#[tokio::test]
+async fn test_market_cap_range_gating_50k_to_20m() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let config = get_mock_config();
+    let confluence = ConfluenceEngine::new(config, db.clone());
+    let now = Utc::now();
+
+    let whale = SmartWallet {
+        id: None,
+        rank: 1,
+        name: "Aurelius".to_string(),
+        handle: "Aurelius0121".to_string(),
+        chain: Chain::Robinhood,
+        address: "0xaurelius1234567890abcdef1234567890abcdef".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 850000.0,
+        win_rate_pct: 91.0,
+        total_trades: 45,
+        source: "FOMO".to_string(),
+        reputation_score: 98.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: now,
+    };
+
+    // 1. Insert Tracked Token with MC = $30k (< $50k min)
+    let token_sub_50k = zenithsw::models::TrackedToken {
+        token_mint: "0xtoken_low_mc".to_string(),
+        token_symbol: "LOWMC".to_string(),
+        chain: Chain::Robinhood,
+        market_cap_usd: 30_000.0,
+        liquidity_usd: 35_000.0,
+        price_usd: 0.003,
+        change_24h_pct: 5.0,
+        change_6h_pct: 2.0,
+        change_1h_pct: 1.0,
+        whale_count: 2,
+        total_whale_usd: 50_000.0,
+        top_whale_handles: "@Aurelius0121".to_string(),
+        status: "ACCUMULATION_BOTTOM".to_string(),
+        upside_tier: "NANO_CAP".to_string(),
+        last_scanned_at: now,
+    };
+    db.upsert_tracked_token(&token_sub_50k).unwrap();
+
+    let act_low = WalletActivity {
+        id: None,
+        wallet_address: whale.address.clone(),
+        wallet_handle: whale.handle.clone(),
+        chain: Chain::Robinhood,
+        activity_type: ActivityType::Buy,
+        token_symbol: "LOWMC".to_string(),
+        token_mint: "0xtoken_low_mc".to_string(),
+        amount_usd: 500.0,
+        token_amount: 166_666.0,
+        execution_price_usd: 0.003,
+        whale_balance_before: 0.0,
+        whale_balance_after: 166_666.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_low_mc".to_string(),
+        timestamp: now,
+    };
+
+    let sig_low = confluence.evaluate_activity(&act_low, &whale, 0.003, 35_000.0).unwrap();
+    assert!(!sig_low.is_passed);
+    assert!(sig_low.rejection_reason.unwrap().contains("REJECTED_MARKET_CAP_TOO_LOW"));
+
+    // 2. Insert Tracked Token with MC = $50M (> $20M max)
+    let token_high_mc = zenithsw::models::TrackedToken {
+        token_mint: "0xtoken_high_mc".to_string(),
+        token_symbol: "HIGHMC".to_string(),
+        chain: Chain::Robinhood,
+        market_cap_usd: 50_000_000.0,
+        liquidity_usd: 500_000.0,
+        price_usd: 5.0,
+        change_24h_pct: 5.0,
+        change_6h_pct: 2.0,
+        change_1h_pct: 1.0,
+        whale_count: 5,
+        total_whale_usd: 500_000.0,
+        top_whale_handles: "@Aurelius0121".to_string(),
+        status: "ACCUMULATION_BOTTOM".to_string(),
+        upside_tier: "MID_LARGE".to_string(),
+        last_scanned_at: now,
+    };
+    db.upsert_tracked_token(&token_high_mc).unwrap();
+
+    let act_high = WalletActivity {
+        id: None,
+        wallet_address: whale.address.clone(),
+        wallet_handle: whale.handle.clone(),
+        chain: Chain::Robinhood,
+        activity_type: ActivityType::Buy,
+        token_symbol: "HIGHMC".to_string(),
+        token_mint: "0xtoken_high_mc".to_string(),
+        amount_usd: 1000.0,
+        token_amount: 200.0,
+        execution_price_usd: 5.0,
+        whale_balance_before: 0.0,
+        whale_balance_after: 200.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_high_mc".to_string(),
+        timestamp: now,
+    };
+
+    let sig_high = confluence.evaluate_activity(&act_high, &whale, 5.0, 500_000.0).unwrap();
+    assert!(!sig_high.is_passed);
+    assert!(sig_high.rejection_reason.unwrap().contains("REJECTED_MARKET_CAP_TOO_HIGH"));
+
+    // 3. Insert Tracked Token with MC = $850k (In sweet spot $50k - $20M) -> PASS!
+    let token_sweet = zenithsw::models::TrackedToken {
+        token_mint: "0xtoken_sweet_spot".to_string(),
+        token_symbol: "SWEET".to_string(),
+        chain: Chain::Robinhood,
+        market_cap_usd: 850_000.0,
+        liquidity_usd: 120_000.0,
+        price_usd: 0.085,
+        change_24h_pct: 5.0,
+        change_6h_pct: 2.0,
+        change_1h_pct: 1.0,
+        whale_count: 3,
+        total_whale_usd: 150_000.0,
+        top_whale_handles: "@Aurelius0121".to_string(),
+        status: "ACCUMULATION_BOTTOM".to_string(),
+        upside_tier: "NANO_CAP".to_string(),
+        last_scanned_at: now,
+    };
+    db.upsert_tracked_token(&token_sweet).unwrap();
+
+    let act_sweet = WalletActivity {
+        id: None,
+        wallet_address: whale.address.clone(),
+        wallet_handle: whale.handle.clone(),
+        chain: Chain::Robinhood,
+        activity_type: ActivityType::Buy,
+        token_symbol: "SWEET".to_string(),
+        token_mint: "0xtoken_sweet_spot".to_string(),
+        amount_usd: 1000.0,
+        token_amount: 11764.0,
+        execution_price_usd: 0.085,
+        whale_balance_before: 0.0,
+        whale_balance_after: 11764.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_sweet".to_string(),
+        timestamp: now,
+    };
+
+    let sig_sweet = confluence.evaluate_activity(&act_sweet, &whale, 0.085, 120_000.0).unwrap();
+    assert!(sig_sweet.is_passed);
+    assert_eq!(sig_sweet.rejection_reason, None);
 }

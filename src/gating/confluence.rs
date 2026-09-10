@@ -179,7 +179,7 @@ impl ConfluenceEngine {
             }
         }
 
-        // Gating Check A2: Pool Price Impact Guard (Max 3.5%)
+        // Gating Check A2: Pool Price Impact Guard (Max 15.0%)
         if pool_liquidity_usd > 0.0 && activity.amount_usd > 0.0 {
             let price_impact_pct = (activity.amount_usd / pool_liquidity_usd) * 100.0;
             if price_impact_pct > self.config.max_price_impact_pct {
@@ -189,6 +189,29 @@ impl ConfluenceEngine {
                         "PRICE_IMPACT_TOO_HIGH ({:.2}% > {:.2}%)",
                         price_impact_pct, self.config.max_price_impact_pct
                     ));
+                }
+            }
+        }
+
+        // Gating Check A3: Market Cap Range Gate ($50k Min to $20M Max)
+        if let Ok(Some(tracked)) = self.db.get_tracked_token_by_mint(&activity.token_mint) {
+            if tracked.market_cap_usd > 0.0 {
+                if tracked.market_cap_usd < self.config.min_market_cap_usd {
+                    is_passed = false;
+                    if rejection_reason.is_none() {
+                        rejection_reason = Some(format!(
+                            "REJECTED_MARKET_CAP_TOO_LOW (${:.0} < ${:.0})",
+                            tracked.market_cap_usd, self.config.min_market_cap_usd
+                        ));
+                    }
+                } else if tracked.market_cap_usd > self.config.max_market_cap_usd {
+                    is_passed = false;
+                    if rejection_reason.is_none() {
+                        rejection_reason = Some(format!(
+                            "REJECTED_MARKET_CAP_TOO_HIGH (${:.0} > ${:.0})",
+                            tracked.market_cap_usd, self.config.max_market_cap_usd
+                        ));
+                    }
                 }
             }
         }
