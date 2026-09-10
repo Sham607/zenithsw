@@ -12,7 +12,7 @@ use zenithsw::gating::confluence::ConfluenceEngine;
 use zenithsw::indexer::SmartMoneyIndexer;
 use zenithsw::ingestion::fomo_scraper::FomoScraper;
 use zenithsw::ipc::{IpcMessage, IpcServer};
-use zenithsw::models::{ActivityType, Chain, ShadowPosition, SmartWallet, WalletTier};
+use zenithsw::models::{ActivityType, Chain, ShadowPosition, WalletTier};
 use zenithsw::streams::evm_stream::EvmStreamListener;
 use zenithsw::streams::fomo_api_stream::FomoApiStreamListener;
 use zenithsw::streams::solana_stream::SolanaStreamListener;
@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
         loop {
             if let Ok(wallets) = db_stream.get_active_wallets() {
                 for w in wallets {
-                    let mut activity_opt = if w.tier == WalletTier::TierS {
+                    let mut activity_opt = if w.source == "FOMO" && w.tier == WalletTier::TierS {
                         fomo_listener_stream.check_trader_swaps(&w.handle, &w.address, db_stream.clone()).await.ok().flatten()
                     } else {
                         None
@@ -122,8 +122,13 @@ async fn main() -> Result<()> {
                                 .map(|(_, p, l)| (p, l))
                                 .unwrap_or((act.execution_price_usd, 35000.0));
 
+                            let mut act_to_eval = act.clone();
+                            if act_to_eval.execution_price_usd <= 0.0 && current_price > 0.0 {
+                                act_to_eval.execution_price_usd = current_price;
+                            }
+
                             // Strict Gating & Confluence Evaluation
-                            if let Ok(sig) = confluence_stream.evaluate_activity(&act, &w, current_price, pool_liq) {
+                            if let Ok(sig) = confluence_stream.evaluate_activity(&act_to_eval, &w, current_price, pool_liq) {
                                 let _ = ipc_stream.broadcast(&IpcMessage::SignalBroadcast { signal: sig.clone() });
 
                                 if sig.is_passed {

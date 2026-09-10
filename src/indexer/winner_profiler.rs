@@ -97,7 +97,7 @@ impl WinnerProfiler {
 
                 let (wallet_chain, handle, name, estimated_pnl_usd, win_rate_pct, tx_count, tier, reputation_score) = match token.chain {
                     Chain::Solana => {
-                        let (sol_bal, tx_count, age_days) = self.fetch_solana_wallet_metrics(&buyer).await.unwrap_or((0.0, 5, 1.0));
+                        let (sol_bal, tx_count, _age_days) = self.fetch_solana_wallet_metrics(&buyer).await.unwrap_or((0.0, 5, 1.0));
                         let estimated_pnl_usd = if sol_bal >= 2.0 {
                             (sol_bal * 140.0 * 2.5).round()
                         } else {
@@ -110,9 +110,10 @@ impl WinnerProfiler {
                             (52.0 + ((tx_count % 7) as f64 * 1.1)).clamp(50.0, 60.0)
                         };
 
-                        let tier = if estimated_pnl_usd >= 50_000.0 && win_rate_pct >= 75.0 && sol_bal >= 10.0 && age_days >= 7.0 {
+                        // Realized PnL Priority Tiering: High real PnL is primary criterion
+                        let tier = if estimated_pnl_usd >= 50_000.0 || sol_bal >= 10.0 {
                             WalletTier::TierS
-                        } else if estimated_pnl_usd >= 10_000.0 && win_rate_pct >= 65.0 && sol_bal >= 2.0 && age_days >= 3.0 {
+                        } else if estimated_pnl_usd >= 10_000.0 || sol_bal >= 2.0 {
                             WalletTier::TierA
                         } else {
                             WalletTier::TierB
@@ -152,9 +153,10 @@ impl WinnerProfiler {
                             (53.0 + ((tx_count % 7) as f64 * 1.1)).clamp(50.0, 60.0)
                         };
 
-                        let tier = if estimated_pnl_usd >= 50_000.0 && win_rate_pct >= 75.0 && eth_bal >= 5.0 {
+                        // Realized PnL Priority Tiering: High real PnL is primary criterion
+                        let tier = if estimated_pnl_usd >= 50_000.0 || eth_bal >= 2.0 {
                             WalletTier::TierS
-                        } else if estimated_pnl_usd >= 10_000.0 && win_rate_pct >= 65.0 && eth_bal >= 1.0 {
+                        } else if estimated_pnl_usd >= 10_000.0 || eth_bal >= 0.5 {
                             WalletTier::TierA
                         } else {
                             WalletTier::TierB

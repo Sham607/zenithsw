@@ -47,15 +47,21 @@ impl ConfluenceEngine {
         }
 
         // 2. Strict Price Discovery Gate (Zero price is an immediate reject)
-        if activity.execution_price_usd <= 0.0 || current_pool_price <= 0.0 {
+        let whale_entry_price = if activity.execution_price_usd > 0.0 {
+            activity.execution_price_usd
+        } else {
+            current_pool_price
+        };
+
+        if whale_entry_price <= 0.0 || current_pool_price <= 0.0 {
             is_passed = false;
             rejection_reason = Some(format!(
                 "INVALID_PRICE_OR_UNINDEXED_POOL (Whale: ${:.6}, Pool: ${:.6})",
-                activity.execution_price_usd, current_pool_price
+                whale_entry_price, current_pool_price
             ));
         }
 
-        // 3. Strict Liquidity Safety Floor (Zero or Sub-$30k Liquidity is rejected)
+        // 3. Strict Liquidity Safety Floor (Zero or Sub-Min Liquidity is rejected)
         if pool_liquidity_usd < self.config.min_liquidity_usd {
             is_passed = false;
             if rejection_reason.is_none() {
@@ -67,8 +73,8 @@ impl ConfluenceEngine {
         }
 
         // 4. Calculate Price Delta (Whale Entry vs Current Pool Price)
-        let price_delta_pct = if activity.execution_price_usd > 0.0 && current_pool_price > 0.0 {
-            ((current_pool_price - activity.execution_price_usd) / activity.execution_price_usd) * 100.0
+        let price_delta_pct = if whale_entry_price > 0.0 && current_pool_price > 0.0 {
+            ((current_pool_price - whale_entry_price) / whale_entry_price) * 100.0
         } else {
             0.0
         };

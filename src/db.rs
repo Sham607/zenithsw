@@ -266,7 +266,7 @@ impl SmartWalletDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at
-             FROM wallets WHERE is_active = 1 ORDER BY rank ASC",
+             FROM wallets WHERE is_active = 1 ORDER BY pnl_24h_usd DESC, rank ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             let id: Option<i64> = row.get(0)?;
@@ -322,7 +322,7 @@ impl SmartWalletDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at
-             FROM wallets WHERE is_active = 1 AND tier IN ('TIER-S', 'TIER-A') ORDER BY rank ASC, pnl_24h_usd DESC",
+             FROM wallets WHERE is_active = 1 AND tier IN ('TIER-S', 'TIER-A') ORDER BY pnl_24h_usd DESC, reputation_score DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             let id: Option<i64> = row.get(0)?;
@@ -550,6 +550,59 @@ impl SmartWalletDb {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_recent_signals(&self, limit: usize) -> Result<Vec<ShadowSignal>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chain, token_symbol, token_mint, whale_handle, whale_address, whale_tier, whale_entry_price, current_pool_price, price_delta_pct, pool_liquidity_usd, is_passed, rejection_reason, confluence_count, timestamp
+             FROM shadow_signals ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            let chain_str: String = row.get(0)?;
+            let token_symbol: String = row.get(1)?;
+            let token_mint: String = row.get(2)?;
+            let whale_handle: String = row.get(3)?;
+            let whale_address: String = row.get(4)?;
+            let tier_str: String = row.get(5)?;
+            let whale_entry_price: f64 = row.get(6)?;
+            let current_pool_price: f64 = row.get(7)?;
+            let price_delta_pct: f64 = row.get(8)?;
+            let pool_liquidity_usd: f64 = row.get(9)?;
+            let is_passed_int: i32 = row.get(10)?;
+            let rejection_reason: Option<String> = row.get(11)?;
+            let confluence_count: u32 = row.get(12)?;
+            let ts_str: String = row.get(13)?;
+
+            let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
+            let whale_tier = WalletTier::from_str(&tier_str).unwrap_or(WalletTier::TierB);
+            let timestamp = DateTime::parse_from_rfc3339(&ts_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+            Ok(ShadowSignal {
+                chain,
+                token_symbol,
+                token_mint,
+                whale_handle,
+                whale_address,
+                whale_tier,
+                whale_entry_price,
+                current_pool_price,
+                price_delta_pct,
+                pool_liquidity_usd,
+                is_passed: is_passed_int == 1,
+                rejection_reason,
+                confluence_count,
+                timestamp,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
     }
 
     pub fn upsert_position(&self, pos: &ShadowPosition) -> Result<()> {

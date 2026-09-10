@@ -90,7 +90,7 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
 fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
         .split(area);
 
     // Left: Live Whale Activities
@@ -119,18 +119,17 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!(" ${:.2}", act.amount_usd), Style::default().fg(Color::Yellow)),
         ]);
 
+        let mint_display = if act.token_mint.len() > 18 {
+            format!("{}...{}", &act.token_mint[..8], &act.token_mint[act.token_mint.len() - 6..])
+        } else {
+            act.token_mint.clone()
+        };
+
         let line2 = Line::from(vec![
             Span::raw("   └─ Token: "),
             Span::styled(&act.token_symbol, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-            Span::raw(" | Mint: "),
-            Span::styled(
-                if act.token_mint.len() > 14 {
-                    format!("{}...{}", &act.token_mint[..6], &act.token_mint[act.token_mint.len() - 4..])
-                } else {
-                    act.token_mint.clone()
-                },
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::raw(" | Contract: "),
+            Span::styled(mint_display, Style::default().fg(Color::DarkGray).add_modifier(Modifier::UNDERLINED)),
         ]);
 
         act_items.push(ListItem::new(vec![line1, line2]));
@@ -140,7 +139,7 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(Span::styled(" Real-Time Smart Feed (Sub-Second Ingestion & Bag Tracker) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+                .title(Span::styled(" Real-Time Smart Feed (Multi-Chain Stream & Smart Contract Ingestion) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         );
     frame.render_widget(act_list, chunks[0]);
 
@@ -160,15 +159,25 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
         ]);
 
+        let mint_display = if sig.token_mint.len() > 18 {
+            format!("{}...{}", &sig.token_mint[..8], &sig.token_mint[sig.token_mint.len() - 6..])
+        } else {
+            sig.token_mint.clone()
+        };
+
         let mut sublines = vec![line1];
         if let Some(reason) = &sig.rejection_reason {
             sublines.push(Line::from(vec![
-                Span::raw("   └─ Reason: "),
-                Span::styled(reason, Style::default().fg(Color::DarkGray)),
+                Span::raw("   └─ Contract: "),
+                Span::styled(mint_display, Style::default().fg(Color::DarkGray)),
+                Span::raw(" | Reason: "),
+                Span::styled(reason, Style::default().fg(Color::Red)),
             ]));
         } else {
             sublines.push(Line::from(vec![
-                Span::raw("   └─ Delta: "),
+                Span::raw("   └─ Contract: "),
+                Span::styled(mint_display, Style::default().fg(Color::DarkGray)),
+                Span::raw(" | Delta: "),
                 Span::styled(format!("+{:.2}%", sig.price_delta_pct), Style::default().fg(Color::Green)),
                 Span::raw(" | Target: "),
                 Span::styled(format!("@{}", sig.whale_handle), Style::default().fg(Color::Yellow)),
@@ -182,14 +191,14 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(Span::styled(" Gating Matrix (Max Delta +5.0% | Pure Whale Mirror) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                .title(Span::styled(" Gating Matrix (Max Delta +10.0% | Min Liq $5k | Pure Whale Mirror) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         );
     frame.render_widget(sig_list, chunks[1]);
 }
 
 fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
     let header = Row::new(vec![
-        "Rank", "Name / Profile", "Source", "Handle", "Chain", "Tier", "Total Realized PnL", "Win Rate", "Trades", "Status",
+        "Rank", "Name / Profile", "Source", "Handle", "Chain", "Tier", "Total Realized PnL", "Win Rate", "Trades", "Wallet Address / Contract", "Status",
     ])
     .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     .bottom_margin(1);
@@ -218,6 +227,12 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
                 format!("+${:.2}", w.pnl_24h_usd)
             };
 
+            let addr_display = if w.address.len() > 18 {
+                format!("{}...{}", &w.address[..8], &w.address[w.address.len() - 6..])
+            } else {
+                w.address.clone()
+            };
+
             Row::new(vec![
                 format!("#{:02}", w.rank),
                 w.name.clone(),
@@ -228,6 +243,7 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
                 formatted_pnl,
                 format!("{:.1}%", w.win_rate_pct),
                 w.total_trades.to_string(),
+                addr_display,
                 status_str.to_string(),
             ])
             .style(Style::default().fg(tier_color))
@@ -238,22 +254,23 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Length(5),
-            Constraint::Percentage(16),
-            Constraint::Percentage(12),
-            Constraint::Percentage(14),
-            Constraint::Percentage(9),
-            Constraint::Percentage(11),
-            Constraint::Percentage(13),
-            Constraint::Percentage(9),
-            Constraint::Percentage(8),
+            Constraint::Percentage(15),
             Constraint::Percentage(10),
+            Constraint::Percentage(12),
+            Constraint::Percentage(8),
+            Constraint::Percentage(9),
+            Constraint::Percentage(12),
+            Constraint::Percentage(8),
+            Constraint::Percentage(6),
+            Constraint::Percentage(15),
+            Constraint::Percentage(9),
         ],
     )
     .header(header)
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" SMART MONEY TARGET WALLETS (FOMO + DIRECT ON-CHAIN INDEXER) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+            .title(Span::styled(" SMART MONEY TARGET WALLETS (SORTED BY REALIZED PNL & ON-CHAIN REPUTATION) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
     );
 
     frame.render_widget(table, area);
@@ -261,7 +278,7 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     let header = Row::new(vec![
-        "ID / Symbol", "Chain", "Target Whale", "Entry Price", "Current Price", "Bag Remaining", "PnL ($)", "PnL (%)", "Status",
+        "Symbol", "Chain", "Contract / Mint Address", "Target Whale", "Entry Price", "Current Price", "Bag %", "PnL ($)", "PnL (%)", "Status",
     ])
     .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     .bottom_margin(1);
@@ -277,10 +294,16 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
             };
 
             let portion_str = format!("{:.0}%", pos.remaining_portion_pct);
+            let mint_display = if pos.token_mint.len() > 18 {
+                format!("{}...{}", &pos.token_mint[..8], &pos.token_mint[pos.token_mint.len() - 6..])
+            } else {
+                pos.token_mint.clone()
+            };
 
             Row::new(vec![
                 pos.token_symbol.clone(),
                 pos.chain.to_string(),
+                mint_display,
                 format!("@{}", pos.target_whale_handle),
                 format!("${:.6}", pos.entry_price),
                 format!("${:.6}", pos.current_price),
@@ -296,22 +319,23 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(14),
             Constraint::Percentage(10),
-            Constraint::Percentage(16),
+            Constraint::Percentage(8),
+            Constraint::Percentage(18),
             Constraint::Percentage(13),
-            Constraint::Percentage(13),
-            Constraint::Percentage(12),
             Constraint::Percentage(11),
+            Constraint::Percentage(11),
+            Constraint::Percentage(8),
             Constraint::Percentage(10),
-            Constraint::Percentage(10),
+            Constraint::Percentage(9),
+            Constraint::Percentage(9),
         ],
     )
     .header(header)
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" ACTIVE SHADOW POSITIONS (PURE PROPORTIONAL WHALE MIRROR EXIT) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+            .title(Span::styled(" ACTIVE SHADOW POSITIONS (LIVE REAL-TIME FLOATING PNL & CONTRACT DISPLAY) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
     );
 
     frame.render_widget(table, area);
@@ -333,28 +357,31 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" | Jito Anti-MEV Bundles: Active 🟢"),
         ]),
         Line::from(vec![
-            Span::raw(" • Direct On-Chain DEX Graph Indexer: "),
-            Span::styled("Active 🟢 (Raydium / Pump.fun Exploding Pool Reverse Profiler)", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" • Robinhood / Arbitrum (Alchemy EVM): "),
+            Span::styled(format!("{} ms", app.arbitrum_latency_ms), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" | Full Asset Transfers Stream: Active 🟢"),
         ]),
         Line::from(vec![
             Span::raw(" • Exit Mechanism: "),
             Span::styled("Pure Whale Mirror (Proportional Partial & Full Exit)", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
-            Span::raw(" • Calibrated Gating: Max Entry Delta = "),
-            Span::styled("+5.0%", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" • Active Calibrated Gating: Max Entry Delta = "),
+            Span::styled("+10.0%", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw(" | Min Pool Liquidity = "),
-            Span::styled("$30,000", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("$5,000", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" | Position Size = "),
+            Span::styled("$5.00", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ]),
     ];
 
     let info_block = Paragraph::new(info_text)
-        .block(Block::default().borders(Borders::ALL).title(" Pipeline Latency & Settings "));
+        .block(Block::default().borders(Borders::ALL).title(" Pipeline Latency & Active Settings "));
     frame.render_widget(info_block, chunks[0]);
 
     // Trade History Table
     let header = Row::new(vec![
-        "Timestamp (WIB)", "Chain", "Action", "Symbol", "Whale Target", "Entry", "Exit", "PnL (%)", "PnL ($)", "Exit Reason",
+        "Timestamp (WIB)", "Chain", "Action", "Symbol", "Contract / Mint", "Whale Target", "Entry", "Exit", "PnL (%)", "PnL ($)", "Exit Reason",
     ])
     .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     .bottom_margin(1);
@@ -367,11 +394,18 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
             let ts_str = wib_dt.format("%H:%M:%S").to_string();
             let pnl_color = if tr.pnl_pct >= 0.0 { Color::Green } else { Color::Red };
 
+            let mint_display = if tr.mint.len() > 16 {
+                format!("{}...{}", &tr.mint[..7], &tr.mint[tr.mint.len() - 5..])
+            } else {
+                tr.mint.clone()
+            };
+
             Row::new(vec![
                 ts_str,
                 tr.chain.to_string(),
                 tr.action.clone(),
                 tr.symbol.clone(),
+                mint_display,
                 format!("@{}", tr.target_whale),
                 format!("${:.6}", tr.entry_price),
                 format!("${:.6}", tr.exit_price),
@@ -386,23 +420,24 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(11),
-            Constraint::Percentage(9),
-            Constraint::Percentage(11),
             Constraint::Percentage(10),
+            Constraint::Percentage(8),
+            Constraint::Percentage(9),
+            Constraint::Percentage(8),
+            Constraint::Percentage(16),
+            Constraint::Percentage(13),
+            Constraint::Percentage(10),
+            Constraint::Percentage(10),
+            Constraint::Percentage(8),
+            Constraint::Percentage(8),
             Constraint::Percentage(14),
-            Constraint::Percentage(11),
-            Constraint::Percentage(11),
-            Constraint::Percentage(9),
-            Constraint::Percentage(9),
-            Constraint::Percentage(15),
         ],
     )
     .header(header)
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" RECENT SHADOW EXECUTIONS AUDIT LOG ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+            .title(Span::styled(" RECENT SHADOW EXECUTIONS AUDIT LOG (WITH SMART CONTRACT MINT) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
     );
 
     frame.render_widget(table, chunks[1]);

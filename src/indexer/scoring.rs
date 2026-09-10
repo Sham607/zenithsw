@@ -98,8 +98,9 @@ impl ReputationScorer {
         }
 
         let reputation_score = score.clamp(0.0, 100.0);
-        let is_eligible_tier_s = reputation_score >= 88.0 && estimated_pnl_usd >= 50_000.0 && win_rate_pct >= 70.0;
-        let is_eligible_tier_a = reputation_score >= 70.0 && estimated_pnl_usd >= 10_000.0 && win_rate_pct >= 60.0;
+        // Realized PnL Priority: Large verified real PnL is primary eligibility criterion
+        let is_eligible_tier_s = estimated_pnl_usd >= 50_000.0 || (reputation_score >= 80.0 && estimated_pnl_usd >= 25_000.0);
+        let is_eligible_tier_a = estimated_pnl_usd >= 10_000.0 || (reputation_score >= 65.0 && estimated_pnl_usd >= 5_000.0);
 
         WalletScoreResult {
             address: address.to_string(),

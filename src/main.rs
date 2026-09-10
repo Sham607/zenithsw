@@ -60,7 +60,41 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Task: Connect to Unix Domain Socket IPC Daemon
+    // Task 1: Real-Time Periodic Local Database Sync (Ensures live PnL, fresh wallets, activities & trades)
+    let app_db_sync = app.clone();
+    let db_path_sync = config.db_path.clone();
+    tokio::spawn(async move {
+        if let Ok(db) = SmartWalletDb::new(&db_path_sync) {
+            loop {
+                if let Ok(mut state) = app_db_sync.lock() {
+                    if let Ok(wallets) = db.get_qualified_wallets() {
+                        if !wallets.is_empty() {
+                            state.wallets = wallets;
+                        }
+                    }
+                    if let Ok(positions) = db.get_active_positions() {
+                        state.positions = positions;
+                    }
+                    if let Ok(trades) = db.get_recent_trades(50) {
+                        state.trades = trades;
+                    }
+                    if let Ok(acts) = db.get_recent_activities(50) {
+                        if state.activities.is_empty() || acts.len() > state.activities.len() {
+                            state.activities = acts;
+                        }
+                    }
+                    if let Ok(sigs) = db.get_recent_signals(50) {
+                        if state.signals.is_empty() || sigs.len() > state.signals.len() {
+                            state.signals = sigs;
+                        }
+                    }
+                }
+                sleep(Duration::from_millis(1500)).await;
+            }
+        }
+    });
+
+    // Task 2: Connect to Unix Domain Socket IPC Daemon
     let app_ipc = app.clone();
     let socket_path = config.ipc_socket_path.clone();
     tokio::spawn(async move {
