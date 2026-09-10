@@ -441,3 +441,150 @@ async fn test_qualified_wallets_and_auto_tp_protocol() {
     assert_eq!(trades[0].exit_reason, "AUTO_TP_100PCT_FREE_ROLL");
     assert_eq!(trades[0].pnl_pct, 100.0);
 }
+
+#[tokio::test]
+async fn test_multi_whale_averaging_and_same_whale_deduplication() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let mut config = get_mock_config();
+    config.position_size_usd = 10.0;
+    let confluence = ConfluenceEngine::new(config.clone(), db.clone());
+    let sol_exec = SolanaExecutor::new(config.clone(), db.clone());
+    let now = Utc::now();
+
+    // 1. Setup 2 Tier-S Smart Wallets
+    let whale1 = SmartWallet {
+        id: None,
+        rank: 1,
+        name: "Whale Alpha 🐋".to_string(),
+        handle: "whale_alpha".to_string(),
+        chain: Chain::Solana,
+        address: "Whale1Addr111111111111111111111111111111111".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 150000.0,
+        win_rate_pct: 90.0,
+        total_trades: 40,
+        source: "NANSEN".to_string(),
+        reputation_score: 95.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: now,
+    };
+
+    let whale2 = SmartWallet {
+        id: None,
+        rank: 2,
+        name: "Whale Beta 🐳".to_string(),
+        handle: "whale_beta".to_string(),
+        chain: Chain::Solana,
+        address: "Whale2Addr222222222222222222222222222222222".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 120000.0,
+        win_rate_pct: 85.0,
+        total_trades: 30,
+        source: "NANSEN".to_string(),
+        reputation_score: 90.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: now,
+    };
+
+    db.upsert_wallet(&whale1).unwrap();
+    db.upsert_wallet(&whale2).unwrap();
+
+    let mint = "TokenMint1234567890abcdef1234567890abcdef12".to_string();
+
+    // 2. Whale 1 buys Token at $0.010
+    let act1 = WalletActivity {
+        id: None,
+        wallet_address: whale1.address.clone(),
+        wallet_handle: whale1.handle.clone(),
+        chain: Chain::Solana,
+        activity_type: ActivityType::Buy,
+        token_symbol: "GEM".to_string(),
+        token_mint: mint.clone(),
+        amount_usd: 5000.0,
+        token_amount: 500_000.0,
+        execution_price_usd: 0.010,
+        whale_balance_before: 0.0,
+        whale_balance_after: 500_000.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_buy_1".to_string(),
+        timestamp: now,
+    };
+
+    let sig1 = confluence.evaluate_activity(&act1, &whale1, 0.010, 50000.0).unwrap();
+    assert!(sig1.is_passed, "Whale 1 initial buy should pass gating");
+
+    let pos1 = sol_exec.execute_shadow_buy(&sig1).await.unwrap().unwrap();
+    assert_eq!(pos1.entry_price, 0.010);
+    assert_eq!(pos1.amount_usd, 10.0);
+    assert_eq!(pos1.amount_native, 1000.0); // 10.0 / 0.010 = 1000 tokens
+
+    // 3. Whale 1 attempts to buy AGAIN on the same token -> MUST BE REJECTED!
+    let act1_repeat = WalletActivity {
+        id: None,
+        wallet_address: whale1.address.clone(),
+        wallet_handle: whale1.handle.clone(),
+        chain: Chain::Solana,
+        activity_type: ActivityType::Buy,
+        token_symbol: "GEM".to_string(),
+        token_mint: mint.clone(),
+        amount_usd: 3000.0,
+        token_amount: 300_000.0,
+        execution_price_usd: 0.012,
+        whale_balance_before: 500_000.0,
+        whale_balance_after: 800_000.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_buy_repeat".to_string(),
+        timestamp: now,
+    };
+
+    let sig1_repeat = confluence.evaluate_activity(&act1_repeat, &whale1, 0.012, 50000.0).unwrap();
+    assert!(!sig1_repeat.is_passed, "Same whale repeat buy MUST be rejected");
+    assert!(
+        sig1_repeat.rejection_reason.unwrap().contains("REJECTED_WHALE_ALREADY_IN_POSITION"),
+        "Rejection reason must be REJECTED_WHALE_ALREADY_IN_POSITION"
+    );
+
+    // 4. Whale 2 (DIFFERENT WHALE) buys Token at $0.020 -> MUST BE ALLOWED & AVERAGED IN!
+    let act2 = WalletActivity {
+        id: None,
+        wallet_address: whale2.address.clone(),
+        wallet_handle: whale2.handle.clone(),
+        chain: Chain::Solana,
+        activity_type: ActivityType::Buy,
+        token_symbol: "GEM".to_string(),
+        token_mint: mint.clone(),
+        amount_usd: 7000.0,
+        token_amount: 350_000.0,
+        execution_price_usd: 0.020,
+        whale_balance_before: 0.0,
+        whale_balance_after: 350_000.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_buy_2".to_string(),
+        timestamp: now,
+    };
+
+    let sig2 = confluence.evaluate_activity(&act2, &whale2, 0.020, 50000.0).unwrap();
+    assert!(sig2.is_passed, "Different whale buy MUST pass gating");
+
+    let _pos2 = sol_exec.execute_shadow_buy(&sig2).await.unwrap().unwrap();
+    
+    // Position should be consolidated into 1 unified position
+    let active_positions = db.get_active_positions().unwrap();
+    assert_eq!(active_positions.len(), 1, "There should be exactly 1 unified position");
+    
+    let unified_pos = &active_positions[0];
+    assert_eq!(unified_pos.amount_usd, 20.0, "Total USD must be $20 ($10 + $10)");
+    assert_eq!(unified_pos.amount_native, 1500.0, "Total tokens must be 1500 (1000 + 500)");
+    
+    // Weighted avg entry = $20 / 1500 = 0.013333333333333334
+    let expected_avg = 20.0 / 1500.0;
+    assert!((unified_pos.entry_price - expected_avg).abs() < 1e-6, "Avg entry price must be weighted average (${:.6} vs ${:.6})", unified_pos.entry_price, expected_avg);
+    
+    // Handles and addresses must include both whales
+    assert!(unified_pos.target_whale_handle.contains("whale_alpha"));
+    assert!(unified_pos.target_whale_handle.contains("whale_beta"));
+    assert!(unified_pos.target_whale_address.contains(&whale1.address));
+    assert!(unified_pos.target_whale_address.contains(&whale2.address));
+}

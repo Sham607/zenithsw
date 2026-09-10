@@ -616,6 +616,11 @@ impl SmartWalletDb {
                 id, chain, token_symbol, token_mint, target_whale_handle, target_whale_address, entry_price, current_price, peak_price, amount_native, amount_usd, remaining_portion_pct, unrealized_pnl_pct, realized_pnl_usd, entry_time, last_update, status
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET
+                entry_price = excluded.entry_price,
+                amount_usd = excluded.amount_usd,
+                amount_native = excluded.amount_native,
+                target_whale_handle = excluded.target_whale_handle,
+                target_whale_address = excluded.target_whale_address,
                 current_price = excluded.current_price,
                 peak_price = excluded.peak_price,
                 remaining_portion_pct = excluded.remaining_portion_pct,

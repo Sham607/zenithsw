@@ -91,25 +91,36 @@ async fn main() -> Result<()> {
                         println!("[ACTIVITY 🔥] {} by @{} ({}) -> Token: {} (${:.2})", act.activity_type, act.wallet_handle, act.chain, act.token_symbol, act.amount_usd);
                         let _ = ipc_stream.broadcast(&IpcMessage::ActivityBroadcast { activity: act.clone() });
 
-                        // Handle Pure Shadow Mirror Exit (Proportional / Full)
+                        // Handle Pure Shadow Mirror Exit (Proportional / Full per whale contribution)
                         if act.activity_type == ActivityType::Sell {
                             if let Ok(positions) = db_stream.get_active_positions() {
                                 for pos in positions {
-                                    if pos.token_mint == act.token_mint && pos.target_whale_handle == act.wallet_handle {
-                                        let exit_price = if act.execution_price_usd > 0.0 { act.execution_price_usd } else { pos.current_price };
-                                        let sell_ratio = act.sell_ratio_pct.clamp(1.0, 100.0);
+                                    if pos.token_mint.eq_ignore_ascii_case(&act.token_mint) && pos.chain == act.chain {
+                                        let whale_addr_lower = act.wallet_address.to_lowercase();
+                                        let is_participant = pos.target_whale_address.to_lowercase().contains(&whale_addr_lower)
+                                            || pos.target_whale_handle.to_lowercase().contains(&act.wallet_handle.to_lowercase());
 
-                                        if sell_ratio >= 95.0 {
-                                            println!("[SHADOW FULL EXIT 🔴] Target @{} sold 100% of {} -> Closing position completely!", pos.target_whale_handle, pos.token_symbol);
-                                            match pos.chain {
-                                                Chain::Solana => { let _ = sol_exec_stream.execute_shadow_sell(&pos.id, "WHALE_FULL_DUMP", exit_price).await; }
-                                                _ => { let _ = evm_exec_stream.execute_shadow_sell(&pos.id, "WHALE_FULL_DUMP", exit_price).await; }
-                                            }
-                                        } else {
-                                            println!("[SHADOW PARTIAL EXIT 🟡] Target @{} sold {:.1}% of {} -> Mirroring {:.1}% partial sell!", pos.target_whale_handle, sell_ratio, pos.token_symbol, sell_ratio);
-                                            match pos.chain {
-                                                Chain::Solana => { let _ = sol_exec_stream.execute_partial_shadow_sell(&pos.id, sell_ratio, "WHALE_PARTIAL_DUMP", exit_price).await; }
-                                                _ => { let _ = evm_exec_stream.execute_partial_shadow_sell(&pos.id, sell_ratio, "WHALE_PARTIAL_DUMP", exit_price).await; }
+                                        if is_participant {
+                                            let exit_price = if act.execution_price_usd > 0.0 { act.execution_price_usd } else { pos.current_price };
+                                            let raw_sell_ratio = act.sell_ratio_pct.clamp(1.0, 100.0);
+                                            
+                                            // Count participating whales to compute weighted exit ratio
+                                            let whale_count = pos.target_whale_address.split(',').count().max(1) as f64;
+                                            let whale_weight = 1.0 / whale_count;
+                                            let effective_sell_ratio = (raw_sell_ratio * whale_weight).clamp(1.0, 100.0);
+
+                                            if raw_sell_ratio >= 95.0 && whale_count <= 1.0 {
+                                                println!("[SHADOW FULL EXIT 🔴] Target @{} sold 100% of {} -> Closing position completely!", act.wallet_handle, pos.token_symbol);
+                                                match pos.chain {
+                                                    Chain::Solana => { let _ = sol_exec_stream.execute_shadow_sell(&pos.id, "WHALE_FULL_DUMP", exit_price).await; }
+                                                    _ => { let _ = evm_exec_stream.execute_shadow_sell(&pos.id, "WHALE_FULL_DUMP", exit_price).await; }
+                                                }
+                                            } else {
+                                                println!("[SHADOW PROPORTIONAL EXIT 🟡] Target @{} sold {:.1}% of {} (Weighted: {:.1}%, {} whales in pos) -> Partial exit!", act.wallet_handle, raw_sell_ratio, pos.token_symbol, effective_sell_ratio, whale_count);
+                                                match pos.chain {
+                                                    Chain::Solana => { let _ = sol_exec_stream.execute_partial_shadow_sell(&pos.id, effective_sell_ratio, "WHALE_PARTIAL_DUMP", exit_price).await; }
+                                                    _ => { let _ = evm_exec_stream.execute_partial_shadow_sell(&pos.id, effective_sell_ratio, "WHALE_PARTIAL_DUMP", exit_price).await; }
+                                                }
                                             }
                                         }
                                     }
@@ -178,7 +189,16 @@ async fn main() -> Result<()> {
                         .map(|(_, p, _)| p)
                         .unwrap_or(pos.current_price);
 
+                    // Sanity check: Discard single-tick anomaly if price jumps > 500% in one tick from an established price
                     if live_price > 0.0 {
+                        if pos.current_price > 0.0 && live_price > pos.current_price * 5.0 {
+                            eprintln!(
+                                "[PRICE SANITY GUARD 🛡️] Suspicious price spike for {} (${:.6} -> ${:.6}). Discarding unverified tick.",
+                                pos.token_symbol, pos.current_price, live_price
+                            );
+                            continue;
+                        }
+
                         pos.current_price = live_price;
                         pos.peak_price = pos.peak_price.max(live_price);
                         if pos.entry_price > 0.0 {
@@ -214,6 +234,8 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
+
+                    sleep(Duration::from_millis(100)).await;
                 }
 
                 // Broadcast refreshed positions to IPC socket

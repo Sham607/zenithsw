@@ -66,6 +66,52 @@ impl ConfluenceEngine {
             });
         }
 
+        // 1c. Duplicate Whale & Max Token Exposure Check on Active Positions
+        if let Ok(active_positions) = self.db.get_active_positions() {
+            if let Some(pos) = active_positions.iter().find(|p| p.token_mint.eq_ignore_ascii_case(&activity.token_mint) && p.chain == activity.chain) {
+                // Reject if THIS specific whale address is already part of this active position
+                if pos.target_whale_address.to_lowercase().contains(&activity.wallet_address.to_lowercase()) {
+                    return Ok(ShadowSignal {
+                        chain: activity.chain,
+                        token_symbol: activity.token_symbol.clone(),
+                        token_mint: activity.token_mint.clone(),
+                        whale_handle: activity.wallet_handle.clone(),
+                        whale_address: activity.wallet_address.clone(),
+                        whale_tier: wallet.tier,
+                        whale_entry_price: activity.execution_price_usd,
+                        current_pool_price,
+                        price_delta_pct: 0.0,
+                        pool_liquidity_usd,
+                        is_passed: false,
+                        rejection_reason: Some(format!("REJECTED_WHALE_ALREADY_IN_POSITION (@{})", activity.wallet_handle)),
+                        confluence_count: 0,
+                        timestamp: now,
+                    });
+                }
+
+                // Reject if max exposure per token is reached ($15.0 max)
+                let max_exposure_usd = 15.0;
+                if pos.amount_usd >= max_exposure_usd {
+                    return Ok(ShadowSignal {
+                        chain: activity.chain,
+                        token_symbol: activity.token_symbol.clone(),
+                        token_mint: activity.token_mint.clone(),
+                        whale_handle: activity.wallet_handle.clone(),
+                        whale_address: activity.wallet_address.clone(),
+                        whale_tier: wallet.tier,
+                        whale_entry_price: activity.execution_price_usd,
+                        current_pool_price,
+                        price_delta_pct: 0.0,
+                        pool_liquidity_usd,
+                        is_passed: false,
+                        rejection_reason: Some(format!("REJECTED_MAX_TOKEN_EXPOSURE_REACHED (${:.2} >= ${:.2})", pos.amount_usd, max_exposure_usd)),
+                        confluence_count: 0,
+                        timestamp: now,
+                    });
+                }
+            }
+        }
+
         // 2. Strict Price Discovery Gate (Zero price is an immediate reject)
         let whale_entry_price = if activity.execution_price_usd > 0.0 {
             activity.execution_price_usd

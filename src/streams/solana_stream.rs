@@ -6,8 +6,14 @@ use reqwest::Client;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
+
+static PRICE_CACHE: OnceLock<RwLock<HashMap<String, (String, f64, f64, Instant)>>> = OnceLock::new();
+
+fn get_price_cache() -> &'static RwLock<HashMap<String, (String, f64, f64, Instant)>> {
+    PRICE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 pub struct SolanaStreamListener {
     rpc_urls: Vec<String>,
@@ -275,28 +281,6 @@ impl SolanaStreamListener {
             return Ok(None);
         }
 
-        // Calculate native SOL spent/received from transaction balance deltas
-        let mut native_sol_delta = 0.0;
-        let account_keys = tx_result["transaction"]["message"]["accountKeys"].as_array();
-        let pre_balances = meta["preBalances"].as_array();
-        let post_balances = meta["postBalances"].as_array();
-
-        if let (Some(keys), Some(pre_b), Some(post_b)) = (account_keys, pre_balances, post_balances) {
-            for (idx, key_obj) in keys.iter().enumerate() {
-                let pubkey_str = key_obj["pubkey"].as_str().or_else(|| key_obj.as_str()).unwrap_or("");
-                if pubkey_str == address {
-                    let pre_lamports = pre_b.get(idx).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let post_lamports = post_b.get(idx).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let diff = (pre_lamports - post_lamports).abs() / 1_000_000_000.0;
-                    if diff > 0.001 {
-                        native_sol_delta = diff;
-                    }
-                    break;
-                }
-            }
-        }
-
-        let sol_price_usd = 140.0;
         let mut execution_price_usd = 0.0;
         if let Ok((sym, price, _)) = Self::fetch_token_price(&token_mint).await {
             if sym != "UNKNOWN" {
@@ -305,15 +289,9 @@ impl SolanaStreamListener {
             execution_price_usd = price;
         }
 
-        // Derive price from native SOL spent on-chain if DEX indexer has latency
-        if execution_price_usd <= 0.0 && native_sol_delta > 0.0 && token_amount > 0.0 {
-            execution_price_usd = (native_sol_delta * sol_price_usd) / token_amount;
-        }
-
+        // NOTE: Strict policy - No fallback price derivation from native SOL deltas to prevent anomalous price spikes
         let amount_usd = if token_amount > 0.0 && execution_price_usd > 0.0 {
             token_amount * execution_price_usd
-        } else if native_sol_delta > 0.0 {
-            native_sol_delta * sol_price_usd
         } else {
             0.0
         };
@@ -348,13 +326,23 @@ impl SolanaStreamListener {
         Ok(Some(activity))
     }
 
-    /// Fetches live price & aggregated liquidity with multi-pool scanning (DexScreener + Search Fallback)
+    /// Fetches live price & aggregated liquidity with multi-pool scanning & in-memory TTL caching (DexScreener + Search Fallback)
     pub async fn fetch_token_price(mint: &str) -> Result<(String, f64, f64)> {
+        // Step 1: Check in-memory price cache (TTL 3 seconds)
+        if let Ok(cache) = get_price_cache().read() {
+            if let Some((sym, price, liq, ts)) = cache.get(mint) {
+                if ts.elapsed() < Duration::from_secs(3) {
+                    return Ok((sym.clone(), *price, *liq));
+                }
+            }
+        }
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(4))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .build()?;
 
-        // Source 1: DexScreener API with full multi-pool scanning & aggregated liquidity
+        // Source 1: DexScreener API with strict baseToken matching & aggregated liquidity
         let url = format!("https://api.dexscreener.com/latest/dex/tokens/{}", mint);
         if let Ok(res) = client.get(&url).send().await {
             if let Ok(json) = res.json::<Value>().await {
@@ -366,31 +354,19 @@ impl SolanaStreamListener {
                         let mut best_price = 0.0;
 
                         for pair in pairs {
-                            let dex_id = pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
                             let base_addr = pair.get("baseToken").and_then(|b| b.get("address")).and_then(|s| s.as_str()).unwrap_or("");
-                            let quote_addr = pair.get("quoteToken").and_then(|q| q.get("address")).and_then(|s| s.as_str()).unwrap_or("");
-
-                            let is_base = base_addr.eq_ignore_ascii_case(mint);
-                            let is_quote = quote_addr.eq_ignore_ascii_case(mint);
-
-                            if !is_base && !is_quote {
+                            
+                            // STRICT: Base token address MUST match query mint (case-insensitive)
+                            if !base_addr.eq_ignore_ascii_case(mint) {
                                 continue;
                             }
 
-                            let sym = if is_base {
-                                pair.get("baseToken").and_then(|b| b.get("symbol")).and_then(|s| s.as_str()).unwrap_or("")
-                            } else {
-                                pair.get("quoteToken").and_then(|q| q.get("symbol")).and_then(|s| s.as_str()).unwrap_or("")
-                            };
-
-                            let price: f64 = if is_base {
-                                pair.get("priceUsd")
-                                    .and_then(|p| p.as_str())
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0.0)
-                            } else {
-                                1.0
-                            };
+                            let dex_id = pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
+                            let sym = pair.get("baseToken").and_then(|b| b.get("symbol")).and_then(|s| s.as_str()).unwrap_or("");
+                            let price: f64 = pair.get("priceUsd")
+                                .and_then(|p| p.as_str())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0.0);
                             
                             let mut liq: f64 = pair.get("liquidity")
                                 .and_then(|l| l.get("usd"))
@@ -410,20 +386,13 @@ impl SolanaStreamListener {
 
                             total_liq += liq;
 
-                            if is_base {
-                                if liq >= max_liq && price > 0.0 {
-                                    max_liq = liq;
-                                    best_price = price;
-                                    if !sym.is_empty() {
-                                        best_symbol = sym.to_string();
-                                    }
-                                } else if best_price <= 0.0 && price > 0.0 {
-                                    best_price = price;
-                                    if !sym.is_empty() {
-                                        best_symbol = sym.to_string();
-                                    }
+                            if liq >= max_liq && price > 0.0 {
+                                max_liq = liq;
+                                best_price = price;
+                                if !sym.is_empty() {
+                                    best_symbol = sym.to_string();
                                 }
-                            } else if best_price <= 0.0 {
+                            } else if best_price <= 0.0 && price > 0.0 {
                                 best_price = price;
                                 if !sym.is_empty() {
                                     best_symbol = sym.to_string();
@@ -433,6 +402,9 @@ impl SolanaStreamListener {
 
                         let effective_liq = max_liq.max(total_liq);
                         if best_price > 0.0 {
+                            if let Ok(mut cache) = get_price_cache().write() {
+                                cache.insert(mint.to_string(), (best_symbol.clone(), best_price, effective_liq, Instant::now()));
+                            }
                             return Ok((best_symbol, best_price, effective_liq));
                         }
                     }
@@ -440,16 +412,25 @@ impl SolanaStreamListener {
             }
         }
 
-        // Source 2: DexScreener Search Endpoint Fallback
+        // Source 2: DexScreener Search Endpoint Fallback with strict baseToken matching
         let search_url = format!("https://api.dexscreener.com/latest/dex/search?q={}", mint);
         if let Ok(res) = client.get(&search_url).send().await {
             if let Ok(json) = res.json::<Value>().await {
                 if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
-                    if let Some(pair) = pairs.iter().find(|p| p.get("baseToken").and_then(|b| b.get("address")).and_then(|s| s.as_str()) == Some(mint)) {
+                    if let Some(pair) = pairs.iter().find(|p| {
+                        p.get("baseToken")
+                            .and_then(|b| b.get("address"))
+                            .and_then(|s| s.as_str())
+                            .map(|addr| addr.eq_ignore_ascii_case(mint))
+                            .unwrap_or(false)
+                    }) {
                         let symbol = pair.get("baseToken").and_then(|b| b.get("symbol")).and_then(|s| s.as_str()).unwrap_or("TOKEN").to_string();
                         let price_usd: f64 = pair.get("priceUsd").and_then(|p| p.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
                         let liquidity_usd: f64 = pair.get("liquidity").and_then(|l| l.get("usd")).and_then(|v| v.as_f64()).unwrap_or(35000.0);
                         if price_usd > 0.0 {
+                            if let Ok(mut cache) = get_price_cache().write() {
+                                cache.insert(mint.to_string(), (symbol.clone(), price_usd, liquidity_usd, Instant::now()));
+                            }
                             return Ok((symbol, price_usd, liquidity_usd));
                         }
                     }

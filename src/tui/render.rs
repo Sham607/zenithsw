@@ -304,11 +304,17 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
                 pos.token_mint.clone()
             };
 
+            let handle_display = if pos.target_whale_handle.starts_with('@') {
+                pos.target_whale_handle.clone()
+            } else {
+                format!("@{}", pos.target_whale_handle)
+            };
+
             Row::new(vec![
                 pos.token_symbol.clone(),
                 pos.chain.to_string(),
                 mint_display,
-                format!("@{}", pos.target_whale_handle),
+                handle_display,
                 format!("${:.6}", pos.entry_price),
                 format!("${:.6}", pos.current_price),
                 portion_str,

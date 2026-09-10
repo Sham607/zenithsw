@@ -234,11 +234,13 @@ impl SolanaExecutor {
         }
 
         let now = Utc::now();
-        let position_id = format!("SOL-{}-{}", signal.token_symbol, now.timestamp());
         let amount_usd = self.config.position_size_usd;
+        let new_tokens = if entry_price > 0.0 { amount_usd / entry_price } else { 0.0 };
+        let position_id = format!("SOL-{}", signal.token_mint);
+
         let sol_price = 140.0; // Dynamic or fallback price
-        let amount_native = amount_usd / sol_price;
-        let amount_lamports = (amount_native * 1_000_000_000.0) as u64;
+        let amount_native_sol = amount_usd / sol_price;
+        let amount_lamports = (amount_native_sol * 1_000_000_000.0) as u64;
 
         let wsol_mint = "So11111111111111111111111111111111111111112";
 
@@ -248,11 +250,11 @@ impl SolanaExecutor {
             if let Ok((signing_key, user_pubkey)) = self.get_keypair() {
                 // Gas Buffer Guard: Require at least 0.05 SOL reserve for gas fees + trade amount
                 if let Ok(balance_sol) = self.get_native_balance(&user_pubkey).await {
-                    let required_sol = amount_native + 0.05;
+                    let required_sol = amount_native_sol + 0.05;
                     if balance_sol < required_sol {
                         eprintln!(
                             "[GAS BUFFER GUARD 🛡️] Insufficient SOL balance ({:.4} SOL < required {:.4} SOL = 0.05 buffer + {:.4} trade). Skipping live buy!",
-                            balance_sol, required_sol, amount_native
+                            balance_sol, required_sol, amount_native_sol
                         );
                         return Ok(None);
                     }
@@ -296,17 +298,52 @@ impl SolanaExecutor {
             );
         }
 
+        // Check if position already exists for this token mint on Solana -> Average in!
+        if let Ok(active_pos) = self.db.get_active_positions() {
+            if let Some(mut existing) = active_pos.into_iter().find(|p| p.token_mint.eq_ignore_ascii_case(&signal.token_mint) && p.chain == Chain::Solana) {
+                let prev_usd = existing.amount_usd;
+                let prev_tokens = existing.amount_native;
+                let total_usd = prev_usd + amount_usd;
+                let total_tokens = prev_tokens + new_tokens;
+                let weighted_avg_entry = if total_tokens > 0.0 { total_usd / total_tokens } else { entry_price };
+
+                println!(
+                    "[POSITION AVERAGING ➕] Adding ${:.2} to existing {} position (ID: {}). Prev Entry: ${:.6} -> New Avg Entry: ${:.6} (Total: ${:.2})",
+                    amount_usd, existing.token_symbol, existing.id, existing.entry_price, weighted_avg_entry, total_usd
+                );
+
+                existing.entry_price = weighted_avg_entry;
+                existing.amount_usd = total_usd;
+                existing.amount_native = total_tokens;
+                existing.current_price = entry_price;
+                existing.peak_price = existing.peak_price.max(entry_price);
+                existing.remaining_portion_pct = 100.0;
+                existing.last_update = now;
+                existing.status = "OPEN".to_string();
+
+                if !existing.target_whale_handle.contains(&signal.whale_handle) {
+                    existing.target_whale_handle = format!("{}, @{}", existing.target_whale_handle, signal.whale_handle);
+                }
+                if !existing.target_whale_address.contains(&signal.whale_address) {
+                    existing.target_whale_address = format!("{}, {}", existing.target_whale_address, signal.whale_address);
+                }
+
+                self.db.upsert_position(&existing)?;
+                return Ok(Some(existing));
+            }
+        }
+
         let position = ShadowPosition {
             id: position_id,
             chain: Chain::Solana,
             token_symbol: signal.token_symbol.clone(),
             token_mint: signal.token_mint.clone(),
-            target_whale_handle: signal.whale_handle.clone(),
+            target_whale_handle: format!("@{}", signal.whale_handle),
             target_whale_address: signal.whale_address.clone(),
             entry_price,
             current_price: entry_price,
             peak_price: entry_price,
-            amount_native,
+            amount_native: new_tokens,
             amount_usd,
             remaining_portion_pct: 100.0,
             unrealized_pnl_pct: 0.0,
