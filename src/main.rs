@@ -31,6 +31,8 @@ async fn main() -> Result<()> {
         max_price_delta_pct: 5.0,
         min_liquidity_usd: 30000.0,
         position_size_usd: 15.0,
+        min_whale_buy_usd: 250.0,
+        max_price_impact_pct: 3.5,
         trailing_stop_pct: 10.0,
         stop_loss_pct: 15.0,
         take_profit_pct: 50.0,

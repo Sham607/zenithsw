@@ -26,6 +26,8 @@ pub struct Config {
     pub max_price_delta_pct: f64,   // Max +5.0% price impact / slippage delta
     pub min_liquidity_usd: f64,      // Min $30,000 liquidity in pool
     pub position_size_usd: f64,      // $15 default position size
+    pub min_whale_buy_usd: f64,      // Min $250 whale order size to filter dust transactions
+    pub max_price_impact_pct: f64,   // Max 3.5% price impact on pool to prevent buying local tops
     pub trailing_stop_pct: f64,      // 10% trailing stop
     pub stop_loss_pct: f64,          // 15% stop loss
     pub take_profit_pct: f64,        // 50% take profit
@@ -89,6 +91,16 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(15.0);
 
+        let min_whale_buy_usd = env::var("MIN_WHALE_BUY_USD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(250.0);
+
+        let max_price_impact_pct = env::var("MAX_PRICE_IMPACT_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3.5);
+
         let trailing_stop_pct = env::var("TRAILING_STOP_PCT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -136,6 +148,8 @@ impl Config {
             max_price_delta_pct,
             min_liquidity_usd,
             position_size_usd,
+            min_whale_buy_usd,
+            max_price_impact_pct,
             trailing_stop_pct,
             stop_loss_pct,
             take_profit_pct,

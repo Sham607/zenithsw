@@ -112,6 +112,29 @@ impl ConfluenceEngine {
             }
         }
 
+        // 1d. Minimum Whale Buy Filter (Filter out dust test transactions < $250.00)
+        if activity.amount_usd > 0.0 && activity.amount_usd < self.config.min_whale_buy_usd {
+            return Ok(ShadowSignal {
+                chain: activity.chain,
+                token_symbol: activity.token_symbol.clone(),
+                token_mint: activity.token_mint.clone(),
+                whale_handle: activity.wallet_handle.clone(),
+                whale_address: activity.wallet_address.clone(),
+                whale_tier: wallet.tier,
+                whale_entry_price: activity.execution_price_usd,
+                current_pool_price,
+                price_delta_pct: 0.0,
+                pool_liquidity_usd,
+                is_passed: false,
+                rejection_reason: Some(format!(
+                    "REJECTED_WHALE_BUY_TOO_SMALL (${:.2} < ${:.2})",
+                    activity.amount_usd, self.config.min_whale_buy_usd
+                )),
+                confluence_count: 0,
+                timestamp: now,
+            });
+        }
+
         // 2. Strict Price Discovery Gate (Zero price is an immediate reject)
         let whale_entry_price = if activity.execution_price_usd > 0.0 {
             activity.execution_price_usd
@@ -153,6 +176,20 @@ impl ConfluenceEngine {
                     "PRICE_DELTA_TOO_HIGH (+{:.2}% > +{:.2}%)",
                     price_delta_pct, self.config.max_price_delta_pct
                 ));
+            }
+        }
+
+        // Gating Check A2: Pool Price Impact Guard (Max 3.5%)
+        if pool_liquidity_usd > 0.0 && activity.amount_usd > 0.0 {
+            let price_impact_pct = (activity.amount_usd / pool_liquidity_usd) * 100.0;
+            if price_impact_pct > self.config.max_price_impact_pct {
+                is_passed = false;
+                if rejection_reason.is_none() {
+                    rejection_reason = Some(format!(
+                        "PRICE_IMPACT_TOO_HIGH ({:.2}% > {:.2}%)",
+                        price_impact_pct, self.config.max_price_impact_pct
+                    ));
+                }
             }
         }
 

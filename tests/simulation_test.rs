@@ -26,6 +26,8 @@ fn get_mock_config() -> Config {
         max_price_delta_pct: 5.0,
         min_liquidity_usd: 30000.0,
         position_size_usd: 15.0,
+        min_whale_buy_usd: 250.0,
+        max_price_impact_pct: 3.5,
         trailing_stop_pct: 10.0,
         stop_loss_pct: 15.0,
         take_profit_pct: 50.0,
@@ -135,14 +137,14 @@ async fn test_gating_price_delta_max_5_pct() {
 
     // Case 1: Current Price = 1.03 (+3.0% delta) -> Should PASS (<= +5.0%)
     let signal_pass = confluence
-        .evaluate_activity(&activity, &wallet, 1.03, 50000.0)
+        .evaluate_activity(&activity, &wallet, 1.03, 100000.0)
         .unwrap();
     assert!(signal_pass.is_passed);
     assert!(signal_pass.rejection_reason.is_none());
 
     // Case 2: Current Price = 1.08 (+8.0% delta) -> Should REJECT (> +5.0%)
     let signal_fail = confluence
-        .evaluate_activity(&activity, &wallet, 1.08, 50000.0)
+        .evaluate_activity(&activity, &wallet, 1.08, 100000.0)
         .unwrap();
     assert!(!signal_fail.is_passed);
     assert!(signal_fail
@@ -512,7 +514,7 @@ async fn test_multi_whale_averaging_and_same_whale_deduplication() {
         timestamp: now,
     };
 
-    let sig1 = confluence.evaluate_activity(&act1, &whale1, 0.010, 50000.0).unwrap();
+    let sig1 = confluence.evaluate_activity(&act1, &whale1, 0.010, 250000.0).unwrap();
     assert!(sig1.is_passed, "Whale 1 initial buy should pass gating");
 
     let pos1 = sol_exec.execute_shadow_buy(&sig1).await.unwrap().unwrap();
@@ -539,7 +541,7 @@ async fn test_multi_whale_averaging_and_same_whale_deduplication() {
         timestamp: now,
     };
 
-    let sig1_repeat = confluence.evaluate_activity(&act1_repeat, &whale1, 0.012, 50000.0).unwrap();
+    let sig1_repeat = confluence.evaluate_activity(&act1_repeat, &whale1, 0.012, 250000.0).unwrap();
     assert!(!sig1_repeat.is_passed, "Same whale repeat buy MUST be rejected");
     assert!(
         sig1_repeat.rejection_reason.unwrap().contains("REJECTED_WHALE_ALREADY_IN_POSITION"),
@@ -565,7 +567,7 @@ async fn test_multi_whale_averaging_and_same_whale_deduplication() {
         timestamp: now,
     };
 
-    let sig2 = confluence.evaluate_activity(&act2, &whale2, 0.020, 50000.0).unwrap();
+    let sig2 = confluence.evaluate_activity(&act2, &whale2, 0.020, 250000.0).unwrap();
     assert!(sig2.is_passed, "Different whale buy MUST pass gating");
 
     let _pos2 = sol_exec.execute_shadow_buy(&sig2).await.unwrap().unwrap();
@@ -587,4 +589,108 @@ async fn test_multi_whale_averaging_and_same_whale_deduplication() {
     assert!(unified_pos.target_whale_handle.contains("whale_beta"));
     assert!(unified_pos.target_whale_address.contains(&whale1.address));
     assert!(unified_pos.target_whale_address.contains(&whale2.address));
+}
+
+#[tokio::test]
+async fn test_min_whale_buy_and_price_impact_gating() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let config = get_mock_config(); // min_whale_buy_usd: 250.0, max_price_impact_pct: 3.5
+    let confluence = ConfluenceEngine::new(config, db.clone());
+    let now = Utc::now();
+
+    let whale = SmartWallet {
+        id: None,
+        rank: 1,
+        name: "Aurelius0121 👑".to_string(),
+        handle: "Aurelius0121".to_string(),
+        chain: Chain::Robinhood,
+        address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 341442.0,
+        win_rate_pct: 92.0,
+        total_trades: 50,
+        source: "FOMO".to_string(),
+        reputation_score: 98.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: now,
+    };
+    db.upsert_wallet(&whale).unwrap();
+
+    let mint = "0xd7321801caae694090694ff55a9323139f043b88".to_string();
+
+    // 1. Dust Buy ($15.00 < $250.00 min) -> MUST BE REJECTED!
+    let dust_act = WalletActivity {
+        id: None,
+        wallet_address: whale.address.clone(),
+        wallet_handle: whale.handle.clone(),
+        chain: Chain::Robinhood,
+        activity_type: ActivityType::Buy,
+        token_symbol: "JUGGERNAUT".to_string(),
+        token_mint: mint.clone(),
+        amount_usd: 15.0,
+        token_amount: 1000.0,
+        execution_price_usd: 0.015,
+        whale_balance_before: 0.0,
+        whale_balance_after: 1000.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_dust".to_string(),
+        timestamp: now,
+    };
+
+    let sig_dust = confluence.evaluate_activity(&dust_act, &whale, 0.015, 100_000.0).unwrap();
+    assert!(!sig_dust.is_passed, "Dust buy under $250 must be rejected");
+    assert!(
+        sig_dust.rejection_reason.unwrap().contains("REJECTED_WHALE_BUY_TOO_SMALL"),
+        "Rejection reason must indicate buy too small"
+    );
+
+    // 2. Whale Big Buy with High Price Impact ($5,000 buy on $50,000 pool = 10% impact > 3.5%) -> MUST BE REJECTED!
+    let high_impact_act = WalletActivity {
+        id: None,
+        wallet_address: whale.address.clone(),
+        wallet_handle: whale.handle.clone(),
+        chain: Chain::Robinhood,
+        activity_type: ActivityType::Buy,
+        token_symbol: "JUGGERNAUT".to_string(),
+        token_mint: mint.clone(),
+        amount_usd: 5000.0,
+        token_amount: 333_333.0,
+        execution_price_usd: 0.015,
+        whale_balance_before: 0.0,
+        whale_balance_after: 333_333.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_high_impact".to_string(),
+        timestamp: now,
+    };
+
+    let sig_high_impact = confluence.evaluate_activity(&high_impact_act, &whale, 0.015, 50_000.0).unwrap(); // 5000 / 50000 = 10% > 3.5%
+    assert!(!sig_high_impact.is_passed, "High price impact buy must be rejected");
+    assert!(
+        sig_high_impact.rejection_reason.unwrap().contains("PRICE_IMPACT_TOO_HIGH"),
+        "Rejection reason must indicate price impact too high"
+    );
+
+    // 3. High-Conviction Whale Buy ($1,500 buy on $900,000 pool = 0.16% impact) -> MUST PASS!
+    let valid_act = WalletActivity {
+        id: None,
+        wallet_address: whale.address.clone(),
+        wallet_handle: whale.handle.clone(),
+        chain: Chain::Robinhood,
+        activity_type: ActivityType::Buy,
+        token_symbol: "JUGGERNAUT".to_string(),
+        token_mint: mint.clone(),
+        amount_usd: 1500.0,
+        token_amount: 100_000.0,
+        execution_price_usd: 0.015,
+        whale_balance_before: 0.0,
+        whale_balance_after: 100_000.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_valid".to_string(),
+        timestamp: now,
+    };
+
+    let sig_valid = confluence.evaluate_activity(&valid_act, &whale, 0.015, 900_000.0).unwrap();
+    assert!(sig_valid.is_passed, "Valid high conviction buy must pass gating");
+    assert_eq!(sig_valid.rejection_reason, None);
 }
