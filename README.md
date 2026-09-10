@@ -117,6 +117,21 @@ Panel intelijen multi-whale yang memetakan konsensus kepemilikan koin dari Top S
 
 * **`whale_cluster_detective.py`**: Skrip forensik pelacak jejak pendanaan on-chain (parent-child transfer trace) untuk Top Tier-S Whales.
 * **`one_shot_fomo_harvester.py`**: Skrip ekstraksi snapshot 100 top traders (7D, 30D, All-Time) ke SQLite tanpa memicu restriksi API.
+* **`leaderboard_wallet_harvester.py`**: One-shot harvester Solana Tracker dan OKX Smart Money leaderboard; default **dry-run**, validasi address chain-aware, deduplikasi, dan ingest eksplisit dengan `--execute`. Credential hanya dari environment (`SOLANA_TRACKER_API_KEY`, `OKX_API_KEY`, `OKX_SECRET_KEY`, `OKX_PASSPHRASE`).
+* Provider discovery baru tidak menggunakan Alchemy/Birdeye; live monitoring tetap mengikuti konfigurasi engine yang tersedia.
+
+Contoh aman (default dry-run):
+```bash
+export SOLANA_TRACKER_API_KEY='[REDACTED]'
+export OKX_API_KEY='[REDACTED]'
+export OKX_SECRET_KEY='[REDACTED]'
+export OKX_PASSPHRASE='[REDACTED]'
+python3 scripts/leaderboard_wallet_harvester.py --limit 100
+# Tambahkan --execute hanya setelah meninjau output kandidat.
+```
+
+OKX dipanggil per chain yang didukung adapter (Solana, Ethereum, Base; Arbitrum dapat ditolak API bila parameter tidak tersedia). Adapter tidak melakukan polling kontinu.
+
 * **`nansen_7d_smart_money_harvester.py`**: Memindai Top Smart Money 7D PnL tertinggi via Nansen API v2.
 * **`screen_fomo_bottom_vs_top.py`**: Pemindaian koin berklaster modal besar pada whale portofolio.
 
@@ -134,9 +149,13 @@ make start
 * **Menyalakan Daemon di Background:** `make engine`
 * **Menghentikan Daemon:** `make stop`
 * **Restart Daemon & Clear Socket:** `make restart`
-* **Menjalankan Test Suite (11/11 Pass):** `make test`
+* **Menjalankan Test Suite:** `make test`
 
 ### 3. Shortcut Navigasi TUI:
 * **`[1]` / `[2]` / `[3]` / `[4]` / `[5]`**: Berpindah tab dashboard secara instan.
 * **`[Tab]` / `[Shift+Tab]`**: Rotasi tab berikutnya / sebelumnya.
 * **`[Q]` / `[Esc]`**: Keluar dari dashboard visual (engine tetap jalan di background).
+
+## 🔐 Kebijakan Credential Provider
+
+API key/secret/passphrase tidak pernah ditulis ke source code, SQLite, log, README, atau commit. Credential yang pernah dibagikan sebaiknya dirotasi setelah pengujian.

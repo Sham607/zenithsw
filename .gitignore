@@ -4,6 +4,8 @@ Cargo.lock
 data/
 .env
 *.log
+__pycache__/
+*.pyc
 /tmp/zenithsw.sock
 node_modules/
 package-lock.json
