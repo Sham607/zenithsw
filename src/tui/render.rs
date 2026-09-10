@@ -112,15 +112,39 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         )
     };
 
+    let sol_count = app
+        .wallets
+        .iter()
+        .filter(|w| w.chain == crate::models::Chain::Solana)
+        .count();
+    let rh_count = app
+        .wallets
+        .iter()
+        .filter(|w| w.chain == crate::models::Chain::Robinhood)
+        .count();
+    let evm_count = app
+        .wallets
+        .iter()
+        .filter(|w| {
+            w.chain == crate::models::Chain::Ethereum || w.chain == crate::models::Chain::Base
+        })
+        .count();
+
     let footer_text = Line::from(vec![
         ipc_status,
         Span::raw(" | "),
         Span::styled("[1-5]", Style::default().fg(Color::Cyan)),
         Span::raw(" Switch Tabs | "),
         Span::styled("[Q]", Style::default().fg(Color::Red)),
-        Span::raw(" Quit | Tracked Wallets: "),
+        Span::raw(" Quit | Qualified Wallets: "),
         Span::styled(
-            format!("{}", app.wallets.len()),
+            format!(
+                "{} ({} SOL, {} RH, {} EVM)",
+                app.wallets.len(),
+                sol_count,
+                rh_count,
+                evm_count
+            ),
             Style::default().fg(Color::Yellow),
         ),
         Span::raw(" | Tracked Gems: "),
