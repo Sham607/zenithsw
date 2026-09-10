@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
                     eprintln!("[RADAR HARVEST ⚠️] Error harvesting whale holdings: {}", e);
                 }
             }
-            sleep(Duration::from_secs(900)).await; // Re-scan every 15 minutes
+            sleep(Duration::from_secs(60)).await; // Dynamic re-scan every 60 seconds
         }
     });
 

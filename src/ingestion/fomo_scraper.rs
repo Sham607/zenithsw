@@ -274,8 +274,40 @@ impl FomoScraper {
                     }
                 }
             }
-        } else {
-            // Load Verified Seed Gems with live DexScreener verification
+        }
+
+        // 2. Ingest Dynamic Live Tokens from Recent Smart Wallet Activities & Positions
+        if let Ok(act_tokens) = self.db.get_recent_whale_activity_tokens(50) {
+            for (mint, _sym, _chain_str, count, val, handles) in act_tokens {
+                if is_blacklisted_asset(&mint, &_sym) {
+                    continue;
+                }
+                let entry = token_map.entry(mint).or_default();
+                entry.total_usd += val;
+                for h in handles {
+                    if !entry.whale_handles.contains(&h) {
+                        entry.whale_handles.push(h);
+                    }
+                }
+            }
+        }
+
+        // 3. Include Tokens from Open Shadow Positions
+        if let Ok(positions) = self.db.get_active_positions() {
+            for p in positions {
+                if !is_blacklisted_asset(&p.token_mint, &p.token_symbol) {
+                    let entry = token_map.entry(p.token_mint).or_default();
+                    entry.total_usd += p.amount_usd;
+                    let h = p.target_whale_handle;
+                    if !entry.whale_handles.contains(&h) {
+                        entry.whale_handles.push(h);
+                    }
+                }
+            }
+        }
+
+        // 4. Fallback to Verified Seed Gems if token map is sparse (< 5 tokens)
+        if token_map.len() < 5 {
             let seed_path = "data/default_whale_gems.json";
             if let Ok(data) = fs::read_to_string(seed_path) {
                 if let Ok(seeds) =
@@ -283,11 +315,13 @@ impl FomoScraper {
                 {
                     for (_sym, mint, _chain_str, _count, val, handles_str) in seeds {
                         let entry = token_map.entry(mint).or_default();
-                        entry.total_usd = val;
-                        entry.whale_handles = handles_str
-                            .split(',')
-                            .map(|s| s.trim().trim_start_matches('@').to_string())
-                            .collect();
+                        entry.total_usd += val;
+                        for s in handles_str.split(',') {
+                            let h = s.trim().trim_start_matches('@').to_string();
+                            if !entry.whale_handles.contains(&h) {
+                                entry.whale_handles.push(h);
+                            }
+                        }
                     }
                 }
             }
@@ -303,8 +337,8 @@ impl FomoScraper {
 
         let mut tracked_tokens = Vec::new();
 
-        // Inspect top 25 high-conviction tokens via DexScreener
-        for (token_addr, agg) in sorted_tokens.into_iter().take(25) {
+        // Inspect top 50 high-conviction tokens via DexScreener
+        for (token_addr, agg) in sorted_tokens.into_iter().take(50) {
             if is_blacklisted_asset(&token_addr, "") {
                 continue;
             }

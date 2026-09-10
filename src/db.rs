@@ -1047,6 +1047,48 @@ impl SmartWalletDb {
         Ok(())
     }
 
+    pub fn get_recent_whale_activity_tokens(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String, u32, f64, Vec<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT token_mint, 
+                    MAX(token_symbol) as token_symbol, 
+                    MAX(chain) as chain, 
+                    COUNT(DISTINCT wallet_handle) as whale_count, 
+                    SUM(amount_usd) as total_usd, 
+                    GROUP_CONCAT(DISTINCT wallet_handle) as handles
+             FROM wallet_activities
+             WHERE amount_usd > 0.0 AND token_mint != '' AND token_mint != 'NATIVE'
+             GROUP BY token_mint
+             ORDER BY total_usd DESC, whale_count DESC
+             LIMIT ?1",
+        )?;
+
+        let rows = stmt.query_map(params![limit], |row| {
+            let mint: String = row.get(0)?;
+            let symbol: String = row.get(1)?;
+            let chain: String = row.get(2)?;
+            let count: u32 = row.get(3)?;
+            let total_usd: f64 = row.get(4)?;
+            let handles_raw: Option<String> = row.get(5)?;
+            let handles = handles_raw
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<String>>();
+            Ok((mint, symbol, chain, count, total_usd, handles))
+        })?;
+
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r?);
+        }
+        Ok(results)
+    }
+
     pub fn get_tracked_tokens(&self, limit: usize) -> Result<Vec<TrackedToken>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
