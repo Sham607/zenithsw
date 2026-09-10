@@ -265,11 +265,18 @@ pub fn is_blacklisted_asset(mint: &str, symbol: &str) -> bool {
     // Blacklisted base/stablecoin symbols and major/bridged large-cap tokens
     let blacklisted_symbols = [
         "USDC", "USDT", "USD₮0", "USDT0", "DAI", "USDE", "USDS", "PYUSD", "BUSD", "TUSD", "EURC",
-        "USDG", "UZDT", "WETH", "ETH", "WSOL", "SOL", "WBTC", "CBTС", "CBTC", "BTC", "ARB", "OTM",
-        "WERC", // Ticker impersonation / synthetic equity assets
+        "USDG", "UZDT", "FDUSD", "USDD", "FRAX", "LUSD", "CRVUSD", "GHO", "WETH", "ETH", "WSOL",
+        "SOL", "WBTC", "CBTС", "CBTC", "BTC", "ARB", "OTM", "WERC",
+        // Ticker impersonation / synthetic equity assets
         "TSLA", "TSLAX", "AAPL", "AAPLX", "AMZN", "AMZNX", "NVDA", "NVDAX", "META", "METAX",
-        "GOOGL", "GOOGLX", "MSFT", "MSFTX", "SPY", "QQQ",
-        // Major / Multi-chain Bridged Large Caps (Excluded from nano/micro-cap copy-trade)
+        "GOOGL", "GOOGLX", "MSFT", "MSFTX", "SPY", "QQQ", "CRCL", "CRCLX", "HOOD", "HOODX", "COIN",
+        "COINX", "MSTR", "MSTRX", "PLTR", "PLTRX",
+        // Major / Multi-chain Bridged Large Caps & Major CEX/DeFi tokens
+        "BNB", "WBNB", "AAVE", "WAAVE", "STG", "WSTG", "XAI", "WXAI", "OKB", "WOKB", "FTM", "WFTM",
+        "TON", "WTON", "TRX", "WTRX", "BGB", "LEO", "MNT", "RUNE", "CRO", "BTT", "EGLD", "FLOW",
+        "AXS", "SAND", "MANA", "CHZ", "GALA", "ENJ", "THETA", "EOS", "KLAY", "NEO", "IOTA", "ZIL",
+        "DCR", "RVN", "WAVES", "QTUM", "OMG", "ICX", "LRC", "ANKR", "BAT", "BAL", "COMP", "SNX",
+        "MKR", "CRV", "1INCH", "SUSHI", "DYDX", "GMX", "PENDLE", "LDO", "SSV", "RPL", "FXS", "ENS",
         "XRP", "WXRP", "HBAR", "WHBAR", "ZEC", "WZEC", "JASMY", "WJASMY", "MOVR", "WMOVR", "BICO",
         "WBICO", "ADA", "WADA", "DOGE", "WDOGE", "DOT", "WDOT", "AVAX", "WAVAX", "LINK", "WLINK",
         "MATIC", "POL", "LTC", "WLTC", "BCH", "WBCH", "XLM", "WXLM", "NEAR", "WNEAR", "ATOM",
@@ -283,6 +290,18 @@ pub fn is_blacklisted_asset(mint: &str, symbol: &str) -> bool {
         .any(|&s| sym_upper == s || sym_upper == format!("W{}", s))
     {
         return true;
+    }
+
+    // Reject synthetic equity / tokenized assets ending in 'X' with base matching equities
+    if sym_upper.ends_with('X') && sym_upper.len() >= 3 {
+        let base_ticker = &sym_upper[..sym_upper.len() - 1];
+        let equity_bases = [
+            "TSLA", "AAPL", "AMZN", "NVDA", "META", "GOOGL", "MSFT", "SPY", "QQQ", "CRCL", "HOOD",
+            "COIN", "MSTR", "PLTR", "AMD", "INTC", "NFLX", "DIS",
+        ];
+        if equity_bases.contains(&base_ticker) {
+            return true;
+        }
     }
 
     // Blacklisted contract addresses on EVM & Solana

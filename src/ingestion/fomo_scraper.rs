@@ -405,8 +405,23 @@ impl FomoScraper {
                             .or_else(|| pair.get("fdv").and_then(|f| f.as_f64()))
                             .unwrap_or(0.0);
 
-                        // Strict Nano/Micro-Cap Radar Filter: Reject large caps (> $20M) and dead liquidity (< $50k)
+                        // 1. Strict Blacklist check with live symbol
+                        if is_blacklisted_asset(&token_addr, &symbol) {
+                            continue;
+                        }
+
+                        // 2. Strict Price & Minimum Liquidity Filter ($30,000 min liquidity floor)
+                        if price_usd <= 0.0 || liquidity_usd < 30_000.0 {
+                            continue;
+                        }
+
+                        // 3. Strict Nano/Micro-Cap Radar Filter ($50k - $20M Market Cap)
                         if market_cap_usd > 20_000_000.0 || market_cap_usd < 50_000.0 {
+                            continue;
+                        }
+
+                        // 4. Sanity check: Reject distorted pools where liquidity > 2x MCap (synthetic stocks like CRCLx)
+                        if liquidity_usd > market_cap_usd * 2.0 {
                             continue;
                         }
 

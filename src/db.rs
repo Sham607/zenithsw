@@ -1096,7 +1096,7 @@ impl SmartWalletDb {
                     change_24h_pct, change_6h_pct, change_1h_pct, whale_count, total_whale_usd,
                     top_whale_handles, status, upside_tier, last_scanned_at
              FROM tracked_tokens
-             WHERE market_cap_usd >= 50000.0 AND market_cap_usd <= 20000000.0
+             WHERE market_cap_usd >= 50000.0 AND market_cap_usd <= 20000000.0 AND liquidity_usd >= 30000.0
              ORDER BY 
                 CASE 
                     WHEN market_cap_usd > 0.0 AND market_cap_usd < 1000000.0 THEN 1
