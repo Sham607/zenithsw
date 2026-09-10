@@ -1003,6 +1003,49 @@ impl SmartWalletDb {
         Ok(count as u32)
     }
 
+    pub fn delete_tracked_token(&self, mint: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM tracked_tokens WHERE token_mint = ?1",
+            params![mint],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_stale_tracked_tokens(
+        &self,
+        active_mints: &[String],
+        max_age_seconds: i64,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - chrono::Duration::seconds(max_age_seconds)).to_rfc3339();
+
+        let removed = if active_mints.is_empty() {
+            conn.execute(
+                "DELETE FROM tracked_tokens WHERE last_scanned_at < ?1",
+                params![cutoff],
+            )?
+        } else {
+            let placeholders = active_mints
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "DELETE FROM tracked_tokens WHERE last_scanned_at < ?1 OR token_mint NOT IN ({})",
+                placeholders
+            );
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            params_vec.push(Box::new(cutoff));
+            for m in active_mints {
+                params_vec.push(Box::new(m.clone()));
+            }
+            let slice: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+            conn.execute(&sql, slice.as_slice())?
+        };
+        Ok(removed)
+    }
+
     pub fn upsert_tracked_token(&self, token: &TrackedToken) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1091,12 +1134,13 @@ impl SmartWalletDb {
 
     pub fn get_tracked_tokens(&self, limit: usize) -> Result<Vec<TrackedToken>> {
         let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - chrono::Duration::minutes(15)).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT token_mint, token_symbol, chain, market_cap_usd, liquidity_usd, price_usd,
                     change_24h_pct, change_6h_pct, change_1h_pct, whale_count, total_whale_usd,
                     top_whale_handles, status, upside_tier, last_scanned_at
              FROM tracked_tokens
-             WHERE market_cap_usd >= 50000.0 AND market_cap_usd <= 20000000.0 AND liquidity_usd >= 30000.0
+             WHERE market_cap_usd >= 50000.0 AND market_cap_usd <= 20000000.0 AND liquidity_usd >= 30000.0 AND last_scanned_at >= ?1
              ORDER BY 
                 CASE 
                     WHEN market_cap_usd > 0.0 AND market_cap_usd < 1000000.0 THEN 1
@@ -1107,10 +1151,10 @@ impl SmartWalletDb {
                 END ASC,
                 whale_count DESC, 
                 total_whale_usd DESC 
-             LIMIT ?1",
+             LIMIT ?2",
         )?;
 
-        let rows = stmt.query_map(params![limit], |row| {
+        let rows = stmt.query_map(params![cutoff, limit], |row| {
             let token_mint: String = row.get(0)?;
             let token_symbol: String = row.get(1)?;
             let chain_str: String = row.get(2)?;

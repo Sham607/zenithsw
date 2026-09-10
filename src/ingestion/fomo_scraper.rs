@@ -407,21 +407,25 @@ impl FomoScraper {
 
                         // 1. Strict Blacklist check with live symbol
                         if is_blacklisted_asset(&token_addr, &symbol) {
+                            let _ = self.db.delete_tracked_token(&token_addr);
                             continue;
                         }
 
                         // 2. Strict Price & Minimum Liquidity Filter ($30,000 min liquidity floor)
                         if price_usd <= 0.0 || liquidity_usd < 30_000.0 {
+                            let _ = self.db.delete_tracked_token(&token_addr);
                             continue;
                         }
 
                         // 3. Strict Nano/Micro-Cap Radar Filter ($50k - $20M Market Cap)
                         if market_cap_usd > 20_000_000.0 || market_cap_usd < 50_000.0 {
+                            let _ = self.db.delete_tracked_token(&token_addr);
                             continue;
                         }
 
                         // 4. Sanity check: Reject distorted pools where liquidity > 2x MCap (synthetic stocks like CRCLx)
                         if liquidity_usd > market_cap_usd * 2.0 {
+                            let _ = self.db.delete_tracked_token(&token_addr);
                             continue;
                         }
 
@@ -500,6 +504,14 @@ impl FomoScraper {
                 }
             }
             sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        if !tracked_tokens.is_empty() {
+            let active_mints: Vec<String> = tracked_tokens
+                .iter()
+                .map(|t| t.token_mint.clone())
+                .collect();
+            let _ = self.db.prune_stale_tracked_tokens(&active_mints, 600);
         }
 
         Ok(tracked_tokens)
