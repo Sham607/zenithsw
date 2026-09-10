@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
 use zenithsw::config::Config;
+use zenithsw::db::SmartWalletDb;
 use zenithsw::ipc::{IpcClient, IpcMessage};
 use zenithsw::tui::{render_ui, App};
 
@@ -41,6 +42,23 @@ async fn main() -> Result<()> {
     });
 
     let app = Arc::new(Mutex::new(App::new()));
+
+    // Populate initial state from local SQLite database if available
+    if let Ok(db) = SmartWalletDb::new(&config.db_path) {
+        if let Ok(mut state) = app.lock() {
+            if let Ok(wallets) = db.get_active_wallets() {
+                if !wallets.is_empty() {
+                    state.wallets = wallets;
+                }
+            }
+            if let Ok(positions) = db.get_active_positions() {
+                state.positions = positions;
+            }
+            if let Ok(trades) = db.get_recent_trades(50) {
+                state.trades = trades;
+            }
+        }
+    }
 
     // Task: Connect to Unix Domain Socket IPC Daemon
     let app_ipc = app.clone();
@@ -109,11 +127,6 @@ async fn main() -> Result<()> {
             }
         }
     });
-
-    // Populate initial seed wallets if empty
-    if let Ok(mut state) = app.lock() {
-        state.wallets = zenithsw::ingestion::FomoScraper::get_default_seed_traders();
-    }
 
     // Initialize Terminal
     enable_raw_mode()?;
