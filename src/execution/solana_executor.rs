@@ -75,6 +75,30 @@ impl SolanaExecutor {
         Ok((signing_key, pubkey_b58))
     }
 
+    /// Fetches native SOL balance via Solana RPC
+    pub async fn get_native_balance(&self, pubkey: &str) -> Result<f64> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [pubkey]
+        });
+
+        let res = self
+            .client
+            .post(&self.config.solana_rpc_url)
+            .json(&payload)
+            .send()
+            .await?;
+
+        let res_json: Value = res.json().await?;
+        if let Some(lamports) = res_json["result"]["value"].as_f64() {
+            Ok(lamports / 1_000_000_000.0)
+        } else {
+            Ok(0.0)
+        }
+    }
+
     /// Fetches a Jupiter Swap quote (v6)
     pub async fn fetch_jupiter_quote(
         &self,
@@ -222,6 +246,18 @@ impl SolanaExecutor {
         let mut _onchain_tx_sig = None;
         if !self.config.dry_run {
             if let Ok((signing_key, user_pubkey)) = self.get_keypair() {
+                // Gas Buffer Guard: Require at least 0.05 SOL reserve for gas fees + trade amount
+                if let Ok(balance_sol) = self.get_native_balance(&user_pubkey).await {
+                    let required_sol = amount_native + 0.05;
+                    if balance_sol < required_sol {
+                        eprintln!(
+                            "[GAS BUFFER GUARD 🛡️] Insufficient SOL balance ({:.4} SOL < required {:.4} SOL = 0.05 buffer + {:.4} trade). Skipping live buy!",
+                            balance_sol, required_sol, amount_native
+                        );
+                        return Ok(None);
+                    }
+                }
+
                 println!(
                     "[ONCHAIN SOLANA BUY 🚀] Executing real Jupiter swap for {} (${:.2}) with pubkey {}",
                     signal.token_symbol, amount_usd, user_pubkey

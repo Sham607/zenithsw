@@ -182,7 +182,25 @@ async fn main() -> Result<()> {
                         pos.last_update = Utc::now();
                         let _ = db_pos_tracker.upsert_position(pos);
 
-                        // Emergency Hard SL Trigger (-20.0%) to prevent -99.9% rug pull wipeouts
+                        // 1. Independent Auto Take Profit (50% Partial Exit at +100% PnL to free-roll initial capital)
+                        if pos.unrealized_pnl_pct >= 100.0 && pos.status == "OPEN" && pos.remaining_portion_pct >= 90.0 {
+                            println!("[AUTO-TP +100% 🎯] Position {} ({}) reached +{:.1}% >= +100.0%! Executing 50% partial exit to secure initial capital (Free-Roll Moonbag)!", pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
+                            match pos.chain {
+                                Chain::Solana => { let _ = sol_exec_pos.execute_partial_shadow_sell(&pos.id, 50.0, "AUTO_TP_100PCT_FREE_ROLL", live_price).await; }
+                                _ => { let _ = evm_exec_pos.execute_partial_shadow_sell(&pos.id, 50.0, "AUTO_TP_100PCT_FREE_ROLL", live_price).await; }
+                            }
+                        }
+
+                        // 2. Trailing Profit-Lock Floor on Moonbag (+100% -> Floor +25.0%)
+                        if pos.status == "PARTIAL_EXIT" && pos.remaining_portion_pct <= 55.0 && pos.unrealized_pnl_pct <= 25.0 {
+                            println!("[PROFIT-LOCK FLOOR 🛡️] Position {} ({}) moonbag dropped to +{:.1}% <= +25.0%! Closing remaining portion to lock gains!", pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
+                            match pos.chain {
+                                Chain::Solana => { let _ = sol_exec_pos.execute_shadow_sell(&pos.id, "PROFIT_LOCK_FLOOR_EXIT", live_price).await; }
+                                _ => { let _ = evm_exec_pos.execute_shadow_sell(&pos.id, "PROFIT_LOCK_FLOOR_EXIT", live_price).await; }
+                            }
+                        }
+
+                        // 3. Emergency Hard SL Trigger (-20.0%) to prevent -99.9% rug pull wipeouts
                         if pos.unrealized_pnl_pct <= -20.0 && pos.status != "CLOSED" {
                             println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) hit {:.1}% <= -20.0%! Force closing immediately to protect capital!", pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
                             match pos.chain {
@@ -210,8 +228,8 @@ async fn main() -> Result<()> {
         loop {
             sync_tick += 1;
             let uptime_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-            let tracked_wallets = db_heartbeat.get_active_wallets().unwrap_or_default();
-            let tracked_wallets_count = tracked_wallets.len();
+            let total_tracked_count = db_heartbeat.get_active_wallets().map(|w| w.len()).unwrap_or(0);
+            let qualified_wallets = db_heartbeat.get_qualified_wallets().unwrap_or_default();
             let active_positions_count = db_heartbeat.get_active_positions().map(|p: Vec<ShadowPosition>| p.len()).unwrap_or(0);
 
             let hb = IpcMessage::Heartbeat {
@@ -219,15 +237,15 @@ async fn main() -> Result<()> {
                 solana_latency_ms: 68,
                 arbitrum_latency_ms: 42,
                 base_latency_ms: 45,
-                tracked_wallets_count,
+                tracked_wallets_count: total_tracked_count,
                 active_positions_count,
             };
             let _ = ipc_heartbeat.broadcast(&hb);
 
-            // Sync wallet list and trade executions audit log every 4 seconds
+            // Sync qualified elite target wallets (Tier-S & Tier-A only) and trade executions audit log every 4 seconds
             if sync_tick % 2 == 0 {
-                if !tracked_wallets.is_empty() {
-                    let _ = ipc_heartbeat.broadcast(&IpcMessage::WalletSync { wallets: tracked_wallets });
+                if !qualified_wallets.is_empty() {
+                    let _ = ipc_heartbeat.broadcast(&IpcMessage::WalletSync { wallets: qualified_wallets });
                 }
                 if let Ok(trades) = db_heartbeat.get_recent_trades(50) {
                     let _ = ipc_heartbeat.broadcast(&IpcMessage::TradeSync { trades });

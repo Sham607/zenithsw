@@ -331,3 +331,113 @@ fn test_fomo_seed_traders_and_resolver() {
     assert_eq!(res_rh.0, Chain::Robinhood);
     assert_eq!(res_rh.1, "0x7163aE1B5aEa2F09EBc609c52b4DCAC0A7a4bC2D");
 }
+
+#[tokio::test]
+async fn test_qualified_wallets_and_auto_tp_protocol() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let now = Utc::now();
+
+    // 1. Insert Tier-S, Tier-A, and Tier-B wallets
+    let tier_s = SmartWallet {
+        id: None,
+        rank: 1,
+        name: "Tier S Whale".to_string(),
+        handle: "whale_s".to_string(),
+        chain: Chain::Solana,
+        address: "AddrS11111111111111111111111111111111111111".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 150000.0,
+        win_rate_pct: 85.0,
+        total_trades: 120,
+        source: "ONCHAIN".to_string(),
+        reputation_score: 95.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: now,
+    };
+    let tier_a = SmartWallet {
+        id: None,
+        rank: 2,
+        name: "Tier A Sniper".to_string(),
+        handle: "sniper_a".to_string(),
+        chain: Chain::Solana,
+        address: "AddrA11111111111111111111111111111111111111".to_string(),
+        tier: WalletTier::TierA,
+        pnl_24h_usd: 25000.0,
+        win_rate_pct: 70.0,
+        total_trades: 45,
+        source: "ONCHAIN".to_string(),
+        reputation_score: 82.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: now,
+    };
+    let tier_b = SmartWallet {
+        id: None,
+        rank: 3,
+        name: "Tier B Micro".to_string(),
+        handle: "micro_b".to_string(),
+        chain: Chain::Solana,
+        address: "AddrB11111111111111111111111111111111111111".to_string(),
+        tier: WalletTier::TierB,
+        pnl_24h_usd: 4.0,
+        win_rate_pct: 50.0,
+        total_trades: 10,
+        source: "ONCHAIN".to_string(),
+        reputation_score: 45.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: now,
+    };
+
+    db.upsert_wallet(&tier_s).unwrap();
+    db.upsert_wallet(&tier_a).unwrap();
+    db.upsert_wallet(&tier_b).unwrap();
+
+    // Verify all active vs qualified filter
+    let all_wallets = db.get_active_wallets().unwrap();
+    assert_eq!(all_wallets.len(), 3);
+
+    let qualified = db.get_qualified_wallets().unwrap();
+    assert_eq!(qualified.len(), 2);
+    assert_eq!(qualified[0].tier, WalletTier::TierS);
+    assert_eq!(qualified[1].tier, WalletTier::TierA);
+
+    // 2. Test Auto Take Profit 50% Protocol on +100% PnL
+    let config = get_mock_config();
+    let sol_exec = SolanaExecutor::new(config, db.clone());
+    let signal = ShadowSignal {
+        chain: Chain::Solana,
+        token_symbol: "MOON".to_string(),
+        token_mint: "MoonMint111111111111111111111111111111111111".to_string(),
+        whale_handle: "whale_s".to_string(),
+        whale_address: "AddrS11111111111111111111111111111111111111".to_string(),
+        whale_tier: WalletTier::TierS,
+        whale_entry_price: 1.0,
+        current_pool_price: 1.0,
+        price_delta_pct: 0.0,
+        pool_liquidity_usd: 50000.0,
+        is_passed: true,
+        rejection_reason: None,
+        confluence_count: 1,
+        timestamp: now,
+    };
+
+    let pos = sol_exec.execute_shadow_buy(&signal).await.unwrap().unwrap();
+    assert_eq!(pos.remaining_portion_pct, 100.0);
+
+    // Simulate +100% price pump (Entry 1.0 -> 2.0)
+    sol_exec.execute_partial_shadow_sell(&pos.id, 50.0, "AUTO_TP_100PCT_FREE_ROLL", 2.0).await.unwrap();
+
+    let active_pos = db.get_active_positions().unwrap();
+    assert_eq!(active_pos.len(), 1);
+    assert_eq!(active_pos[0].remaining_portion_pct, 50.0);
+    assert_eq!(active_pos[0].status, "PARTIAL_EXIT");
+
+    // Verify Trade History records PARTIAL_SELL
+    let trades = db.get_recent_trades(5).unwrap();
+    assert_eq!(trades.len(), 1);
+    assert_eq!(trades[0].action, "PARTIAL_SELL");
+    assert_eq!(trades[0].exit_reason, "AUTO_TP_100PCT_FREE_ROLL");
+    assert_eq!(trades[0].pnl_pct, 100.0);
+}

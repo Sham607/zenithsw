@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     // Populate initial state from local SQLite database if available
     if let Ok(db) = SmartWalletDb::new(&config.db_path) {
         if let Ok(mut state) = app.lock() {
-            if let Ok(wallets) = db.get_active_wallets() {
+            if let Ok(wallets) = db.get_qualified_wallets() {
                 if !wallets.is_empty() {
                     state.wallets = wallets;
                 }
