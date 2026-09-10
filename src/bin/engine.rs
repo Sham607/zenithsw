@@ -26,14 +26,18 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
     let db = Arc::new(SmartWalletDb::new(&config.db_path)?);
 
-    // Initial seed: Verified smart wallets into SQLite database
-    let default_seeds = FomoScraper::get_default_seed_traders();
-    println!(
-        "[INIT] Syncing {} verified elite smart wallets into database...",
-        default_seeds.len()
-    );
-    for s in &default_seeds {
-        let _ = db.upsert_wallet(s);
+    // Initial seed: Only populate if database is completely empty
+    if let Ok(existing) = db.get_active_wallets() {
+        if existing.is_empty() {
+            let default_seeds = FomoScraper::get_default_seed_traders();
+            println!(
+                "[INIT] Database is empty. Syncing {} initial verified smart wallets...",
+                default_seeds.len()
+            );
+            for s in &default_seeds {
+                let _ = db.upsert_wallet(s);
+            }
+        }
     }
 
     // Initialize IPC Server
@@ -104,7 +108,14 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         println!("[STREAM WORKER] Paced Multi-Chain Streamer online (5 RPS, Zero Rate-Limit Drop)");
         loop {
-            if let Ok(wallets) = db_stream.get_active_wallets() {
+            if let Ok(mut wallets) = db_stream.get_active_wallets() {
+                // Prioritize Qualified Execution Wallets (Tier-S & Tier-A) first
+                wallets.sort_by_key(|w| match w.tier {
+                    WalletTier::TierS => 0,
+                    WalletTier::TierA => 1,
+                    WalletTier::TierB => 2,
+                });
+
                 for w in wallets {
                     let mut activity_opt = if w.source == "FOMO" && w.tier == WalletTier::TierS {
                         fomo_listener_stream

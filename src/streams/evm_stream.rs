@@ -222,9 +222,9 @@ impl EvmStreamListener {
             };
 
             let amount_usd = if value_num > 0.0 && execution_price_usd > 0.0 {
-                (value_num * execution_price_usd).max(10.0)
+                value_num * execution_price_usd
             } else {
-                50.0
+                0.0
             };
 
             let act = WalletActivity {

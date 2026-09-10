@@ -89,14 +89,10 @@ async fn main() -> Result<()> {
                         state.trades = trades;
                     }
                     if let Ok(acts) = db.get_recent_activities(50) {
-                        if state.activities.is_empty() || acts.len() > state.activities.len() {
-                            state.activities = acts;
-                        }
+                        state.activities = acts;
                     }
                     if let Ok(sigs) = db.get_recent_signals(50) {
-                        if state.signals.is_empty() || sigs.len() > state.signals.len() {
-                            state.signals = sigs;
-                        }
+                        state.signals = sigs;
                     }
                 }
                 sleep(Duration::from_millis(1500)).await;

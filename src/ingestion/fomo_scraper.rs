@@ -278,7 +278,7 @@ impl FomoScraper {
 
         // 2. Ingest Dynamic Live Tokens from Recent Smart Wallet Activities & Positions
         if let Ok(act_tokens) = self.db.get_recent_whale_activity_tokens(50) {
-            for (mint, _sym, _chain_str, count, val, handles) in act_tokens {
+            for (mint, _sym, _chain_str, _count, val, handles) in act_tokens {
                 if is_blacklisted_asset(&mint, &_sym) {
                     continue;
                 }

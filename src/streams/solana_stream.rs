@@ -461,8 +461,8 @@ impl SolanaStreamListener {
                             .get("liquidity")
                             .and_then(|l| l.get("usd"))
                             .and_then(|v| v.as_f64())
-                            .unwrap_or(35000.0);
-                        if price_usd > 0.0 {
+                            .unwrap_or(0.0);
+                        if price_usd > 0.0 && liquidity_usd > 0.0 {
                             if let Ok(mut cache) = get_price_cache().write() {
                                 cache.insert(
                                     mint.to_string(),
