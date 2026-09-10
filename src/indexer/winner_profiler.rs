@@ -243,7 +243,7 @@ impl WinnerProfiler {
                 let chain_id = item["chainId"].as_str().unwrap_or("").to_lowercase();
                 let token_address = item["tokenAddress"].as_str().unwrap_or("").to_string();
 
-                if token_address.is_empty() {
+                if token_address.is_empty() || crate::models::is_blacklisted_asset(&token_address, "") {
                     continue;
                 }
 

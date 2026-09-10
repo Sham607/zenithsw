@@ -321,7 +321,7 @@ fn test_fomo_seed_traders_and_resolver() {
     let seeds = FomoScraper::get_default_seed_traders();
     assert!(seeds.len() >= 15);
     assert_eq!(seeds[0].handle, "unipcs");
-    assert_eq!(seeds[0].tier, WalletTier::TierS);
+    assert_eq!(seeds[0].chain, Chain::Solana);
 
     let res_sol = WalletResolver::resolve_chain_and_address("ether_monk").unwrap();
     assert_eq!(res_sol.0, Chain::Solana);

@@ -367,14 +367,30 @@ impl SolanaStreamListener {
 
                         for pair in pairs {
                             let dex_id = pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
-                            let sym = pair.get("baseToken")
-                                .and_then(|b| b.get("symbol"))
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("");
-                            let price: f64 = pair.get("priceUsd")
-                                .and_then(|p| p.as_str())
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0.0);
+                            let base_addr = pair.get("baseToken").and_then(|b| b.get("address")).and_then(|s| s.as_str()).unwrap_or("");
+                            let quote_addr = pair.get("quoteToken").and_then(|q| q.get("address")).and_then(|s| s.as_str()).unwrap_or("");
+
+                            let is_base = base_addr.eq_ignore_ascii_case(mint);
+                            let is_quote = quote_addr.eq_ignore_ascii_case(mint);
+
+                            if !is_base && !is_quote {
+                                continue;
+                            }
+
+                            let sym = if is_base {
+                                pair.get("baseToken").and_then(|b| b.get("symbol")).and_then(|s| s.as_str()).unwrap_or("")
+                            } else {
+                                pair.get("quoteToken").and_then(|q| q.get("symbol")).and_then(|s| s.as_str()).unwrap_or("")
+                            };
+
+                            let price: f64 = if is_base {
+                                pair.get("priceUsd")
+                                    .and_then(|p| p.as_str())
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0.0)
+                            } else {
+                                1.0
+                            };
                             
                             let mut liq: f64 = pair.get("liquidity")
                                 .and_then(|l| l.get("usd"))
@@ -394,13 +410,20 @@ impl SolanaStreamListener {
 
                             total_liq += liq;
 
-                            if liq >= max_liq && price > 0.0 {
-                                max_liq = liq;
-                                best_price = price;
-                                if !sym.is_empty() {
-                                    best_symbol = sym.to_string();
+                            if is_base {
+                                if liq >= max_liq && price > 0.0 {
+                                    max_liq = liq;
+                                    best_price = price;
+                                    if !sym.is_empty() {
+                                        best_symbol = sym.to_string();
+                                    }
+                                } else if best_price <= 0.0 && price > 0.0 {
+                                    best_price = price;
+                                    if !sym.is_empty() {
+                                        best_symbol = sym.to_string();
+                                    }
                                 }
-                            } else if best_price <= 0.0 && price > 0.0 {
+                            } else if best_price <= 0.0 {
                                 best_price = price;
                                 if !sym.is_empty() {
                                     best_symbol = sym.to_string();

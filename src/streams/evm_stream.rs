@@ -175,12 +175,6 @@ impl EvmStreamListener {
             let to_addr = tx.get("to").and_then(|t| t.as_str()).unwrap_or("");
             let is_buy = to_addr.eq_ignore_ascii_case(address);
 
-            let (activity_type, sell_ratio_pct) = if is_buy {
-                (ActivityType::Buy, 0.0)
-            } else {
-                (ActivityType::Sell, 100.0)
-            };
-
             // Fetch live pool price & aggregated liquidity from DexScreener
             let mut token_symbol = asset.to_string();
             let mut execution_price_usd = 0.0;
@@ -191,6 +185,19 @@ impl EvmStreamListener {
                 }
                 execution_price_usd = price;
             }
+
+            let is_base_stable = crate::models::is_blacklisted_asset(raw_contract, &token_symbol)
+                || crate::models::is_blacklisted_asset(raw_contract, asset);
+
+            let (activity_type, sell_ratio_pct) = if is_buy {
+                if is_base_stable {
+                    (ActivityType::Transfer, 0.0) // Transfer / Deposit of base stablecoin
+                } else {
+                    (ActivityType::Buy, 0.0)
+                }
+            } else {
+                (ActivityType::Sell, 100.0)
+            };
 
             let amount_usd = if value_num > 0.0 && execution_price_usd > 0.0 {
                 (value_num * execution_price_usd).max(10.0)

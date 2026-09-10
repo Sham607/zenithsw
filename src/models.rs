@@ -253,8 +253,51 @@ pub struct ShadowPosition {
     pub status: String,             // "OPEN" | "PARTIAL_EXIT" | "CLOSED"
 }
 
-fn default_portion() -> f64 {
+pub fn default_portion() -> f64 {
     100.0
+}
+
+/// Checks if a token is a base currency, gas token, or stablecoin (USDC, USDT, WETH, etc.)
+pub fn is_blacklisted_asset(mint: &str, symbol: &str) -> bool {
+    let sym_upper = symbol.trim().to_uppercase();
+    let mint_lower = mint.trim().to_lowercase();
+
+    // Blacklisted base/stablecoin symbols
+    let blacklisted_symbols = [
+        "USDC", "USDT", "USD₮0", "USDT0", "DAI", "USDE", "USDS", "PYUSD",
+        "BUSD", "TUSD", "EURC", "USDG", "UZDT", "WETH", "ETH", "WSOL",
+        "SOL", "WBTC", "BTC", "ARB", "OTM", "WERC"
+    ];
+
+    if blacklisted_symbols.iter().any(|&s| sym_upper == s || sym_upper == format!("W{}", s)) {
+        return true;
+    }
+
+    // Blacklisted contract addresses on EVM & Solana
+    let blacklisted_mints = [
+        // EVM Arbitrum / Base / Mainnet
+        "0xaf88d065e77c8cc2239327c5edb3a432268e5831", // USDC Arb
+        "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8", // USDC.e Arb
+        "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9", // USDT Arb
+        "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", // WETH Arb
+        "0x912ce59144191c1204e64559fe8253a0e49e6548", // ARB
+        "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f", // WBTC Arb
+        "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1", // DAI Arb
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC Base
+        "0x4200000000000000000000000000000000000006", // WETH Base
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC Eth
+        "0xdac17f958d2ee523a2206206994597c13d831ec7", // USDT Eth
+        // Solana
+        "epjfwdd5aufqssqem2qn1xzybapc8g4weggkzwytdt1v", // USDC Sol
+        "es9vmfrzacerrmjfrf4h2fyd4kconkcy11mcce8benwny", // USDT Sol
+        "so11111111111111111111111111111111111111112", // WSOL Sol
+    ];
+
+    if blacklisted_mints.iter().any(|&m| mint_lower == m) {
+        return true;
+    }
+
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

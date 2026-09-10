@@ -46,6 +46,26 @@ impl ConfluenceEngine {
             });
         }
 
+        // 1b. Filter out Base Currencies, Gas Tokens, and Stablecoins (USDC, USDT, WETH, etc.)
+        if crate::models::is_blacklisted_asset(&activity.token_mint, &activity.token_symbol) {
+            return Ok(ShadowSignal {
+                chain: activity.chain,
+                token_symbol: activity.token_symbol.clone(),
+                token_mint: activity.token_mint.clone(),
+                whale_handle: activity.wallet_handle.clone(),
+                whale_address: activity.wallet_address.clone(),
+                whale_tier: wallet.tier,
+                whale_entry_price: activity.execution_price_usd,
+                current_pool_price,
+                price_delta_pct: 0.0,
+                pool_liquidity_usd,
+                is_passed: false,
+                rejection_reason: Some(format!("REJECTED_BASE_ASSET_OR_STABLECOIN ({})", activity.token_symbol)),
+                confluence_count: 0,
+                timestamp: now,
+            });
+        }
+
         // 2. Strict Price Discovery Gate (Zero price is an immediate reject)
         let whale_entry_price = if activity.execution_price_usd > 0.0 {
             activity.execution_price_usd
