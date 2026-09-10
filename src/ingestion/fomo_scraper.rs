@@ -405,6 +405,27 @@ impl FomoScraper {
                             .or_else(|| pair.get("fdv").and_then(|f| f.as_f64()))
                             .unwrap_or(0.0);
 
+                        let quote_symbol = pair
+                            .get("quoteToken")
+                            .and_then(|q| q.get("symbol"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_uppercase();
+                        let quote_amount = pair
+                            .get("liquidity")
+                            .and_then(|l| l.get("quote"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+
+                        let real_quote_reserve_usd = match quote_symbol.as_str() {
+                            "USDC" | "USDT" | "USD" | "USDG" | "DAI" | "USDS" | "PYUSD" => {
+                                quote_amount
+                            }
+                            "SOL" | "WSOL" => quote_amount * 120.0,
+                            "ETH" | "WETH" => quote_amount * 2500.0,
+                            _ => quote_amount.min(liquidity_usd * 0.5),
+                        };
+
                         // 1. Strict Blacklist check with live symbol
                         if is_blacklisted_asset(&token_addr, &symbol) {
                             let _ = self.db.delete_tracked_token(&token_addr);
@@ -417,13 +438,28 @@ impl FomoScraper {
                             continue;
                         }
 
-                        // 3. Strict Nano/Micro-Cap Radar Filter ($50k - $20M Market Cap)
+                        // 3. Strict Real Quote Collateral Floor ($15,000 min real USDC/SOL/ETH in pool)
+                        // Destroys single-sided Raydium CLMM spoofed pools (e.g. AKE, BANANAS31 where quote is only $30 USDC)
+                        if real_quote_reserve_usd < 15_000.0 {
+                            let _ = self.db.delete_tracked_token(&token_addr);
+                            continue;
+                        }
+
+                        // 4. Anti-CLMM Asymmetric Spoof Guard (real quote must be at least 15% of reported liquidity)
+                        if liquidity_usd >= 100_000.0
+                            && (real_quote_reserve_usd / liquidity_usd) < 0.15
+                        {
+                            let _ = self.db.delete_tracked_token(&token_addr);
+                            continue;
+                        }
+
+                        // 5. Strict Nano/Micro-Cap Radar Filter ($50k - $20M Market Cap)
                         if market_cap_usd > 20_000_000.0 || market_cap_usd < 50_000.0 {
                             let _ = self.db.delete_tracked_token(&token_addr);
                             continue;
                         }
 
-                        // 4. Sanity check: Reject distorted pools where liquidity > 2x MCap (synthetic stocks like CRCLx)
+                        // 6. Sanity check: Reject distorted pools where liquidity > 2x MCap (synthetic stocks like CRCLx)
                         if liquidity_usd > market_cap_usd * 2.0 {
                             let _ = self.db.delete_tracked_token(&token_addr);
                             continue;

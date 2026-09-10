@@ -386,6 +386,36 @@ impl SolanaStreamListener {
                                 .and_then(|v| v.as_f64())
                                 .unwrap_or(0.0);
 
+                            let quote_sym = pair
+                                .get("quoteToken")
+                                .and_then(|q| q.get("symbol"))
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_uppercase();
+                            let quote_amt = pair
+                                .get("liquidity")
+                                .and_then(|l| l.get("quote"))
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
+
+                            let real_quote_usd = match quote_sym.as_str() {
+                                "USDC" | "USDT" | "USD" | "USDG" | "DAI" | "USDS" | "PYUSD" => {
+                                    quote_amt
+                                }
+                                "SOL" | "WSOL" => quote_amt * 120.0,
+                                "ETH" | "WETH" => quote_amt * 2500.0,
+                                _ => quote_amt.min(liq * 0.5),
+                            };
+
+                            // Anti-CLMM Spoof: If single-sided fake liquidity has < $10k real quote collateral, clamp liquidity to real quote
+                            if dex_id != "pumpfun" {
+                                if liq > 100_000.0 && (real_quote_usd / liq) < 0.10 {
+                                    liq = real_quote_usd * 2.0;
+                                } else if real_quote_usd < 10_000.0 {
+                                    liq = real_quote_usd;
+                                }
+                            }
+
                             // For Pump.fun bonding curves where liquidity object is null/0, derive virtual liquidity from marketCap / fdv
                             if dex_id == "pumpfun" && liq <= 0.0 {
                                 let mcap: f64 = pair
