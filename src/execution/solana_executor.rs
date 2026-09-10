@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::db::SmartWalletDb;
-use crate::models::{Chain, ShadowPosition, ShadowSignal};
+use crate::models::{is_blacklisted_asset, Chain, ShadowPosition, ShadowSignal};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
@@ -221,6 +221,13 @@ impl SolanaExecutor {
         &self,
         signal: &ShadowSignal,
     ) -> Result<Option<ShadowPosition>> {
+        if is_blacklisted_asset(&signal.token_mint, &signal.token_symbol) {
+            eprintln!(
+                "[SOLANA EXECUTION BLOCK 🛡️] Refusing blacklisted/impersonation asset {} ({})",
+                signal.token_symbol, signal.token_mint
+            );
+            return Ok(None);
+        }
         if !signal.is_passed {
             return Ok(None);
         }

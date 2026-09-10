@@ -1043,6 +1043,10 @@ async fn test_wrapped_btc_blacklist_and_market_cap_fail_closed() {
         "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
         "cbBTC"
     ));
+    assert!(zenithsw::models::is_blacklisted_asset(
+        "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB",
+        "TSLAx"
+    ));
 
     let cb_btc = WalletActivity {
         id: None,

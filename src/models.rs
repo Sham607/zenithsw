@@ -266,7 +266,9 @@ pub fn is_blacklisted_asset(mint: &str, symbol: &str) -> bool {
     let blacklisted_symbols = [
         "USDC", "USDT", "USD₮0", "USDT0", "DAI", "USDE", "USDS", "PYUSD", "BUSD", "TUSD", "EURC",
         "USDG", "UZDT", "WETH", "ETH", "WSOL", "SOL", "WBTC", "CBTС", "CBTC", "BTC", "ARB", "OTM",
-        "WERC",
+        "WERC", // Ticker impersonation / synthetic equity assets; never auto-copy.
+        "TSLA", "TSLAX", "AAPL", "AAPLX", "AMZN", "AMZNX", "NVDA", "NVDAX", "META", "METAX",
+        "GOOGL", "GOOGLX", "MSFT", "MSFTX", "SPY", "QQQ",
     ];
 
     if blacklisted_symbols
