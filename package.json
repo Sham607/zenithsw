@@ -1,0 +1,27 @@
+{
+  "name": "zenithsw",
+  "version": "1.0.0",
+  "description": "**ZenithSW** adalah bot *shadow trading* multi-chain berlatensi sub-detik (<150 ms) yang melacak dan mengeksekusi *copy-trade* cerdas mengikuti pergerakan **Top Trader `fomo.family`** serta penemuan mandiri dompet *Smart Money* on-chain (**Direct On-Chain DEX Graph Indexer**) lintas blockchain (**Solana SVM**, **Robinhood / Arbitrum EVM**, **Base EVM**).",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sham607/zenithsw.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Sham607/zenithsw/issues"
+  },
+  "homepage": "https://github.com/Sham607/zenithsw#readme",
+  "dependencies": {
+    "puppeteer-core": "^25.10.0"
+  }
+}

@@ -318,6 +318,62 @@ impl SmartWalletDb {
         Ok(wallets)
     }
 
+    pub fn get_wallet_by_address(&self, address: &str) -> Result<Option<SmartWallet>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at
+             FROM wallets WHERE address = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![address], |row| {
+            let id: Option<i64> = row.get(0)?;
+            let rank: u32 = row.get(1)?;
+            let name: String = row.get(2)?;
+            let handle: String = row.get(3)?;
+            let chain_str: String = row.get(4)?;
+            let address: String = row.get(5)?;
+            let tier_str: String = row.get(6)?;
+            let pnl_24h_usd: f64 = row.get(7)?;
+            let win_rate_pct: f64 = row.get(8)?;
+            let total_trades: u32 = row.get(9)?;
+            let source: String = row.get(10).unwrap_or_else(|_| "FOMO".to_string());
+            let reputation_score: f64 = row.get(11).unwrap_or(80.0);
+            let is_active_int: i32 = row.get(12)?;
+            let last_seen_str: Option<String> = row.get(13)?;
+            let updated_str: String = row.get(14)?;
+
+            let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
+            let tier = WalletTier::from_str(&tier_str).unwrap_or(WalletTier::TierB);
+            let last_seen_at = last_seen_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc)));
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+            Ok(SmartWallet {
+                id,
+                rank,
+                name,
+                handle,
+                chain,
+                address,
+                tier,
+                pnl_24h_usd,
+                win_rate_pct,
+                total_trades,
+                source,
+                reputation_score,
+                is_active: is_active_int == 1,
+                last_seen_at,
+                updated_at,
+            })
+        })?;
+
+        if let Some(res) = rows.next() {
+            Ok(Some(res?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn insert_activity(&self, act: &WalletActivity) -> Result<()> {
         let ts_str = act.timestamp.to_rfc3339();
         let chain_str = act.chain.to_string();

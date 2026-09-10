@@ -152,12 +152,14 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Task 3: Live Position Lifecycle & Real-Time Price Tracker Worker (Pure Whale Mirror Tracking)
+    // Task 3: Live Position Lifecycle & Real-Time Price Tracker Worker (Whale Mirror + Emergency Hard SL -20%)
     let db_pos_tracker = db.clone();
     let ipc_pos_tracker = ipc_server.clone();
+    let sol_exec_pos = sol_exec.clone();
+    let evm_exec_pos = evm_exec.clone();
 
     tokio::spawn(async move {
-        println!("[POSITION TRACKER] Pure Whale Mirror Position & Floating PnL Tracker online (Interval: 2s)");
+        println!("[POSITION TRACKER] Position & Floating PnL Tracker online (Whale Mirror + Emergency Hard SL -20% active)");
         loop {
             if let Ok(mut positions) = db_pos_tracker.get_active_positions() {
                 for pos in &mut positions {
@@ -179,6 +181,15 @@ async fn main() -> Result<()> {
                         }
                         pos.last_update = Utc::now();
                         let _ = db_pos_tracker.upsert_position(pos);
+
+                        // Emergency Hard SL Trigger (-20.0%) to prevent -99.9% rug pull wipeouts
+                        if pos.unrealized_pnl_pct <= -20.0 && pos.status != "CLOSED" {
+                            println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) hit {:.1}% <= -20.0%! Force closing immediately to protect capital!", pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
+                            match pos.chain {
+                                Chain::Solana => { let _ = sol_exec_pos.execute_shadow_sell(&pos.id, "EMERGENCY_HARD_SL_CUTLOSS", live_price).await; }
+                                _ => { let _ = evm_exec_pos.execute_shadow_sell(&pos.id, "EMERGENCY_HARD_SL_CUTLOSS", live_price).await; }
+                            }
+                        }
                     }
                 }
 

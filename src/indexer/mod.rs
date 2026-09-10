@@ -23,7 +23,7 @@ impl SmartMoneyIndexer {
         println!("[INDEXER 🌐] On-Chain DEX Graph Indexer initialized (Interval: {}s)", self.interval_secs);
         loop {
             // Run indexing pass
-            match self.profiler.scan_and_profile_smart_money().await {
+            match self.profiler.discover_active_smart_wallets().await {
                 Ok(new_wallets) => {
                     if !new_wallets.is_empty() {
                         println!("[INDEXER 🎯] Discovered & added {} new active smart wallet(s) directly on-chain!", new_wallets.len());
