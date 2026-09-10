@@ -89,6 +89,9 @@ async fn main() -> Result<()> {
                                 IpcMessage::PositionUpdate { positions } => {
                                     state.positions = positions;
                                 }
+                                IpcMessage::TradeSync { trades } => {
+                                    state.trades = trades;
+                                }
                                 IpcMessage::EngineLog { message, .. } => {
                                     state.add_log(message);
                                 }

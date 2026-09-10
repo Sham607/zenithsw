@@ -224,9 +224,14 @@ async fn main() -> Result<()> {
             };
             let _ = ipc_heartbeat.broadcast(&hb);
 
-            // Sync wallet list every 4 seconds
-            if sync_tick % 2 == 0 && !tracked_wallets.is_empty() {
-                let _ = ipc_heartbeat.broadcast(&IpcMessage::WalletSync { wallets: tracked_wallets });
+            // Sync wallet list and trade executions audit log every 4 seconds
+            if sync_tick % 2 == 0 {
+                if !tracked_wallets.is_empty() {
+                    let _ = ipc_heartbeat.broadcast(&IpcMessage::WalletSync { wallets: tracked_wallets });
+                }
+                if let Ok(trades) = db_heartbeat.get_recent_trades(50) {
+                    let _ = ipc_heartbeat.broadcast(&IpcMessage::TradeSync { trades });
+                }
             }
 
             sleep(Duration::from_secs(2)).await;

@@ -1,4 +1,4 @@
-use crate::models::{ShadowPosition, ShadowSignal, SmartWallet, WalletActivity};
+use crate::models::{ShadowPosition, ShadowSignal, SmartWallet, TradeRecord, WalletActivity};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -28,6 +28,9 @@ pub enum IpcMessage {
     },
     PositionUpdate {
         positions: Vec<ShadowPosition>,
+    },
+    TradeSync {
+        trades: Vec<TradeRecord>,
     },
     EngineLog {
         level: String,
