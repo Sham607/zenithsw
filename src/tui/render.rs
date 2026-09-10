@@ -213,10 +213,14 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
                 WalletTier::TierB => (Color::DarkGray, "[TIER-B]", "MONITOR 🟡"),
             };
 
-            let source_str = if w.source == "ONCHAIN_INDEXER" {
+            let source_str = if w.source.contains("NANSEN") {
+                "[NANSEN 🧠]"
+            } else if w.source.contains("ONCHAIN") {
                 "[ONCHAIN 🌐]"
-            } else {
+            } else if w.source.contains("FOMO") {
                 "[FOMO ⚡]"
+            } else {
+                "[SMART 🎯]"
             };
 
             let formatted_pnl = if w.pnl_24h_usd >= 1_000_000.0 {
