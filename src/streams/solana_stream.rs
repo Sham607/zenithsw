@@ -348,74 +348,87 @@ impl SolanaStreamListener {
         Ok(Some(activity))
     }
 
-    /// Fetches live price & liquidity with multi-source fallback (DexScreener + Pump.fun API + Jupiter API v2)
+    /// Fetches live price & aggregated liquidity with multi-pool scanning (DexScreener + Search Fallback)
     pub async fn fetch_token_price(mint: &str) -> Result<(String, f64, f64)> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(4))
             .build()?;
 
-        // Source 1: DexScreener API
+        // Source 1: DexScreener API with full multi-pool scanning & aggregated liquidity
         let url = format!("https://api.dexscreener.com/latest/dex/tokens/{}", mint);
         if let Ok(res) = client.get(&url).send().await {
             if let Ok(json) = res.json::<Value>().await {
                 if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
-                    if let Some(pair) = pairs.first() {
-                        let symbol = pair.get("baseToken")
-                            .and_then(|b| b.get("symbol"))
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("TOKEN")
-                            .to_string();
-                        let price_usd: f64 = pair.get("priceUsd")
-                            .and_then(|p| p.as_str())
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0.0);
-                        let liquidity_usd: f64 = pair.get("liquidity")
-                            .and_then(|l| l.get("usd"))
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0);
+                    if !pairs.is_empty() {
+                        let mut max_liq = 0.0;
+                        let mut total_liq = 0.0;
+                        let mut best_symbol = "TOKEN".to_string();
+                        let mut best_price = 0.0;
 
-                        if price_usd > 0.0 {
-                            return Ok((symbol, price_usd, liquidity_usd));
+                        for pair in pairs {
+                            let dex_id = pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
+                            let sym = pair.get("baseToken")
+                                .and_then(|b| b.get("symbol"))
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("");
+                            let price: f64 = pair.get("priceUsd")
+                                .and_then(|p| p.as_str())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0.0);
+                            
+                            let mut liq: f64 = pair.get("liquidity")
+                                .and_then(|l| l.get("usd"))
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
+
+                            // For Pump.fun bonding curves where liquidity object is null/0, derive virtual liquidity from marketCap / fdv
+                            if dex_id == "pumpfun" && liq <= 0.0 {
+                                let mcap: f64 = pair.get("marketCap")
+                                    .or_else(|| pair.get("fdv"))
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+                                if mcap > 0.0 {
+                                    liq = mcap * 0.50; // Pump.fun virtual pool reserve ~ 50% of MC
+                                }
+                            }
+
+                            total_liq += liq;
+
+                            if liq >= max_liq && price > 0.0 {
+                                max_liq = liq;
+                                best_price = price;
+                                if !sym.is_empty() {
+                                    best_symbol = sym.to_string();
+                                }
+                            } else if best_price <= 0.0 && price > 0.0 {
+                                best_price = price;
+                                if !sym.is_empty() {
+                                    best_symbol = sym.to_string();
+                                }
+                            }
+                        }
+
+                        let effective_liq = max_liq.max(total_liq);
+                        if best_price > 0.0 {
+                            return Ok((best_symbol, best_price, effective_liq));
                         }
                     }
                 }
             }
         }
 
-        // Source 2: Pump.fun API for newly launched bonding curves
-        let pump_url = format!("https://frontend-api.pump.fun/coins/{}", mint);
-        if let Ok(res) = client.get(&pump_url).send().await {
+        // Source 2: DexScreener Search Endpoint Fallback
+        let search_url = format!("https://api.dexscreener.com/latest/dex/search?q={}", mint);
+        if let Ok(res) = client.get(&search_url).send().await {
             if let Ok(json) = res.json::<Value>().await {
-                let symbol = json.get("symbol").and_then(|s| s.as_str()).unwrap_or("PUMP_TOKEN").to_string();
-                let usd_market_cap = json.get("usd_market_cap").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let virtual_sol_reserves = json.get("virtual_sol_reserves").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                
-                // Virtual liquidity in USD on Pump.fun curve (2x Virtual SOL in USD)
-                let liq_usd = (virtual_sol_reserves / 1_000_000_000.0) * 140.0 * 2.0;
-                let price_usd = if usd_market_cap > 0.0 {
-                    usd_market_cap / 1_000_000_000.0 // 1B total supply on pump.fun
-                } else {
-                    0.000005
-                };
-
-                if price_usd > 0.0 {
-                    return Ok((symbol, price_usd, liq_usd));
-                }
-            }
-        }
-
-        // Source 3: Jupiter Price API v2
-        let jup_url = format!("https://api.jup.ag/price/v2?ids={}", mint);
-        if let Ok(res) = client.get(&jup_url).send().await {
-            if let Ok(json) = res.json::<Value>().await {
-                if let Some(data) = json.get("data").and_then(|d| d.get(mint)) {
-                    let price_usd: f64 = data.get("price")
-                        .and_then(|p| p.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0.0);
-
-                    if price_usd > 0.0 {
-                        return Ok(("JUP_TOKEN".to_string(), price_usd, 50_000.0));
+                if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
+                    if let Some(pair) = pairs.iter().find(|p| p.get("baseToken").and_then(|b| b.get("address")).and_then(|s| s.as_str()) == Some(mint)) {
+                        let symbol = pair.get("baseToken").and_then(|b| b.get("symbol")).and_then(|s| s.as_str()).unwrap_or("TOKEN").to_string();
+                        let price_usd: f64 = pair.get("priceUsd").and_then(|p| p.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let liquidity_usd: f64 = pair.get("liquidity").and_then(|l| l.get("usd")).and_then(|v| v.as_f64()).unwrap_or(35000.0);
+                        if price_usd > 0.0 {
+                            return Ok((symbol, price_usd, liquidity_usd));
+                        }
                     }
                 }
             }
