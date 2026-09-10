@@ -117,6 +117,7 @@ Panel intelijen multi-whale yang memetakan konsensus kepemilikan koin dari Top S
 
 * **`whale_cluster_detective.py`**: Skrip forensik pelacak jejak pendanaan on-chain (parent-child transfer trace) untuk Top Tier-S Whales.
 * **`one_shot_fomo_harvester.py`**: Skrip ekstraksi snapshot 100 top traders (7D, 30D, All-Time) ke SQLite tanpa memicu restriksi API.
+* **`dune_smart_money_harvester.py`**: Ingestion smart money terkurasi dari Dune Analytics (mis. Top 10k Pump.fun Traders, multi-bagger 10x-100x snipers) dengan filter ketat win rate $\ge 55\%$, realized PnL $\ge \$10,000$, dan minimum 3 multi-baggers. Default **dry-run**, ingest dengan `--execute`.
 * **`leaderboard_wallet_harvester.py`**: One-shot harvester Solana Tracker dan OKX Smart Money leaderboard; default **dry-run**, validasi address chain-aware, deduplikasi, dan ingest eksplisit dengan `--execute`. Credential hanya dari environment (`SOLANA_TRACKER_API_KEY`, `OKX_API_KEY`, `OKX_SECRET_KEY`, `OKX_PASSPHRASE`).
 * Provider discovery baru tidak menggunakan Alchemy/Birdeye; live monitoring tetap mengikuti konfigurasi engine yang tersedia.
 
