@@ -1,4 +1,6 @@
-use crate::models::{ShadowPosition, ShadowSignal, SmartWallet, TradeRecord, WalletActivity};
+use crate::models::{
+    ShadowPosition, ShadowSignal, SmartWallet, TrackedToken, TradeRecord, WalletActivity,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -19,6 +21,9 @@ pub enum IpcMessage {
     },
     WalletSync {
         wallets: Vec<SmartWallet>,
+    },
+    TrackedTokensUpdate {
+        tokens: Vec<TrackedToken>,
     },
     ActivityBroadcast {
         activity: WalletActivity,

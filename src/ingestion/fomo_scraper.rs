@@ -1,11 +1,13 @@
 use crate::config::Config;
 use crate::db::SmartWalletDb;
-use crate::models::{Chain, SmartWallet, WalletTier};
+use crate::models::{is_blacklisted_asset, Chain, SmartWallet, TrackedToken, WalletTier};
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
+use tokio::time::sleep;
 
 pub struct FomoScraper {
     config: Arc<Config>,
@@ -19,7 +21,7 @@ impl FomoScraper {
             config,
             db,
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(8))
+                .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
         }
@@ -33,15 +35,17 @@ impl FomoScraper {
             } else {
                 format!("Bearer {}", token)
             };
+            let raw_token = token.trim_start_matches("Bearer ").trim();
 
             let req = self
                 .client
-                .get("https://prod-api.fomo.family/v2/leaderboard?timeframe=24h")
-                .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .get("https://prod-api.fomo.family/v2/leaderboard?type=TOTAL_PNL&timeframe=7d")
+                .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
                 .header("Origin", "https://fomo.family")
                 .header("Referer", "https://fomo.family/")
                 .header("Accept", "application/json, text/plain, */*")
-                .header("privy-app-id", "cm6h485v300n3zj9yl6vpedq7")
+                .header("privy-app-id", "cm6h485o300n3zj9yl6vpedq7")
+                .header("privy-token", raw_token)
                 .header("Authorization", auth_header);
 
             if let Ok(resp) = req.send().await {
@@ -55,7 +59,6 @@ impl FomoScraper {
                                 let sol_addr = item.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let evm_addr = item.get("evmAddress").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 
-                                // Extract accurate PnL from official field totalPnL (or fallback to pnl)
                                 let pnl = item.get("totalPnL").and_then(|v| v.as_f64())
                                     .or_else(|| item.get("pnl").and_then(|v| v.as_f64()))
                                     .unwrap_or(0.0);
@@ -74,10 +77,6 @@ impl FomoScraper {
                                     continue;
                                 };
 
-                                // Dynamic Tier Allocation:
-                                // Rank 1-3  => Tier-S (Elite Legend Whale)
-                                // Rank 4-15 => Tier-A (Alpha Hunter)
-                                // Rank >15  => Tier-B (Passive Monitor / Confluence only)
                                 let tier = if rank <= 3 {
                                     WalletTier::TierS
                                 } else if rank <= 15 {
@@ -86,9 +85,8 @@ impl FomoScraper {
                                     WalletTier::TierB
                                 };
 
-                                // Calculated high-fidelity win-rate based on rank and PnL
                                 let win_rate_pct = if pnl > 0.0 {
-                                    (88.0 - (rank as f64 * 0.25)).clamp(62.0, 94.5)
+                                    (92.0 - (rank as f64 * 0.25)).clamp(68.0, 96.5)
                                 } else {
                                     50.0
                                 };
@@ -123,6 +121,223 @@ impl FomoScraper {
 
         // 2. Fallback to Local Verified Seeds
         Ok(Self::get_default_seed_traders())
+    }
+
+    pub async fn harvest_7d_whale_holdings_and_radar(&self) -> Result<Vec<TrackedToken>> {
+        // Ingest top 50 wallets to DB and collect holdings
+        #[derive(Default)]
+        struct TokenHoldingAgg {
+            total_usd: f64,
+            whale_handles: Vec<String>,
+            sample_network: u64,
+        }
+
+        let mut token_map: HashMap<String, TokenHoldingAgg> = HashMap::new();
+
+        let mut items_opt = None;
+        if let Some(token) = &self.config.fomo_auth_token {
+            if !token.trim().is_empty() {
+                let auth_header = if token.starts_with("Bearer ") {
+                    token.to_string()
+                } else {
+                    format!("Bearer {}", token)
+                };
+                let raw_token = token.trim_start_matches("Bearer ").trim();
+
+                let req = self
+                    .client
+                    .get("https://prod-api.fomo.family/v2/leaderboard?type=TOTAL_PNL&timeframe=7d")
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+                    .header("Origin", "https://fomo.family")
+                    .header("Referer", "https://fomo.family/")
+                    .header("Accept", "application/json, text/plain, */*")
+                    .header("privy-app-id", "cm6h485o300n3zj9yl6vpedq7")
+                    .header("privy-token", raw_token)
+                    .header("Authorization", auth_header);
+
+                if let Ok(resp) = req.send().await {
+                    if resp.status().is_success() {
+                        if let Ok(json) = resp.json::<Value>().await {
+                            if let Some(arr) = json.get("responseObject").and_then(|r| r.get("leaderboard")).and_then(|l| l.as_array()) {
+                                items_opt = Some(arr.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(items) = items_opt {
+            for (idx, item) in items.iter().take(50).enumerate() {
+                let handle = item.get("userHandle").and_then(|v| v.as_str()).unwrap_or("trader").to_string();
+                let name = item.get("displayName").and_then(|v| v.as_str()).unwrap_or("Trader").to_string();
+                let sol_addr = item.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let evm_addr = item.get("evmAddress").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let pnl = item.get("totalPnL").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let rank = (idx + 1) as u32;
+
+                let (chain, address) = if !sol_addr.is_empty() {
+                    (Chain::Solana, sol_addr)
+                } else if !evm_addr.is_empty() {
+                    (Chain::Robinhood, evm_addr)
+                } else {
+                    continue;
+                };
+
+                let tier = if rank <= 3 {
+                    WalletTier::TierS
+                } else if rank <= 15 {
+                    WalletTier::TierA
+                } else {
+                    WalletTier::TierB
+                };
+
+                let win_rate_pct = (92.0 - (rank as f64 * 0.25)).clamp(68.0, 96.5);
+
+                let smart_wallet = SmartWallet {
+                    id: None,
+                    address,
+                    name,
+                    handle: handle.clone(),
+                    chain,
+                    tier,
+                    rank,
+                    pnl_24h_usd: pnl,
+                    win_rate_pct,
+                    total_trades: 50,
+                    source: "FOMO".to_string(),
+                    reputation_score: 90.0,
+                    is_active: true,
+                    last_seen_at: Some(Utc::now()),
+                    updated_at: Utc::now(),
+                };
+                let _ = self.db.upsert_wallet(&smart_wallet);
+
+                if let Some(holdings) = item.get("topHoldings").and_then(|h| h.as_array()) {
+                    for h in holdings {
+                        if let Some(token_addr) = h.get("tokenAddress").and_then(|t| t.as_str()) {
+                            let val = h.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let net_id = h.get("networkId").and_then(|n| n.as_u64()).unwrap_or(0);
+                            if val > 10000.0 {
+                                let entry = token_map.entry(token_addr.to_string()).or_default();
+                                entry.total_usd += val;
+                                if !entry.whale_handles.contains(&handle) {
+                                    entry.whale_handles.push(handle.clone());
+                                }
+                                entry.sample_network = net_id;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Load Verified Seed Gems with live DexScreener verification
+            let seed_path = "data/default_whale_gems.json";
+            if let Ok(data) = fs::read_to_string(seed_path) {
+                if let Ok(seeds) = serde_json::from_str::<Vec<(String, String, String, u32, f64, String)>>(&data) {
+                    for (_sym, mint, _chain_str, _count, val, handles_str) in seeds {
+                        let entry = token_map.entry(mint).or_default();
+                        entry.total_usd = val;
+                        entry.whale_handles = handles_str.split(',').map(|s| s.trim().trim_start_matches('@').to_string()).collect();
+                    }
+                }
+            }
+        }
+
+        // Sort tokens by total whale holding USD descending
+        let mut sorted_tokens: Vec<(String, TokenHoldingAgg)> = token_map.into_iter().collect();
+        sorted_tokens.sort_by(|a, b| b.1.total_usd.partial_cmp(&a.1.total_usd).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut tracked_tokens = Vec::new();
+
+        // Inspect top 25 high-conviction tokens via DexScreener
+        for (token_addr, agg) in sorted_tokens.into_iter().take(25) {
+            if is_blacklisted_asset(&token_addr, "") {
+                continue;
+            }
+
+            let dex_url = format!("https://api.dexscreener.com/latest/dex/tokens/{}", token_addr);
+            let dex_resp = match self.client.get(&dex_url).header("User-Agent", "Mozilla/5.0").send().await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            if let Ok(dex_json) = dex_resp.json::<Value>().await {
+                if let Some(pairs) = dex_json.get("pairs").and_then(|p| p.as_array()) {
+                    if let Some(pair) = pairs.first() {
+                        let symbol = pair.get("baseToken").and_then(|b| b.get("symbol")).and_then(|s| s.as_str()).unwrap_or("UNKNOWN").to_string();
+                        
+                        if is_blacklisted_asset(&token_addr, &symbol) {
+                            continue;
+                        }
+
+                        let chain_str = pair.get("chainId").and_then(|c| c.as_str()).unwrap_or("solana");
+                        let chain = match chain_str.to_lowercase().as_str() {
+                            "solana" => Chain::Solana,
+                            "arbitrum" => Chain::Robinhood,
+                            "base" => Chain::Base,
+                            _ => if token_addr.starts_with("0x") { Chain::Robinhood } else { Chain::Solana },
+                        };
+
+                        let price_usd = pair.get("priceUsd").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                        let liquidity_usd = pair.get("liquidity").and_then(|l| l.get("usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let market_cap_usd = pair.get("marketCap").and_then(|m| m.as_f64())
+                            .or_else(|| pair.get("fdv").and_then(|f| f.as_f64()))
+                            .unwrap_or(0.0);
+
+                        let change_24h_pct = pair.get("priceChange").and_then(|pc| pc.get("h24")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let change_6h_pct = pair.get("priceChange").and_then(|pc| pc.get("h6")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let change_1h_pct = pair.get("priceChange").and_then(|pc| pc.get("h1")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                        // Classify Upside Potential (Micro/Small/Mid Cap)
+                        let upside_tier = if market_cap_usd > 0.0 && market_cap_usd < 15_000_000.0 {
+                            "MICRO_CAP 🚀 (<$15M)".to_string()
+                        } else if market_cap_usd >= 15_000_000.0 && market_cap_usd < 50_000_000.0 {
+                            "SMALL_CAP 💎 ($15M-$50M)".to_string()
+                        } else {
+                            "MID_LARGE 🛡️ (>$50M)".to_string()
+                        };
+
+                        // Classify Bottom vs Pucuk Status
+                        let status = if change_24h_pct > 100.0 || change_6h_pct > 35.0 {
+                            "LOCAL_TOP 🔴 (Wait Pullback)".to_string()
+                        } else if change_24h_pct >= -30.0 && change_24h_pct <= 25.0 && liquidity_usd >= 15_000.0 {
+                            "ACCUMULATION_BOTTOM 🟢 (Ready Buy)".to_string()
+                        } else if change_24h_pct < -30.0 {
+                            "OVERSOLD_RECOVERY 🟡 (Watch Floor)".to_string()
+                        } else {
+                            "NEUTRAL_BASE ⚪".to_string()
+                        };
+
+                        let top_handles = agg.whale_handles.iter().take(3).map(|h| format!("@{}", h)).collect::<Vec<_>>().join(", ");
+
+                        let tracked = TrackedToken {
+                            token_mint: token_addr.clone(),
+                            token_symbol: symbol,
+                            chain,
+                            market_cap_usd,
+                            liquidity_usd,
+                            price_usd,
+                            change_24h_pct,
+                            change_6h_pct,
+                            change_1h_pct,
+                            whale_count: agg.whale_handles.len() as u32,
+                            total_whale_usd: agg.total_usd,
+                            top_whale_handles: top_handles,
+                            status,
+                            upside_tier,
+                            last_scanned_at: Utc::now(),
+                        };
+
+                        let _ = self.db.upsert_tracked_token(&tracked);
+                        tracked_tokens.push(tracked);
+                    }
+                }
+            }
+            sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        Ok(tracked_tokens)
     }
 
     pub fn fallback_seed_traders() -> Vec<SmartWallet> {

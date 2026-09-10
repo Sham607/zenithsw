@@ -19,7 +19,7 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    // 1. Tab Bar Navigation [1]-[4]
+    // 1. Tab Bar Navigation [1]-[5]
     let tab_titles = vec![
         Line::from(vec![
             Span::styled("[1]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -31,10 +31,14 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("[3]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(" SHADOW POSITIONS 💼"),
+            Span::raw(" WHALE GEMS RADAR 💎"),
         ]),
         Line::from(vec![
             Span::styled("[4]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" SHADOW POSITIONS 💼"),
+        ]),
+        Line::from(vec![
+            Span::styled("[5]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw(" LATENCY & STATS 📊"),
         ]),
     ];
@@ -56,8 +60,9 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
     match app.current_tab {
         0 => render_tab_stream(frame, chunks[1], app),
         1 => render_tab_wallets(frame, chunks[1], app),
-        2 => render_tab_positions(frame, chunks[1], app),
-        3 => render_tab_stats(frame, chunks[1], app),
+        2 => render_tab_radar(frame, chunks[1], app),
+        3 => render_tab_positions(frame, chunks[1], app),
+        4 => render_tab_stats(frame, chunks[1], app),
         _ => {}
     }
 
@@ -71,11 +76,13 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
     let footer_text = Line::from(vec![
         ipc_status,
         Span::raw(" | "),
-        Span::styled("[1-4]", Style::default().fg(Color::Cyan)),
+        Span::styled("[1-5]", Style::default().fg(Color::Cyan)),
         Span::raw(" Switch Tabs | "),
         Span::styled("[Q]", Style::default().fg(Color::Red)),
         Span::raw(" Quit | Tracked Wallets: "),
         Span::styled(format!("{}", app.wallets.len()), Style::default().fg(Color::Yellow)),
+        Span::raw(" | Tracked Gems: "),
+        Span::styled(format!("{}", app.tracked_tokens.len()), Style::default().fg(Color::Cyan)),
         Span::raw(" | Active Positions: "),
         Span::styled(format!("{}", app.positions.len()), Style::default().fg(Color::Green)),
     ]);
@@ -275,6 +282,123 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(" SMART MONEY TARGET WALLETS (SORTED BY REALIZED PNL & ON-CHAIN REPUTATION) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+    );
+
+    frame.render_widget(table, area);
+}
+
+fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
+    let header = Row::new(vec![
+        "Rank",
+        "Token",
+        "Chain",
+        "Contract / Mint Address",
+        "Whale Cluster",
+        "Total Whale ($)",
+        "MCap & Upside Potential",
+        "Pool Liquidity",
+        "Price (USD)",
+        "24h / 1h",
+        "Market Structure & Action",
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+    .bottom_margin(1);
+
+    let rows: Vec<Row> = app
+        .tracked_tokens
+        .iter()
+        .enumerate()
+        .map(|(idx, t)| {
+            let status_color = if t.status.contains("ACCUMULATION_BOTTOM") || t.status.contains("Ready Buy") {
+                Color::Green
+            } else if t.status.contains("PULLBACK") || t.status.contains("OVERSOLD") {
+                Color::Yellow
+            } else if t.status.contains("LOCAL_TOP") {
+                Color::Red
+            } else {
+                Color::White
+            };
+
+            let _upside_color = if t.upside_tier.contains("MICRO_CAP") {
+                Color::Cyan
+            } else if t.upside_tier.contains("SMALL_CAP") {
+                Color::Magenta
+            } else {
+                Color::DarkGray
+            };
+
+            let mint_display = if t.token_mint.len() > 18 {
+                format!("{}...{}", &t.token_mint[..8], &t.token_mint[t.token_mint.len() - 6..])
+            } else {
+                t.token_mint.clone()
+            };
+
+            let mcap_str = if t.market_cap_usd >= 1_000_000.0 {
+                format!("${:.1}M", t.market_cap_usd / 1_000_000.0)
+            } else {
+                format!("${:.0}k", t.market_cap_usd / 1_000.0)
+            };
+
+            let whale_usd_str = if t.total_whale_usd >= 1_000_000.0 {
+                format!("${:.1}M", t.total_whale_usd / 1_000_000.0)
+            } else {
+                format!("${:.0}k", t.total_whale_usd / 1_000.0)
+            };
+
+            let liq_str = if t.liquidity_usd >= 1_000_000.0 {
+                format!("${:.1}M", t.liquidity_usd / 1_000_000.0)
+            } else {
+                format!("${:.0}k", t.liquidity_usd / 1_000.0)
+            };
+
+            let cluster_display = format!("{} Whales ({})", t.whale_count, t.top_whale_handles);
+            let upside_full = format!("{} [{}]", mcap_str, t.upside_tier);
+
+            Row::new(vec![
+                format!("#{}", idx + 1),
+                t.token_symbol.clone(),
+                t.chain.to_string(),
+                mint_display,
+                cluster_display,
+                whale_usd_str,
+                upside_full,
+                liq_str,
+                format!("${:.6}", t.price_usd),
+                format!("{:+.1}% / {:+.1}%", t.change_24h_pct, t.change_1h_pct),
+                t.status.clone(),
+            ])
+            .style(Style::default().fg(status_color))
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(4),
+            Constraint::Percentage(9),
+            Constraint::Percentage(7),
+            Constraint::Percentage(14),
+            Constraint::Percentage(18),
+            Constraint::Percentage(9),
+            Constraint::Percentage(13),
+            Constraint::Percentage(8),
+            Constraint::Percentage(8),
+            Constraint::Percentage(8),
+            Constraint::Percentage(12),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            " WHALE GEMS RADAR (TOP 50 7D HOLDINGS • MICRO/SMALL-CAP UPSIDE & BOTTOM CONFIRMATION) ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
     );
 
     frame.render_widget(table, area);

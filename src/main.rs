@@ -53,6 +53,9 @@ async fn main() -> Result<()> {
                     state.wallets = wallets;
                 }
             }
+            if let Ok(tokens) = db.get_tracked_tokens(50) {
+                state.tracked_tokens = tokens;
+            }
             if let Ok(positions) = db.get_active_positions() {
                 state.positions = positions;
             }
@@ -73,6 +76,9 @@ async fn main() -> Result<()> {
                         if !wallets.is_empty() {
                             state.wallets = wallets;
                         }
+                    }
+                    if let Ok(tokens) = db.get_tracked_tokens(50) {
+                        state.tracked_tokens = tokens;
                     }
                     if let Ok(positions) = db.get_active_positions() {
                         state.positions = positions;
@@ -127,6 +133,9 @@ async fn main() -> Result<()> {
                                 }
                                 IpcMessage::WalletSync { wallets } => {
                                     state.wallets = wallets;
+                                }
+                                IpcMessage::TrackedTokensUpdate { tokens } => {
+                                    state.tracked_tokens = tokens;
                                 }
                                 IpcMessage::ActivityBroadcast { activity } => {
                                     state.activities.push(activity);
@@ -192,6 +201,7 @@ async fn main() -> Result<()> {
                         KeyCode::Char('2') => state.current_tab = 1,
                         KeyCode::Char('3') => state.current_tab = 2,
                         KeyCode::Char('4') => state.current_tab = 3,
+                        KeyCode::Char('5') => state.current_tab = 4,
                         KeyCode::Tab => state.next_tab(),
                         KeyCode::BackTab => state.prev_tab(),
                         _ => {}

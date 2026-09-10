@@ -1,8 +1,11 @@
-use crate::models::{ShadowPosition, ShadowSignal, SmartWallet, TradeRecord, WalletActivity};
+use crate::models::{
+    ShadowPosition, ShadowSignal, SmartWallet, TrackedToken, TradeRecord, WalletActivity,
+};
 
 pub struct App {
     pub current_tab: usize,
     pub wallets: Vec<SmartWallet>,
+    pub tracked_tokens: Vec<TrackedToken>,
     pub activities: Vec<WalletActivity>,
     pub signals: Vec<ShadowSignal>,
     pub positions: Vec<ShadowPosition>,
@@ -20,6 +23,7 @@ impl App {
         Self {
             current_tab: 0,
             wallets: Vec::new(),
+            tracked_tokens: Vec::new(),
             activities: Vec::new(),
             signals: Vec::new(),
             positions: Vec::new(),
@@ -34,12 +38,12 @@ impl App {
     }
 
     pub fn next_tab(&mut self) {
-        self.current_tab = (self.current_tab + 1) % 4;
+        self.current_tab = (self.current_tab + 1) % 5;
     }
 
     pub fn prev_tab(&mut self) {
         if self.current_tab == 0 {
-            self.current_tab = 3;
+            self.current_tab = 4;
         } else {
             self.current_tab -= 1;
         }

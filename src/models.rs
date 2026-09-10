@@ -301,6 +301,25 @@ pub fn is_blacklisted_asset(mint: &str, symbol: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackedToken {
+    pub token_mint: String,
+    pub token_symbol: String,
+    pub chain: Chain,
+    pub market_cap_usd: f64,
+    pub liquidity_usd: f64,
+    pub price_usd: f64,
+    pub change_24h_pct: f64,
+    pub change_6h_pct: f64,
+    pub change_1h_pct: f64,
+    pub whale_count: u32,
+    pub total_whale_usd: f64,
+    pub top_whale_handles: String,
+    pub status: String,
+    pub upside_tier: String,
+    pub last_scanned_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeRecord {
     pub timestamp: DateTime<Utc>,
     pub chain: Chain,

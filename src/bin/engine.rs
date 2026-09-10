@@ -56,7 +56,27 @@ async fn main() -> Result<()> {
         indexer_worker.run_background_loop().await;
     });
 
-    // Task 2: High-Speed Paced Stream Ingestion Worker (Zero 429 Drop, 200ms per wallet)
+    // Task 2: Whale Portfolio & Radar Harvester Worker (Top 50 7D Whales + Micro/Small Cap Bottom Classifier)
+    let fomo_scraper = Arc::new(FomoScraper::new(Arc::new(config.clone()), db.clone()));
+    let fomo_scraper_worker = fomo_scraper.clone();
+    let ipc_radar = ipc_server.clone();
+    tokio::spawn(async move {
+        println!("[RADAR WORKER] Whale Portfolio & Gems Harvester online (Scanning Top 50 7D Leaderboard)...");
+        loop {
+            match fomo_scraper_worker.harvest_7d_whale_holdings_and_radar().await {
+                Ok(tokens) => {
+                    println!("[RADAR HARVEST 💎] Successfully analyzed and tracked {} whale conviction tokens", tokens.len());
+                    let _ = ipc_radar.broadcast(&IpcMessage::TrackedTokensUpdate { tokens });
+                }
+                Err(e) => {
+                    eprintln!("[RADAR HARVEST ⚠️] Error harvesting whale holdings: {}", e);
+                }
+            }
+            sleep(Duration::from_secs(900)).await; // Re-scan every 15 minutes
+        }
+    });
+
+    // Task 3: High-Speed Paced Stream Ingestion Worker (Zero 429 Drop, 200ms per wallet)
     let db_stream = db.clone();
     let sol_listener_stream = sol_listener.clone();
     let arb_listener_stream = arb_listener.clone();

@@ -1,6 +1,6 @@
 use crate::models::{
-    ActivityType, Chain, ShadowPosition, ShadowSignal, SmartWallet, TradeRecord, WalletActivity,
-    WalletTier,
+    ActivityType, Chain, ShadowPosition, ShadowSignal, SmartWallet, TrackedToken, TradeRecord,
+    WalletActivity, WalletTier,
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -114,6 +114,24 @@ impl SmartWalletDb {
                  pnl_usd REAL NOT NULL,
                  duration_secs INTEGER NOT NULL
              );
+
+             CREATE TABLE IF NOT EXISTS tracked_tokens (
+                 token_mint TEXT PRIMARY KEY,
+                 token_symbol TEXT NOT NULL,
+                 chain TEXT NOT NULL,
+                 market_cap_usd REAL NOT NULL,
+                 liquidity_usd REAL NOT NULL,
+                 price_usd REAL NOT NULL,
+                 change_24h_pct REAL NOT NULL,
+                 change_6h_pct REAL NOT NULL,
+                 change_1h_pct REAL NOT NULL,
+                 whale_count INTEGER NOT NULL,
+                 total_whale_usd REAL NOT NULL,
+                 top_whale_handles TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 upside_tier TEXT NOT NULL,
+                 last_scanned_at TEXT NOT NULL
+             );
              
              CREATE INDEX IF NOT EXISTS idx_wallets_handle ON wallets(handle);
              CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
@@ -212,6 +230,23 @@ impl SmartWalletDb {
                  pnl_pct REAL NOT NULL,
                  pnl_usd REAL NOT NULL,
                  duration_secs INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS tracked_tokens (
+                 token_mint TEXT PRIMARY KEY,
+                 token_symbol TEXT NOT NULL,
+                 chain TEXT NOT NULL,
+                 market_cap_usd REAL NOT NULL,
+                 liquidity_usd REAL NOT NULL,
+                 price_usd REAL NOT NULL,
+                 change_24h_pct REAL NOT NULL,
+                 change_6h_pct REAL NOT NULL,
+                 change_1h_pct REAL NOT NULL,
+                 whale_count INTEGER NOT NULL,
+                 total_whale_usd REAL NOT NULL,
+                 top_whale_handles TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 upside_tier TEXT NOT NULL,
+                 last_scanned_at TEXT NOT NULL
              );",
         )?;
         Ok(Self { conn: Mutex::new(conn) })
@@ -846,5 +881,113 @@ impl SmartWalletDb {
             |row| row.get(0),
         )?;
         Ok(count as u32)
+    }
+
+    pub fn upsert_tracked_token(&self, token: &TrackedToken) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tracked_tokens (
+                token_mint, token_symbol, chain, market_cap_usd, liquidity_usd, price_usd,
+                change_24h_pct, change_6h_pct, change_1h_pct, whale_count, total_whale_usd,
+                top_whale_handles, status, upside_tier, last_scanned_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(token_mint) DO UPDATE SET
+                token_symbol = excluded.token_symbol,
+                chain = excluded.chain,
+                market_cap_usd = excluded.market_cap_usd,
+                liquidity_usd = excluded.liquidity_usd,
+                price_usd = excluded.price_usd,
+                change_24h_pct = excluded.change_24h_pct,
+                change_6h_pct = excluded.change_6h_pct,
+                change_1h_pct = excluded.change_1h_pct,
+                whale_count = excluded.whale_count,
+                total_whale_usd = excluded.total_whale_usd,
+                top_whale_handles = excluded.top_whale_handles,
+                status = excluded.status,
+                upside_tier = excluded.upside_tier,
+                last_scanned_at = excluded.last_scanned_at",
+            params![
+                token.token_mint,
+                token.token_symbol,
+                token.chain.to_string(),
+                token.market_cap_usd,
+                token.liquidity_usd,
+                token.price_usd,
+                token.change_24h_pct,
+                token.change_6h_pct,
+                token.change_1h_pct,
+                token.whale_count,
+                token.total_whale_usd,
+                token.top_whale_handles,
+                token.status,
+                token.upside_tier,
+                token.last_scanned_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_tracked_tokens(&self, limit: usize) -> Result<Vec<TrackedToken>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT token_mint, token_symbol, chain, market_cap_usd, liquidity_usd, price_usd,
+                    change_24h_pct, change_6h_pct, change_1h_pct, whale_count, total_whale_usd,
+                    top_whale_handles, status, upside_tier, last_scanned_at
+             FROM tracked_tokens
+             ORDER BY whale_count DESC, total_whale_usd DESC LIMIT ?1",
+        )?;
+
+        let rows = stmt.query_map(params![limit], |row| {
+            let token_mint: String = row.get(0)?;
+            let token_symbol: String = row.get(1)?;
+            let chain_str: String = row.get(2)?;
+            let market_cap_usd: f64 = row.get(3)?;
+            let liquidity_usd: f64 = row.get(4)?;
+            let price_usd: f64 = row.get(5)?;
+            let change_24h_pct: f64 = row.get(6)?;
+            let change_6h_pct: f64 = row.get(7)?;
+            let change_1h_pct: f64 = row.get(8)?;
+            let whale_count: u32 = row.get(9)?;
+            let total_whale_usd: f64 = row.get(10)?;
+            let top_whale_handles: String = row.get(11)?;
+            let status: String = row.get(12)?;
+            let upside_tier: String = row.get(13)?;
+            let last_scanned_str: String = row.get(14)?;
+
+            let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
+            let last_scanned_at = DateTime::parse_from_rfc3339(&last_scanned_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+            Ok(TrackedToken {
+                token_mint,
+                token_symbol,
+                chain,
+                market_cap_usd,
+                liquidity_usd,
+                price_usd,
+                change_24h_pct,
+                change_6h_pct,
+                change_1h_pct,
+                whale_count,
+                total_whale_usd,
+                top_whale_handles,
+                status,
+                upside_tier,
+                last_scanned_at,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn clear_tracked_tokens(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM tracked_tokens", [])?;
+        Ok(())
     }
 }
