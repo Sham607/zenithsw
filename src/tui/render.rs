@@ -569,15 +569,19 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
             };
 
             let whale_usd_str = if t.total_whale_usd >= 1_000_000.0 {
-                format!("${:.1}M", t.total_whale_usd / 1_000_000.0)
+                format!("${:.2}M", t.total_whale_usd / 1_000_000.0)
+            } else if t.total_whale_usd >= 1_000.0 {
+                format!("${:.1}k", t.total_whale_usd / 1_000.0)
             } else {
-                format!("${:.0}k", t.total_whale_usd / 1_000.0)
+                format!("${:.0}", t.total_whale_usd)
             };
 
             let liq_str = if t.liquidity_usd >= 1_000_000.0 {
-                format!("${:.1}M", t.liquidity_usd / 1_000_000.0)
+                format!("${:.2}M", t.liquidity_usd / 1_000_000.0)
+            } else if t.liquidity_usd >= 1_000.0 {
+                format!("${:.1}k", t.liquidity_usd / 1_000.0)
             } else {
-                format!("${:.0}k", t.liquidity_usd / 1_000.0)
+                format!("${:.0}", t.liquidity_usd)
             };
 
             let cluster_display = format!("{} Whales ({})", t.whale_count, t.top_whale_handles);
