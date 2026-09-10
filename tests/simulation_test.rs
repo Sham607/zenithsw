@@ -1089,3 +1089,82 @@ async fn test_wrapped_btc_blacklist_and_market_cap_fail_closed() {
         Some("REJECTED_MARKET_CAP_UNVERIFIED")
     );
 }
+
+#[test]
+fn test_clmm_single_sided_spoofed_liquidity_gating() {
+    let now = Utc::now();
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let mut config = get_mock_config();
+    config.min_liquidity_usd = 30000.0;
+    let confluence = ConfluenceEngine::new(config, db.clone());
+
+    let whale = SmartWallet {
+        id: None,
+        rank: 1,
+        name: "test_whale".to_string(),
+        handle: "whale_clmm".to_string(),
+        chain: Chain::Solana,
+        address: "whale_clmm_addr".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 500_000.0,
+        win_rate_pct: 85.0,
+        total_trades: 200,
+        source: "TEST".to_string(),
+        reputation_score: 95.0,
+        is_active: true,
+        last_seen_at: Some(now),
+        updated_at: now,
+    };
+
+    // Case 1: Real standard pool ($50k liquidity, genuine quote)
+    seed_test_token(&db, "genuine_mint", "GENUINE", Chain::Solana, now);
+    let genuine_act = WalletActivity {
+        id: None,
+        wallet_address: whale.address.clone(),
+        wallet_handle: whale.handle.clone(),
+        chain: Chain::Solana,
+        activity_type: ActivityType::Buy,
+        token_symbol: "GENUINE".to_string(),
+        token_mint: "genuine_mint".to_string(),
+        amount_usd: 500.0,
+        token_amount: 500.0,
+        execution_price_usd: 1.0,
+        whale_balance_before: 0.0,
+        whale_balance_after: 500.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_genuine".to_string(),
+        timestamp: now,
+    };
+    let genuine_sig = confluence
+        .evaluate_activity(&genuine_act, &whale, 1.0, 50_000.0)
+        .unwrap();
+    assert!(genuine_sig.is_passed);
+
+    // Case 2: Fake CLMM pool with clamped real quote liquidity below min threshold ($31 USDC)
+    let fake_clmm_act = WalletActivity {
+        id: None,
+        wallet_address: whale.address.clone(),
+        wallet_handle: whale.handle.clone(),
+        chain: Chain::Solana,
+        activity_type: ActivityType::Buy,
+        token_symbol: "AKE".to_string(),
+        token_mint: "2AudYNuUH44TwW9MFYYCqyPDXQe4bWoo3vHbHA8KQE9y".to_string(),
+        amount_usd: 500.0,
+        token_amount: 1000.0,
+        execution_price_usd: 0.0039,
+        whale_balance_before: 0.0,
+        whale_balance_after: 1000.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_fake_clmm".to_string(),
+        timestamp: now,
+    };
+    // When effective liquidity is clamped to real quote ($31.11 * 2 = $62.22), it must be rejected by gating
+    let fake_sig = confluence
+        .evaluate_activity(&fake_clmm_act, &whale, 0.0039, 62.22)
+        .unwrap();
+    assert!(!fake_sig.is_passed);
+    assert!(fake_sig
+        .rejection_reason
+        .unwrap()
+        .contains("LIQUIDITY_TOO_LOW"));
+}
