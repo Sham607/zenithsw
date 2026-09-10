@@ -311,11 +311,28 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Fetch latest live price for open position
-                    let live_price = SolanaStreamListener::fetch_token_price(&pos.token_mint)
+                    // Fetch latest live price for open position; never relabel stale price as fresh.
+                    let live_price = match SolanaStreamListener::fetch_token_price(&pos.token_mint)
                         .await
-                        .map(|(_, p, _)| p)
-                        .unwrap_or(pos.current_price);
+                    {
+                        Ok((_, price, liquidity)) if price > 0.0 && liquidity > 0.0 => price,
+                        Ok((symbol, price, liquidity)) => {
+                            eprintln!(
+                                "[PRICE UPDATE SKIP ⚠️] {} returned invalid market data (price=${:.8}, liquidity=${:.2}); keeping last price with no refresh.",
+                                if symbol.is_empty() { &pos.token_symbol } else { &symbol },
+                                price,
+                                liquidity
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[PRICE UPDATE FAILED ⚠️] {} ({}) — keeping last price with no refresh.",
+                                pos.token_symbol, error
+                            );
+                            continue;
+                        }
+                    };
 
                     // Sanity check: Discard single-tick anomaly if price jumps > 500% in one tick from an established price
                     if live_price > 0.0 {
