@@ -405,6 +405,11 @@ impl FomoScraper {
                             .or_else(|| pair.get("fdv").and_then(|f| f.as_f64()))
                             .unwrap_or(0.0);
 
+                        // Strict Nano/Micro-Cap Radar Filter: Reject large caps (> $20M) and dead liquidity (< $50k)
+                        if market_cap_usd > 20_000_000.0 || market_cap_usd < 50_000.0 {
+                            continue;
+                        }
+
                         let change_24h_pct = pair
                             .get("priceChange")
                             .and_then(|pc| pc.get("h24"))

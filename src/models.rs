@@ -262,13 +262,20 @@ pub fn is_blacklisted_asset(mint: &str, symbol: &str) -> bool {
     let sym_upper = symbol.trim().to_uppercase();
     let mint_lower = mint.trim().to_lowercase();
 
-    // Blacklisted base/stablecoin symbols
+    // Blacklisted base/stablecoin symbols and major/bridged large-cap tokens
     let blacklisted_symbols = [
         "USDC", "USDT", "USD₮0", "USDT0", "DAI", "USDE", "USDS", "PYUSD", "BUSD", "TUSD", "EURC",
         "USDG", "UZDT", "WETH", "ETH", "WSOL", "SOL", "WBTC", "CBTС", "CBTC", "BTC", "ARB", "OTM",
-        "WERC", // Ticker impersonation / synthetic equity assets; never auto-copy.
+        "WERC", // Ticker impersonation / synthetic equity assets
         "TSLA", "TSLAX", "AAPL", "AAPLX", "AMZN", "AMZNX", "NVDA", "NVDAX", "META", "METAX",
         "GOOGL", "GOOGLX", "MSFT", "MSFTX", "SPY", "QQQ",
+        // Major / Multi-chain Bridged Large Caps (Excluded from nano/micro-cap copy-trade)
+        "XRP", "WXRP", "HBAR", "WHBAR", "ZEC", "WZEC", "JASMY", "WJASMY", "MOVR", "WMOVR", "BICO",
+        "WBICO", "ADA", "WADA", "DOGE", "WDOGE", "DOT", "WDOT", "AVAX", "WAVAX", "LINK", "WLINK",
+        "MATIC", "POL", "LTC", "WLTC", "BCH", "WBCH", "XLM", "WXLM", "NEAR", "WNEAR", "ATOM",
+        "WATOM", "ALGO", "WALGO", "ICP", "WICP", "FIL", "WFIL", "UNI", "WUNI", "APT", "WAPT",
+        "SUI", "WSUI", "TIA", "WTIA", "INJ", "WINJ", "RENDER", "FET", "GRT", "STX", "KAS", "PEPE",
+        "SHIB", "FLOKI", "BONK", "WIF",
     ];
 
     if blacklisted_symbols
