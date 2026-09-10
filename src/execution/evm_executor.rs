@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::db::SmartWalletDb;
-use crate::models::{ShadowPosition, ShadowSignal};
+use crate::models::{is_blacklisted_asset, ShadowPosition, ShadowSignal};
 use anyhow::Result;
 use chrono::Utc;
 use std::sync::Arc;
@@ -19,7 +19,13 @@ impl EvmExecutor {
         &self,
         signal: &ShadowSignal,
     ) -> Result<Option<ShadowPosition>> {
-        if !signal.is_passed {
+        if !signal.is_passed || is_blacklisted_asset(&signal.token_mint, &signal.token_symbol) {
+            if is_blacklisted_asset(&signal.token_mint, &signal.token_symbol) {
+                eprintln!(
+                    "[EXECUTION BLOCK 🛡️] Refusing blacklisted base/wrapped asset {} ({})",
+                    signal.token_symbol, signal.token_mint
+                );
+            }
             return Ok(None);
         }
 

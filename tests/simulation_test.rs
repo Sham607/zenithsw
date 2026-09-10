@@ -7,8 +7,35 @@ use zenithsw::gating::ConfluenceEngine;
 use zenithsw::indexer::scoring::ReputationScorer;
 use zenithsw::ingestion::{FomoScraper, WalletResolver};
 use zenithsw::models::{
-    ActivityType, Chain, ShadowSignal, SmartWallet, WalletActivity, WalletTier,
+    ActivityType, Chain, ShadowSignal, SmartWallet, TrackedToken, WalletActivity, WalletTier,
 };
+
+fn seed_test_token(
+    db: &SmartWalletDb,
+    mint: &str,
+    symbol: &str,
+    chain: Chain,
+    now: chrono::DateTime<Utc>,
+) {
+    db.upsert_tracked_token(&TrackedToken {
+        token_mint: mint.to_string(),
+        token_symbol: symbol.to_string(),
+        chain,
+        market_cap_usd: 850_000.0,
+        liquidity_usd: 1_000_000.0,
+        price_usd: 1.0,
+        change_24h_pct: 0.0,
+        change_6h_pct: 0.0,
+        change_1h_pct: 0.0,
+        whale_count: 2,
+        total_whale_usd: 5_000.0,
+        top_whale_handles: "test".to_string(),
+        status: "ACCUMULATION_BOTTOM".to_string(),
+        upside_tier: "NANO_CAP".to_string(),
+        last_scanned_at: now,
+    })
+    .unwrap();
+}
 
 fn get_mock_config() -> Config {
     Config {
@@ -138,6 +165,13 @@ async fn test_gating_price_delta_max_5_pct() {
     };
 
     // Case 1: Current Price = 1.03 (+3.0% delta) -> Should PASS (<= +5.0%)
+    seed_test_token(
+        &db,
+        &activity.token_mint,
+        &activity.token_symbol,
+        activity.chain,
+        now,
+    );
     let signal_pass = confluence
         .evaluate_activity(&activity, &wallet, 1.03, 100000.0)
         .unwrap();
@@ -210,6 +244,13 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
         .contains("LIQUIDITY_TOO_LOW"));
 
     // Case 2: Good Liquidity $45k, but only 1 Tier-B buyer -> Should REJECT for confluence
+    seed_test_token(
+        &db,
+        &activity.token_mint,
+        &activity.token_symbol,
+        activity.chain,
+        now,
+    );
     let signal_conf = confluence
         .evaluate_activity(&activity, &wallet_b, 1.01, 45000.0)
         .unwrap();
@@ -499,6 +540,7 @@ async fn test_multi_whale_averaging_and_same_whale_deduplication() {
     db.upsert_wallet(&whale2).unwrap();
 
     let mint = "TokenMint1234567890abcdef1234567890abcdef12".to_string();
+    seed_test_token(&db, &mint, "GEM", Chain::Solana, now);
 
     // 2. Whale 1 buys Token at $0.010
     let act1 = WalletActivity {
@@ -735,6 +777,13 @@ async fn test_min_whale_buy_and_price_impact_gating() {
         timestamp: now,
     };
 
+    seed_test_token(
+        &db,
+        &valid_act.token_mint,
+        &valid_act.token_symbol,
+        valid_act.chain,
+        now,
+    );
     let sig_valid = confluence
         .evaluate_activity(&valid_act, &whale, 0.015, 900_000.0)
         .unwrap();
@@ -965,4 +1014,74 @@ async fn test_whale_cluster_detective_and_subsidiary_discovery() {
     assert_eq!(retrieved_child.source, "CLUSTER_DETECTIVE");
     assert_eq!(retrieved_child.handle, "unipcs_sub_e2a1");
     assert_eq!(retrieved_child.tier, WalletTier::TierS);
+}
+
+#[tokio::test]
+async fn test_wrapped_btc_blacklist_and_market_cap_fail_closed() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let confluence = ConfluenceEngine::new(get_mock_config(), db.clone());
+    let now = Utc::now();
+    let whale = SmartWallet {
+        id: None,
+        rank: 1,
+        name: "Wrapped BTC Test Whale".to_string(),
+        handle: "wrapped_btc_test".to_string(),
+        chain: Chain::Ethereum,
+        address: "0xtest_whale".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 100_000.0,
+        win_rate_pct: 90.0,
+        total_trades: 100,
+        source: "TEST".to_string(),
+        reputation_score: 95.0,
+        is_active: true,
+        last_seen_at: Some(now),
+        updated_at: now,
+    };
+
+    assert!(zenithsw::models::is_blacklisted_asset(
+        "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+        "cbBTC"
+    ));
+
+    let cb_btc = WalletActivity {
+        id: None,
+        wallet_address: whale.address.clone(),
+        wallet_handle: whale.handle.clone(),
+        chain: Chain::Ethereum,
+        activity_type: ActivityType::Buy,
+        token_symbol: "cbBTC".to_string(),
+        token_mint: "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf".to_string(),
+        amount_usd: 1_000.0,
+        token_amount: 0.013,
+        execution_price_usd: 77_053.28,
+        whale_balance_before: 0.0,
+        whale_balance_after: 0.389,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_cbbtc_blacklist".to_string(),
+        timestamp: now,
+    };
+    let cb_signal = confluence
+        .evaluate_activity(&cb_btc, &whale, 77_053.28, 1_000_000.0)
+        .unwrap();
+    assert!(!cb_signal.is_passed);
+    assert!(cb_signal
+        .rejection_reason
+        .unwrap()
+        .contains("REJECTED_BASE_ASSET_OR_STABLECOIN"));
+
+    let unknown = WalletActivity {
+        token_symbol: "UNKNOWN".to_string(),
+        token_mint: "0xunknown_without_market_cap".to_string(),
+        tx_signature: "tx_unknown_market_cap".to_string(),
+        ..cb_btc
+    };
+    let unknown_signal = confluence
+        .evaluate_activity(&unknown, &whale, 1.0, 100_000.0)
+        .unwrap();
+    assert!(!unknown_signal.is_passed);
+    assert_eq!(
+        unknown_signal.rejection_reason.as_deref(),
+        Some("REJECTED_MARKET_CAP_UNVERIFIED")
+    );
 }

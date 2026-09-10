@@ -102,6 +102,8 @@ Panel intelijen multi-whale yang memetakan konsensus kepemilikan koin dari Top S
 | :--- | :--- | :--- |
 | **`MIN_MARKET_CAP_USD`** | **`$50,000.0`** | Batas bawah MCap (menolak token mati / illiquid pump.fun dead pools). |
 | **`MAX_MARKET_CAP_USD`** | **`$20,000,000.0`** | Batas atas MCap (fokus pada koin mikro dengan potensi asymmetric upside). |
+| **`WRAPPED_ASSET_BLACKLIST`** | **`cbBTC`, `WBTC`, `WETH` + exact contracts** | Mencegah BTC/gas wrapper masuk sebagai posisi copy-trade. |
+| **`MARKET_CAP_FAIL_CLOSED`** | **`true` untuk EVM** | Market cap hilang/tidak valid ditolak dengan `REJECTED_MARKET_CAP_UNVERIFIED`. |
 | **`MIN_WHALE_BUY_USD`** | **`$250.0`** | Batas minimal order whale (menyaring transaksi debu/spam). |
 | **`MAX_PRICE_IMPACT_PCT`** | **`15.0%`** | Toleransi slippage kedalaman pool DEX nano/micro-cap. |
 | **`MAX_PRICE_DELTA_PCT`** | **`+10.0%`** | Batas toleransi lonjakan harga masuk bot vs harga entry whale (*anti-pucuk*). |

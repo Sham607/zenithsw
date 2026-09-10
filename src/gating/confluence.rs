@@ -208,9 +208,10 @@ impl ConfluenceEngine {
             }
         }
 
-        // Gating Check A3: Market Cap Range Gate ($50k Min to $20M Max)
-        if let Ok(Some(tracked)) = self.db.get_tracked_token_by_mint(&activity.token_mint) {
-            if tracked.market_cap_usd > 0.0 {
+        // Gating Check A3: Market Cap Range Gate ($50k Min to $20M Max).
+        // Fail closed: a missing/zero market-cap snapshot is not evidence of eligibility.
+        match self.db.get_tracked_token_by_mint(&activity.token_mint) {
+            Ok(Some(tracked)) if tracked.market_cap_usd > 0.0 => {
                 if tracked.market_cap_usd < self.config.min_market_cap_usd {
                     is_passed = false;
                     if rejection_reason.is_none() {
@@ -229,6 +230,23 @@ impl ConfluenceEngine {
                     }
                 }
             }
+            Ok(Some(_)) | Ok(None) | Err(_)
+                if matches!(
+                    activity.chain,
+                    crate::models::Chain::Robinhood
+                        | crate::models::Chain::Arbitrum
+                        | crate::models::Chain::Base
+                        | crate::models::Chain::Ethereum
+                ) =>
+            {
+                is_passed = false;
+                if rejection_reason.is_none() {
+                    rejection_reason = Some("REJECTED_MARKET_CAP_UNVERIFIED".to_string());
+                }
+            }
+            // Solana legacy stream may not have a tracked-token snapshot yet; retain its
+            // existing liquidity/price gates until the live market-cap resolver is present.
+            Ok(Some(_)) | Ok(None) | Err(_) => {}
         }
 
         // Gating Check B: Multi-Wallet Confluence Rule

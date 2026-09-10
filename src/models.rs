@@ -265,7 +265,8 @@ pub fn is_blacklisted_asset(mint: &str, symbol: &str) -> bool {
     // Blacklisted base/stablecoin symbols
     let blacklisted_symbols = [
         "USDC", "USDT", "USD₮0", "USDT0", "DAI", "USDE", "USDS", "PYUSD", "BUSD", "TUSD", "EURC",
-        "USDG", "UZDT", "WETH", "ETH", "WSOL", "SOL", "WBTC", "BTC", "ARB", "OTM", "WERC",
+        "USDG", "UZDT", "WETH", "ETH", "WSOL", "SOL", "WBTC", "CBTС", "CBTC", "BTC", "ARB", "OTM",
+        "WERC",
     ];
 
     if blacklisted_symbols
@@ -284,6 +285,7 @@ pub fn is_blacklisted_asset(mint: &str, symbol: &str) -> bool {
         "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", // WETH Arb
         "0x912ce59144191c1204e64559fe8253a0e49e6548", // ARB
         "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f", // WBTC Arb
+        "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf", // cbBTC Ethereum
         "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1", // DAI Arb
         "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC Base
         "0x4200000000000000000000000000000000000006", // WETH Base
