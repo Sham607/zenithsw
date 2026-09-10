@@ -5,3 +5,6 @@ data/
 .env
 *.log
 /tmp/zenithsw.sock
+node_modules/
+package-lock.json
+package.json

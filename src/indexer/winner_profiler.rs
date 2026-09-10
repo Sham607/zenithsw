@@ -1,5 +1,4 @@
 use crate::db::SmartWalletDb;
-use crate::indexer::scoring::ReputationScorer;
 use crate::models::{Chain, SmartWallet, WalletTier};
 use anyhow::Result;
 use chrono::Utc;
@@ -36,7 +35,7 @@ impl SmartMoneyIndexer {
 
     /// Perform a full dual-chain scan for newly active smart money
     pub async fn scan_and_index(&self) -> Result<Vec<SmartWallet>> {
-        println!("[SMART MONEY INDEXER 🌐] Scanning trending DEX gainers on Solana & Arbitrum/Robinhood...");
+        println!("[SMART MONEY INDEXER 🌐] Scanning trending DEX gainers on Solana & Robinhood (Arbitrum EVM)...");
         let discovered = self.profiler.discover_active_smart_wallets().await?;
         println!("[SMART MONEY INDEXER ✅] Scan complete. Discovered & evaluated {} candidate wallets.", discovered.len());
         Ok(discovered)
@@ -76,10 +75,10 @@ impl WinnerProfiler {
             return Ok(discovered_wallets);
         }
 
-        println!("[INDEXER 🔍] Extracted {} active high-volume pool candidates.", boosted_tokens.len());
+        println!("[INDEXER 🔍] Extracted {} active high-volume pool candidates across Solana & Robinhood.", boosted_tokens.len());
 
         // 2. Profile early buyers with STRICT scoring
-        for token in boosted_tokens.iter().take(6) {
+        for token in boosted_tokens.iter().take(8) {
             let buyers = if token.chain == Chain::Solana {
                 self.extract_early_buyers_solana(&token.token_address).await.unwrap_or_default()
             } else {
@@ -96,51 +95,90 @@ impl WinnerProfiler {
                     continue;
                 }
 
-                // Fetch true on-chain metrics
-                let (sol_bal, tx_count, age_days) = self.fetch_solana_wallet_metrics(&buyer).await.unwrap_or((0.0, 5, 1.0));
+                let (wallet_chain, handle, name, estimated_pnl_usd, win_rate_pct, tx_count, tier, reputation_score) = match token.chain {
+                    Chain::Solana => {
+                        let (sol_bal, tx_count, age_days) = self.fetch_solana_wallet_metrics(&buyer).await.unwrap_or((0.0, 5, 1.0));
+                        let estimated_pnl_usd = if sol_bal >= 2.0 {
+                            (sol_bal * 140.0 * 2.5).round()
+                        } else {
+                            (sol_bal * 140.0).round()
+                        };
 
-                // Strict Realized PnL Estimation:
-                // Only consider it genuine smart money if they hold substantial capital (>= 2.0 SOL)
-                let estimated_pnl_usd = if sol_bal >= 2.0 {
-                    (sol_bal * 140.0 * 2.5).round()
-                } else {
-                    // Micro balances are categorized as micro-speculators
-                    (sol_bal * 140.0).round()
-                };
+                        let win_rate_pct = if tx_count >= 15 && sol_bal >= 2.0 {
+                            (62.0 + (sol_bal * 1.2).min(20.0)).clamp(60.0, 88.0)
+                        } else {
+                            (52.0 + ((tx_count % 7) as f64 * 1.1)).clamp(50.0, 60.0)
+                        };
 
-                let win_rate_pct = if tx_count >= 15 && sol_bal >= 2.0 {
-                    (62.0 + (sol_bal * 1.2).min(20.0)).clamp(60.0, 88.0)
-                } else {
-                    (52.0 + ((tx_count % 7) as f64 * 1.1)).clamp(50.0, 60.0)
-                };
+                        let tier = if estimated_pnl_usd >= 50_000.0 && win_rate_pct >= 75.0 && sol_bal >= 10.0 && age_days >= 7.0 {
+                            WalletTier::TierS
+                        } else if estimated_pnl_usd >= 10_000.0 && win_rate_pct >= 65.0 && sol_bal >= 2.0 && age_days >= 3.0 {
+                            WalletTier::TierA
+                        } else {
+                            WalletTier::TierB
+                        };
 
-                // Rigorous Multi-Gate Tier Qualification (ReputationScorer standard)
-                // Tier-S: Realized PnL >= $50k, Win Rate >= 75%, Balance >= 10 SOL, Age >= 7d
-                // Tier-A: Realized PnL >= $10k, Win Rate >= 65%, Balance >= 2.0 SOL, Age >= 3d
-                // Everything else: STRICTLY TIER-B (MONITOR 🟡)
-                let tier = if estimated_pnl_usd >= 50_000.0 && win_rate_pct >= 75.0 && sol_bal >= 10.0 && age_days >= 7.0 {
-                    WalletTier::TierS
-                } else if estimated_pnl_usd >= 10_000.0 && win_rate_pct >= 65.0 && sol_bal >= 2.0 && age_days >= 3.0 {
-                    WalletTier::TierA
-                } else {
-                    WalletTier::TierB
-                };
+                        let reputation_score = if tier == WalletTier::TierS {
+                            90.0
+                        } else if tier == WalletTier::TierA {
+                            75.0
+                        } else {
+                            (40.0 + (sol_bal * 2.0).min(20.0)).clamp(30.0, 59.0)
+                        };
 
-                let reputation_score = if tier == WalletTier::TierS {
-                    90.0
-                } else if tier == WalletTier::TierA {
-                    75.0
-                } else {
-                    (40.0 + (sol_bal * 2.0).min(20.0)).clamp(30.0, 59.0)
-                };
+                        let handle = format!("sol_{}_{}", if buyer.len() > 4 { &buyer[..4] } else { &buyer }, if buyer.len() > 4 { &buyer[buyer.len() - 4..] } else { "" });
+                        let name = if sol_bal >= 10.0 {
+                            format!("Whale {:.1} SOL", sol_bal)
+                        } else if sol_bal >= 2.0 {
+                            format!("Pro Trader {:.1} SOL", sol_bal)
+                        } else {
+                            format!("Micro Trader #{}", &buyer[..4])
+                        };
 
-                let handle = format!("sol_{}_{}", if buyer.len() > 4 { &buyer[..4] } else { &buyer }, if buyer.len() > 4 { &buyer[buyer.len() - 4..] } else { "" });
-                let name = if sol_bal >= 10.0 {
-                    format!("Whale {:.1} SOL", sol_bal)
-                } else if sol_bal >= 2.0 {
-                    format!("Pro Trader {:.1} SOL", sol_bal)
-                } else {
-                    format!("Micro Trader #{}", &buyer[..4])
+                        (Chain::Solana, handle, name, estimated_pnl_usd, win_rate_pct, tx_count as u32, tier, reputation_score)
+                    }
+                    _ => {
+                        // Robinhood / Arbitrum EVM
+                        let (eth_bal, tx_count, _age_days) = self.fetch_evm_wallet_metrics(&buyer).await.unwrap_or((0.0, 5, 1.0));
+                        let estimated_pnl_usd = if eth_bal >= 0.5 {
+                            (eth_bal * 2500.0 * 2.5).round()
+                        } else {
+                            (eth_bal * 2500.0).round()
+                        };
+
+                        let win_rate_pct = if tx_count >= 15 && eth_bal >= 0.5 {
+                            (64.0 + (eth_bal * 2.0).min(20.0)).clamp(60.0, 89.0)
+                        } else {
+                            (53.0 + ((tx_count % 7) as f64 * 1.1)).clamp(50.0, 60.0)
+                        };
+
+                        let tier = if estimated_pnl_usd >= 50_000.0 && win_rate_pct >= 75.0 && eth_bal >= 5.0 {
+                            WalletTier::TierS
+                        } else if estimated_pnl_usd >= 10_000.0 && win_rate_pct >= 65.0 && eth_bal >= 1.0 {
+                            WalletTier::TierA
+                        } else {
+                            WalletTier::TierB
+                        };
+
+                        let reputation_score = if tier == WalletTier::TierS {
+                            90.0
+                        } else if tier == WalletTier::TierA {
+                            75.0
+                        } else {
+                            (40.0 + (eth_bal * 10.0).min(20.0)).clamp(30.0, 59.0)
+                        };
+
+                        let handle = format!("rh_{}_{}", if buyer.len() > 6 { &buyer[..6] } else { &buyer }, if buyer.len() > 4 { &buyer[buyer.len() - 4..] } else { "" });
+                        let name = if eth_bal >= 5.0 {
+                            format!("RH Whale {:.2} ETH", eth_bal)
+                        } else if eth_bal >= 1.0 {
+                            format!("RH Pro {:.2} ETH", eth_bal)
+                        } else {
+                            format!("RH Trader #{}", if buyer.len() > 6 { &buyer[2..6] } else { &buyer })
+                        };
+
+                        (Chain::Robinhood, handle, name, estimated_pnl_usd, win_rate_pct, tx_count as u32, tier, reputation_score)
+                    }
                 };
 
                 let rank = (16 + (self.db.get_active_wallets().map(|w| w.len()).unwrap_or(0) as u32)).min(99);
@@ -150,12 +188,12 @@ impl WinnerProfiler {
                     rank,
                     name,
                     handle,
-                    chain: Chain::Solana,
+                    chain: wallet_chain,
                     address: buyer,
                     tier,
                     pnl_24h_usd: estimated_pnl_usd,
                     win_rate_pct,
-                    total_trades: tx_count as u32,
+                    total_trades: tx_count,
                     source: "ONCHAIN_INDEXER".to_string(),
                     reputation_score,
                     is_active: true,
@@ -164,8 +202,8 @@ impl WinnerProfiler {
                 };
 
                 let _ = self.db.upsert_wallet(&wallet);
-                println!("[INDEXER 🎯 EVALUATED] Added {} (@{}) -> Tier: {:?} | Status: {} | WinRate: {:.1}% | Trades: {} | PnL: +${:.0}", 
-                    wallet.name, wallet.handle, wallet.tier, 
+                println!("[INDEXER 🎯 EVALUATED] Added {} (@{}) on {} -> Tier: {:?} | Status: {} | WinRate: {:.1}% | Trades: {} | PnL: +${:.0}", 
+                    wallet.name, wallet.handle, wallet.chain, wallet.tier, 
                     if wallet.tier == WalletTier::TierB { "MONITOR 🟡" } else { "EXECUTE 🟢" },
                     wallet.win_rate_pct, wallet.total_trades, wallet.pnl_24h_usd);
                 discovered_wallets.push(wallet);
@@ -176,7 +214,7 @@ impl WinnerProfiler {
         Ok(discovered_wallets)
     }
 
-    /// Fetch trending tokens from DexScreener Boosts API
+    /// Fetch trending tokens from DexScreener Boosts API (Solana & Robinhood)
     async fn fetch_trending_boosted_tokens(&self) -> Result<Vec<TrendingTokenCandidate>> {
         let url = "https://api.dexscreener.com/token-boosts/top/v1";
         let res = match self.client.get(url).send().await {
@@ -209,7 +247,7 @@ impl WinnerProfiler {
 
                 let chain = match chain_id.as_str() {
                     "solana" => Chain::Solana,
-                    "arbitrum" => Chain::Arbitrum,
+                    "robinhood" | "arbitrum" => Chain::Robinhood,
                     "base" => Chain::Base,
                     _ => continue,
                 };
@@ -276,6 +314,57 @@ impl WinnerProfiler {
         Ok((sol_bal, tx_count, age_days))
     }
 
+    /// Fetch real on-chain balance and tx count for EVM wallet via Alchemy Arbitrum RPC
+    async fn fetch_evm_wallet_metrics(&self, address: &str) -> Result<(f64, usize, f64)> {
+        let mut eth_bal = 0.0;
+        let mut tx_count = 5;
+        let age_days = 3.0;
+
+        if self.arbitrum_rpc_url.is_empty() {
+            return Ok((0.0, 5, 1.0));
+        }
+
+        // 1. eth_getBalance
+        let bal_payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getBalance",
+            "params": [address, "latest"]
+        });
+
+        if let Ok(res) = self.client.post(&self.arbitrum_rpc_url).json(&bal_payload).send().await {
+            if let Ok(json) = res.json::<Value>().await {
+                if let Some(hex_str) = json["result"].as_str() {
+                    if let Ok(val) = u128::from_str_radix(hex_str.trim_start_matches("0x"), 16) {
+                        eth_bal = (val as f64) / 1_000_000_000_000_000_000.0;
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // 2. eth_getTransactionCount
+        let tx_payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "eth_getTransactionCount",
+            "params": [address, "latest"]
+        });
+
+        if let Ok(res) = self.client.post(&self.arbitrum_rpc_url).json(&tx_payload).send().await {
+            if let Ok(json) = res.json::<Value>().await {
+                if let Some(hex_str) = json["result"].as_str() {
+                    if let Ok(count) = usize::from_str_radix(hex_str.trim_start_matches("0x"), 16) {
+                        tx_count = count.max(1);
+                    }
+                }
+            }
+        }
+
+        Ok((eth_bal, tx_count, age_days))
+    }
+
     /// Extract early buyers for Solana mint via Helius RPC
     async fn extract_early_buyers_solana(&self, mint: &str) -> Result<Vec<String>> {
         if self.helius_rpc_url.is_empty() {
@@ -331,8 +420,8 @@ impl WinnerProfiler {
                 "fromBlock": "0x0",
                 "toBlock": "latest",
                 "contractAddresses": [token_address],
-                "category": ["erc20"],
-                "order": "asc",
+                "category": ["external", "erc20"],
+                "order": "desc",
                 "maxCount": "0xa"
             }]
         });
@@ -350,7 +439,9 @@ impl WinnerProfiler {
         let mut buyers = Vec::new();
         if let Some(transfers) = json["result"]["transfers"].as_array() {
             for t in transfers.iter().take(4) {
-                if let Some(to_addr) = t["to"].as_str() {
+                if let Some(from_addr) = t["from"].as_str() {
+                    buyers.push(from_addr.to_string());
+                } else if let Some(to_addr) = t["to"].as_str() {
                     buyers.push(to_addr.to_string());
                 }
             }
