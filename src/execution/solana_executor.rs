@@ -140,6 +140,32 @@ impl SolanaExecutor {
         100.0 // safe fallback
     }
 
+    /// Fetches on-chain UI token balance for an exact mint
+    pub async fn get_ui_token_balance(&self, user_pubkey: &str, mint: &str) -> Result<f64> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                user_pubkey,
+                {"mint": mint},
+                {"encoding": "jsonParsed"}
+            ]
+        });
+
+        let json = self.post_rpc(&payload).await?;
+        if let Some(accs) = json["result"]["value"].as_array() {
+            if let Some(first) = accs.first() {
+                if let Some(ui_amt) =
+                    first["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"].as_f64()
+                {
+                    return Ok(ui_amt);
+                }
+            }
+        }
+        Ok(0.0)
+    }
+
     /// Fetches on-chain raw SPL token balance for an exact mint
     pub async fn get_raw_token_balance(&self, user_pubkey: &str, mint: &str) -> Result<u64> {
         let payload = serde_json::json!({
@@ -289,7 +315,7 @@ impl SolanaExecutor {
             return Ok(None);
         }
 
-        let entry_price = if signal.current_pool_price > 0.0 {
+        let mut entry_price = if signal.current_pool_price > 0.0 {
             signal.current_pool_price
         } else {
             signal.whale_entry_price
@@ -302,7 +328,7 @@ impl SolanaExecutor {
 
         let now = Utc::now();
         let amount_usd = self.config.position_size_usd;
-        let new_tokens = if entry_price > 0.0 {
+        let mut new_tokens = if entry_price > 0.0 {
             amount_usd / entry_price
         } else {
             0.0
@@ -349,6 +375,17 @@ impl SolanaExecutor {
                                 Ok(sig) => {
                                     println!("[ONCHAIN BUY CONFIRMED 🟢] TX Sig: {}", sig);
                                     _onchain_tx_sig = Some(sig);
+
+                                    // Direct on-chain balance reconciliation: query actual token amount received
+                                    tokio::time::sleep(Duration::from_millis(600)).await;
+                                    if let Ok(onchain_bal) = self.get_ui_token_balance(&user_pubkey, &signal.token_mint).await {
+                                        if onchain_bal > 0.0 {
+                                            new_tokens = onchain_bal;
+                                            entry_price = amount_usd / onchain_bal;
+                                            println!("[ONCHAIN RECONCILED 📊] Exact Token Units: {:.4} -> Exact Real Entry Price: ${:.6}",
+                                                onchain_bal, entry_price);
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     eprintln!("[ONCHAIN BROADCAST FAILED ❌] {}", e);
