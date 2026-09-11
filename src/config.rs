@@ -37,6 +37,11 @@ pub struct Config {
     pub confluence_mode: String,  // "TIER_S_OR_DUAL_A"
     pub dry_run: bool,
 
+    // Chains enabled
+    pub enable_solana: bool,
+    pub enable_robinhood: bool,
+    pub enable_base: bool,
+
     // Persistence & IPC
     pub db_path: String,
     pub ipc_socket_path: String,
@@ -146,6 +151,18 @@ impl Config {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(true);
 
+        let enable_solana = env::var("ENABLE_SOLANA")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(true);
+
+        let enable_robinhood = env::var("ENABLE_ROBINHOOD")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let enable_base = env::var("ENABLE_BASE")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         let db_path = env::var("DB_PATH").unwrap_or_else(|_| "data/smart_wallets.db".to_string());
 
         let ipc_socket_path =
@@ -176,6 +193,9 @@ impl Config {
             shadow_exit_enabled,
             confluence_mode,
             dry_run,
+            enable_solana,
+            enable_robinhood,
+            enable_base,
             db_path,
             ipc_socket_path,
         })

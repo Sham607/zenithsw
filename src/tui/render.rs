@@ -130,6 +130,18 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         })
         .count();
 
+    let qualified_str = if rh_count == 0 && evm_count == 0 {
+        format!("{} SOLANA ⚡", sol_count)
+    } else {
+        format!(
+            "{} ({} SOL, {} RH, {} EVM)",
+            app.wallets.len(),
+            sol_count,
+            rh_count,
+            evm_count
+        )
+    };
+
     let footer_text = Line::from(vec![
         ipc_status,
         Span::raw(" | "),
@@ -137,16 +149,7 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         Span::raw(" Switch Tabs | "),
         Span::styled("[Q]", Style::default().fg(Color::Red)),
         Span::raw(" Quit | Qualified Wallets: "),
-        Span::styled(
-            format!(
-                "{} ({} SOL, {} RH, {} EVM)",
-                app.wallets.len(),
-                sol_count,
-                rh_count,
-                evm_count
-            ),
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled(qualified_str, Style::default().fg(Color::Yellow)),
         Span::raw(" | Tracked Gems: "),
         Span::styled(
             format!("{}", app.tracked_tokens.len()),

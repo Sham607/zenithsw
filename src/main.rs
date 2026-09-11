@@ -12,6 +12,7 @@ use tokio::time::sleep;
 use zenithsw::config::Config;
 use zenithsw::db::SmartWalletDb;
 use zenithsw::ipc::{IpcClient, IpcMessage};
+use zenithsw::models::Chain;
 use zenithsw::tui::{render_ui, App};
 
 #[tokio::main]
@@ -41,27 +42,59 @@ async fn main() -> Result<()> {
         shadow_exit_enabled: true,
         confluence_mode: "TIER_S_OR_DUAL_A".to_string(),
         dry_run: true,
+        enable_solana: true,
+        enable_robinhood: false,
+        enable_base: false,
         db_path: "data/smart_wallets.db".to_string(),
         ipc_socket_path: "/tmp/zenithsw.sock".to_string(),
     });
 
     let app = Arc::new(Mutex::new(App::new()));
 
+    // Helper to filter data by active chains
+    let enable_sol = config.enable_solana;
+    let enable_rh = config.enable_robinhood;
+    let enable_base = config.enable_base;
+
     // Populate initial state from local SQLite database if available
     if let Ok(db) = SmartWalletDb::new(&config.db_path) {
         if let Ok(mut state) = app.lock() {
-            if let Ok(wallets) = db.get_qualified_wallets() {
+            if let Ok(mut wallets) = db.get_qualified_wallets() {
+                wallets.retain(|w| match w.chain {
+                    Chain::Solana => enable_sol,
+                    Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                    Chain::Base => enable_base,
+                    _ => false,
+                });
                 if !wallets.is_empty() {
                     state.wallets = wallets;
                 }
             }
-            if let Ok(tokens) = db.get_tracked_tokens(50) {
+            if let Ok(mut tokens) = db.get_tracked_tokens(50) {
+                tokens.retain(|t| match t.chain {
+                    Chain::Solana => enable_sol,
+                    Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                    Chain::Base => enable_base,
+                    _ => false,
+                });
                 state.tracked_tokens = tokens;
             }
-            if let Ok(positions) = db.get_active_positions() {
+            if let Ok(mut positions) = db.get_active_positions() {
+                positions.retain(|p| match p.chain {
+                    Chain::Solana => enable_sol,
+                    Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                    Chain::Base => enable_base,
+                    _ => false,
+                });
                 state.positions = positions;
             }
-            if let Ok(trades) = db.get_recent_trades(50) {
+            if let Ok(mut trades) = db.get_recent_trades(50) {
+                trades.retain(|t| match t.chain {
+                    Chain::Solana => enable_sol,
+                    Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                    Chain::Base => enable_base,
+                    _ => false,
+                });
                 state.trades = trades;
             }
         }
@@ -74,24 +107,60 @@ async fn main() -> Result<()> {
         if let Ok(db) = SmartWalletDb::new(&db_path_sync) {
             loop {
                 if let Ok(mut state) = app_db_sync.lock() {
-                    if let Ok(wallets) = db.get_qualified_wallets() {
+                    if let Ok(mut wallets) = db.get_qualified_wallets() {
+                        wallets.retain(|w| match w.chain {
+                            Chain::Solana => enable_sol,
+                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Base => enable_base,
+                            _ => false,
+                        });
                         if !wallets.is_empty() {
                             state.wallets = wallets;
                         }
                     }
-                    if let Ok(tokens) = db.get_tracked_tokens(50) {
+                    if let Ok(mut tokens) = db.get_tracked_tokens(50) {
+                        tokens.retain(|t| match t.chain {
+                            Chain::Solana => enable_sol,
+                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Base => enable_base,
+                            _ => false,
+                        });
                         state.tracked_tokens = tokens;
                     }
-                    if let Ok(positions) = db.get_active_positions() {
+                    if let Ok(mut positions) = db.get_active_positions() {
+                        positions.retain(|p| match p.chain {
+                            Chain::Solana => enable_sol,
+                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Base => enable_base,
+                            _ => false,
+                        });
                         state.positions = positions;
                     }
-                    if let Ok(trades) = db.get_recent_trades(50) {
+                    if let Ok(mut trades) = db.get_recent_trades(50) {
+                        trades.retain(|t| match t.chain {
+                            Chain::Solana => enable_sol,
+                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Base => enable_base,
+                            _ => false,
+                        });
                         state.trades = trades;
                     }
-                    if let Ok(acts) = db.get_recent_activities(50) {
+                    if let Ok(mut acts) = db.get_recent_activities(50) {
+                        acts.retain(|a| match a.chain {
+                            Chain::Solana => enable_sol,
+                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Base => enable_base,
+                            _ => false,
+                        });
                         state.activities = acts;
                     }
-                    if let Ok(sigs) = db.get_recent_signals(50) {
+                    if let Ok(mut sigs) = db.get_recent_signals(50) {
+                        sigs.retain(|s| match s.chain {
+                            Chain::Solana => enable_sol,
+                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Base => enable_base,
+                            _ => false,
+                        });
                         state.signals = sigs;
                     }
                 }

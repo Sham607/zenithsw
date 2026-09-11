@@ -63,6 +63,9 @@ fn get_mock_config() -> Config {
         shadow_exit_enabled: true,
         confluence_mode: "TIER_S_OR_DUAL_A".to_string(),
         dry_run: true,
+        enable_solana: true,
+        enable_robinhood: false,
+        enable_base: false,
         db_path: ":memory:".to_string(),
         ipc_socket_path: "/tmp/zenithsw_test.sock".to_string(),
     }

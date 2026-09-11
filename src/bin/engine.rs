@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
 
     // Task 3: High-Speed Paced Stream Ingestion Worker (Zero 429 Drop, 200ms per wallet)
     let db_stream = db.clone();
+    let config_stream = Arc::new(config.clone());
     let sol_listener_stream = sol_listener.clone();
     let arb_listener_stream = arb_listener.clone();
     let base_listener_stream = base_listener.clone();
@@ -106,9 +107,18 @@ async fn main() -> Result<()> {
     let ipc_stream = ipc_server.clone();
 
     tokio::spawn(async move {
-        println!("[STREAM WORKER] Paced Multi-Chain Streamer online (5 RPS, Zero Rate-Limit Drop)");
+        println!("[STREAM WORKER] Paced Multi-Chain Streamer online (Solana: {}, Robinhood: {}, Base: {})",
+            config_stream.enable_solana, config_stream.enable_robinhood, config_stream.enable_base);
         loop {
             if let Ok(mut wallets) = db_stream.get_active_wallets() {
+                // Filter only enabled chains
+                wallets.retain(|w| match w.chain {
+                    Chain::Solana => config_stream.enable_solana,
+                    Chain::Robinhood | Chain::Arbitrum => config_stream.enable_robinhood,
+                    Chain::Base => config_stream.enable_base,
+                    _ => false,
+                });
+
                 // Prioritize Qualified Execution Wallets (Tier-S & Tier-A) first
                 wallets.sort_by_key(|w| match w.tier {
                     WalletTier::TierS => 0,
