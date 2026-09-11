@@ -99,7 +99,58 @@ impl SolanaExecutor {
         }
     }
 
-    /// Fetches a Jupiter Swap quote (v6)
+    /// Fetches live SOL/USD price via DexScreener or Jupiter
+    pub async fn get_sol_price(&self) -> f64 {
+        let url = "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112";
+        if let Ok(res) = self.client.get(url).send().await {
+            if let Ok(data) = res.json::<Value>().await {
+                if let Some(price_str) = data["pairs"][0]["priceUsd"].as_str() {
+                    if let Ok(p) = price_str.parse::<f64>() {
+                        if p > 10.0 {
+                            return p;
+                        }
+                    }
+                }
+            }
+        }
+        100.0 // safe fallback
+    }
+
+    /// Fetches on-chain raw SPL token balance for an exact mint
+    pub async fn get_raw_token_balance(&self, user_pubkey: &str, mint: &str) -> Result<u64> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                user_pubkey,
+                {"mint": mint},
+                {"encoding": "jsonParsed"}
+            ]
+        });
+
+        let res = self
+            .client
+            .post(&self.config.solana_rpc_url)
+            .json(&payload)
+            .send()
+            .await?;
+        let json: Value = res.json().await?;
+        if let Some(accs) = json["result"]["value"].as_array() {
+            if let Some(first) = accs.first() {
+                if let Some(amt_str) =
+                    first["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"].as_str()
+                {
+                    if let Ok(raw_u64) = amt_str.parse::<u64>() {
+                        return Ok(raw_u64);
+                    }
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    /// Fetches a Jupiter Swap quote (v1)
     pub async fn fetch_jupiter_quote(
         &self,
         input_mint: &str,
@@ -108,7 +159,7 @@ impl SolanaExecutor {
         slippage_bps: u16,
     ) -> Result<Value> {
         let url = format!(
-            "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+            "https://api.jup.ag/swap/v1/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
             input_mint, output_mint, amount_lamports, slippage_bps
         );
 
@@ -123,14 +174,14 @@ impl SolanaExecutor {
         Ok(json)
     }
 
-    /// Builds and signs a real on-chain transaction via Jupiter Swap API v6
+    /// Builds and signs a real on-chain transaction via Jupiter Swap API v1
     pub async fn build_and_sign_jupiter_tx(
         &self,
         quote_json: Value,
         user_pubkey: &str,
         signing_key: &SigningKey,
     ) -> Result<String> {
-        let swap_url = "https://quote-api.jup.ag/v6/swap";
+        let swap_url = "https://api.jup.ag/swap/v1/swap";
         let payload = serde_json::json!({
             "quoteResponse": quote_json,
             "userPublicKey": user_pubkey,
@@ -252,7 +303,7 @@ impl SolanaExecutor {
         };
         let position_id = format!("SOL-{}", signal.token_mint);
 
-        let sol_price = 140.0; // Dynamic or fallback price
+        let sol_price = self.get_sol_price().await;
         let amount_native_sol = amount_usd / sol_price;
         let amount_lamports = (amount_native_sol * 1_000_000_000.0) as u64;
 
@@ -262,12 +313,12 @@ impl SolanaExecutor {
         let mut _onchain_tx_sig = None;
         if !self.config.dry_run {
             if let Ok((signing_key, user_pubkey)) = self.get_keypair() {
-                // Gas Buffer Guard: Require at least 0.05 SOL reserve for gas fees + trade amount
+                // Gas Buffer Guard: Require at least 0.04 SOL reserve for gas fees + trade amount
                 if let Ok(balance_sol) = self.get_native_balance(&user_pubkey).await {
-                    let required_sol = amount_native_sol + 0.05;
+                    let required_sol = amount_native_sol + 0.04;
                     if balance_sol < required_sol {
                         eprintln!(
-                            "[GAS BUFFER GUARD 🛡️] Insufficient SOL balance ({:.4} SOL < required {:.4} SOL = 0.05 buffer + {:.4} trade). Skipping live buy!",
+                            "[GAS BUFFER GUARD 🛡️] Insufficient SOL balance ({:.4} SOL < required {:.4} SOL = 0.04 buffer + {:.4} trade). Skipping live buy!",
                             balance_sol, required_sol, amount_native_sol
                         );
                         return Ok(None);
@@ -403,19 +454,29 @@ impl SolanaExecutor {
                             "[ONCHAIN SOLANA SELL 🚀] Executing {:.1}% partial swap for {} to SOL",
                             sell_ratio_pct, pos.token_symbol
                         );
-                        // Query token account balance and calculate amount
-                        let token_amount_raw = 100_000_000u64; // Token units proxy or RPC fetched
+                        // Query real on-chain token balance
+                        let token_amount_raw = self
+                            .get_raw_token_balance(&user_pubkey, &pos.token_mint)
+                            .await
+                            .unwrap_or(0);
                         let sell_units =
                             ((token_amount_raw as f64) * (sell_ratio_pct / 100.0)) as u64;
-                        if let Ok(quote) = self
-                            .fetch_jupiter_quote(&pos.token_mint, wsol_mint, sell_units.max(1), 150)
-                            .await
-                        {
-                            if let Ok(signed_tx) = self
-                                .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
+                        if sell_units > 0 {
+                            if let Ok(quote) = self
+                                .fetch_jupiter_quote(
+                                    &pos.token_mint,
+                                    wsol_mint,
+                                    sell_units,
+                                    150,
+                                )
                                 .await
                             {
-                                let _ = self.broadcast_tx(&signed_tx).await;
+                                if let Ok(signed_tx) = self
+                                    .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
+                                    .await
+                                {
+                                    let _ = self.broadcast_tx(&signed_tx).await;
+                                }
                             }
                         }
                     }
