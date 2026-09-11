@@ -194,6 +194,43 @@ impl SolanaExecutor {
         Ok(0)
     }
 
+    /// Fetches all SPL and Token-2022 tokens held by user_pubkey with non-zero balance
+    pub async fn get_all_wallet_token_balances(&self, user_pubkey: &str) -> Vec<(String, f64)> {
+        let mut tokens = Vec::new();
+        let program_ids = [
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        ];
+
+        for pid in program_ids {
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    user_pubkey,
+                    {"programId": pid},
+                    {"encoding": "jsonParsed"}
+                ]
+            });
+
+            if let Ok(res) = self.post_rpc(&payload).await {
+                if let Some(accs) = res["result"]["value"].as_array() {
+                    for acc in accs {
+                        if let Some(info) = acc.get("account").and_then(|a| a.get("data")).and_then(|d| d.get("parsed")).and_then(|p| p.get("info")) {
+                            let mint = info.get("mint").and_then(|m| m.as_str()).unwrap_or("").to_string();
+                            let ui_amt = info.get("tokenAmount").and_then(|t| t.get("uiAmount")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            if !mint.is_empty() && ui_amt > 0.000001 {
+                                tokens.push((mint, ui_amt));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        tokens
+    }
+
     /// Fetches a Jupiter Swap quote (v1)
     pub async fn fetch_jupiter_quote(
         &self,

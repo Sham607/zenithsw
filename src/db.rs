@@ -1103,7 +1103,7 @@ impl SmartWalletDb {
                     SUM(amount_usd) as total_usd, 
                     GROUP_CONCAT(DISTINCT wallet_handle) as handles
              FROM wallet_activities
-             WHERE amount_usd > 0.0 AND token_mint != '' AND token_mint != 'NATIVE'
+             WHERE amount_usd > 0.0 AND amount_usd <= 100000.0 AND token_mint != '' AND token_mint != 'NATIVE'
              GROUP BY token_mint
              ORDER BY total_usd DESC, whale_count DESC
              LIMIT ?1",

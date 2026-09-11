@@ -572,13 +572,30 @@ async fn main() -> Result<()> {
             let sol_price_usd = sol_exec_hb.get_sol_price().await;
             let sol_usd_val = wallet_sol_balance * sol_price_usd;
 
-            let open_positions_usd: f64 = active_positions
-                .iter()
-                .map(|p| {
-                    (p.amount_usd * (p.remaining_portion_pct / 100.0))
-                        * (1.0 + p.unrealized_pnl_pct / 100.0)
-                })
-                .sum();
+            // Physical On-Chain Token Valuation across ALL tokens in the wallet
+            let mut total_tokens_usd = 0.0;
+            if !wallet_pubkey.is_empty() {
+                let onchain_tokens = sol_exec_hb.get_all_wallet_token_balances(&wallet_pubkey).await;
+                for (mint, amt) in onchain_tokens {
+                    if let Ok((_, price, _, _)) = SolanaStreamListener::fetch_token_price(&mint).await {
+                        if price > 0.0 {
+                            total_tokens_usd += amt * price;
+                        }
+                    }
+                }
+            }
+
+            let open_positions_usd: f64 = if total_tokens_usd > 0.0 {
+                total_tokens_usd
+            } else {
+                active_positions
+                    .iter()
+                    .map(|p| {
+                        (p.amount_usd * (p.remaining_portion_pct / 100.0))
+                            * (1.0 + p.unrealized_pnl_pct / 100.0)
+                    })
+                    .sum()
+            };
 
             let wallet_equity_usd = sol_usd_val + open_positions_usd;
 

@@ -572,7 +572,7 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
         "Chain",
         "Contract / Mint Address",
         "Whale Cluster",
-        "Total Whale ($)",
+        "Whale 7d Vol ($)",
         "MCap & Upside Potential",
         "Pool Liquidity",
         "Price (USD)",
