@@ -122,8 +122,8 @@ impl IpcServer {
                                 max_price_delta_pct: 5.0,
                                 position_size_usd: 5.0,
                                 stop_loss_pct: 35.0,
-                                take_profit_pct: 50.0,
-                                min_whale_buy_usd: 250.0,
+                                take_profit_pct: 100.0,
+                                min_whale_buy_usd: 150.0,
                                 is_live_mode: true,
                                 wallet_pubkey: String::new(),
                             })
@@ -143,8 +143,8 @@ impl IpcServer {
                                 max_price_delta_pct: 5.0,
                                 position_size_usd: 5.0,
                                 stop_loss_pct: 35.0,
-                                take_profit_pct: 50.0,
-                                min_whale_buy_usd: 250.0,
+                                take_profit_pct: 100.0,
+                                min_whale_buy_usd: 150.0,
                                 is_live_mode: true,
                                 wallet_pubkey: String::new(),
                             }

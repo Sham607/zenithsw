@@ -92,6 +92,8 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         "DRY RUN 🟡"
     };
 
+    let calculated_total_equity = (app.wallet_sol_balance * app.sol_price_usd) + total_pos_usd;
+
     let header_title = format!(
         " ZENITHSW • {} • [{}] • SOL: {:.4} (${:.2}) • POS: ${:.2} • TOTAL EQUITY: ${:.2} • REALIZED: ${:+.2} ",
         mode_str,
@@ -99,7 +101,7 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         app.wallet_sol_balance,
         app.wallet_sol_balance * app.sol_price_usd,
         total_pos_usd,
-        app.wallet_equity_usd,
+        calculated_total_equity,
         app.total_realized_pnl_usd
     );
 
@@ -187,7 +189,7 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         Span::styled(qualified_str, Style::default().fg(Color::Yellow)),
         Span::raw(" | Real Equity: "),
         Span::styled(
-            format!("${:.2}", app.wallet_equity_usd),
+            format!("${:.2}", calculated_total_equity),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -783,9 +785,11 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
         })
         .sum();
 
+    let calculated_total_equity = (app.wallet_sol_balance * app.sol_price_usd) + total_pos_usd;
+
     let pos_title = format!(
         " ACTIVE SHADOW POSITIONS • Real Equity: ${:.2} (SOL: {:.4} @ ${:.1} = ${:.2} | Positions: ${:.2} | Realized: ${:+.2}) ",
-        app.wallet_equity_usd,
+        calculated_total_equity,
         app.wallet_sol_balance,
         app.sol_price_usd,
         app.wallet_sol_balance * app.sol_price_usd,
@@ -892,7 +896,7 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Span::raw(" | Total Real Equity = "),
             Span::styled(
-                format!("${:.2} USD", app.wallet_equity_usd),
+                format!("${:.2} USD", (app.wallet_sol_balance * app.sol_price_usd) + total_pos_usd),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),

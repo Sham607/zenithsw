@@ -422,7 +422,21 @@ impl SolanaExecutor {
                 let prev_usd = existing.amount_usd;
                 let prev_tokens = existing.amount_native;
                 let total_usd = prev_usd + amount_usd;
-                let total_tokens = prev_tokens + new_tokens;
+                // Reconcile total balance directly against on-chain wallet state
+                let maybe_pubkey = self.get_keypair().ok().map(|(_, pk)| pk);
+                let total_tokens = if let Some(pk) = maybe_pubkey {
+                    if let Ok(latest_bal) = self.get_ui_token_balance(&pk, &signal.token_mint).await {
+                        if latest_bal > prev_tokens {
+                            latest_bal
+                        } else {
+                            prev_tokens + new_tokens
+                        }
+                    } else {
+                        prev_tokens + new_tokens
+                    }
+                } else {
+                    prev_tokens + new_tokens
+                };
                 let weighted_avg_entry = if total_tokens > 0.0 {
                     total_usd / total_tokens
                 } else {
@@ -510,8 +524,13 @@ impl SolanaExecutor {
                             .get_raw_token_balance(&user_pubkey, &pos.token_mint)
                             .await
                             .unwrap_or(0);
+                        let effective_wallet_fraction = if pos.remaining_portion_pct > 0.0 {
+                            (sell_ratio_pct / pos.remaining_portion_pct).clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
                         let sell_units =
-                            ((token_amount_raw as f64) * (sell_ratio_pct / 100.0)) as u64;
+                            ((token_amount_raw as f64) * effective_wallet_fraction) as u64;
                         if sell_units > 0 {
                             if let Ok(quote) = self
                                 .fetch_jupiter_quote(

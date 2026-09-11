@@ -360,7 +360,44 @@ impl FomoScraper {
 
             if let Ok(dex_json) = dex_resp.json::<Value>().await {
                 if let Some(pairs) = dex_json.get("pairs").and_then(|p| p.as_array()) {
-                    if let Some(pair) = pairs.first() {
+                    // Multi-pool scanner: filter exact base token matching and find best liquid pool
+                    let mut best_pair_opt: Option<&Value> = None;
+                    let mut max_liq = 0.0;
+
+                    for pair in pairs {
+                        let base_addr = pair
+                            .get("baseToken")
+                            .and_then(|b| b.get("address"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+                        if !base_addr.eq_ignore_ascii_case(&token_addr) {
+                            continue;
+                        }
+
+                        let mut liq: f64 = pair
+                            .get("liquidity")
+                            .and_then(|l| l.get("usd"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let dex_id = pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
+                        if dex_id == "pumpfun" && liq <= 0.0 {
+                            let mcap: f64 = pair
+                                .get("marketCap")
+                                .or_else(|| pair.get("fdv"))
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
+                            if mcap > 0.0 {
+                                liq = mcap * 0.50;
+                            }
+                        }
+
+                        if best_pair_opt.is_none() || liq > max_liq {
+                            max_liq = liq;
+                            best_pair_opt = Some(pair);
+                        }
+                    }
+
+                    if let Some(pair) = best_pair_opt {
                         let symbol = pair
                             .get("baseToken")
                             .and_then(|b| b.get("symbol"))
@@ -394,7 +431,7 @@ impl FomoScraper {
                             .and_then(|p| p.as_str())
                             .and_then(|s| s.parse::<f64>().ok())
                             .unwrap_or(0.0);
-                        let liquidity_usd = pair
+                        let mut liquidity_usd = pair
                             .get("liquidity")
                             .and_then(|l| l.get("usd"))
                             .and_then(|v| v.as_f64())
@@ -404,6 +441,11 @@ impl FomoScraper {
                             .and_then(|m| m.as_f64())
                             .or_else(|| pair.get("fdv").and_then(|f| f.as_f64()))
                             .unwrap_or(0.0);
+
+                        let dex_id = pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
+                        if dex_id == "pumpfun" && liquidity_usd <= 0.0 && market_cap_usd > 0.0 {
+                            liquidity_usd = market_cap_usd * 0.50;
+                        }
 
                         let quote_symbol = pair
                             .get("quoteToken")
@@ -421,7 +463,7 @@ impl FomoScraper {
                             "USDC" | "USDT" | "USD" | "USDG" | "DAI" | "USDS" | "PYUSD" => {
                                 quote_amount
                             }
-                            "SOL" | "WSOL" => quote_amount * 120.0,
+                            "SOL" | "WSOL" => quote_amount * 102.0,
                             "ETH" | "WETH" => quote_amount * 2500.0,
                             _ => quote_amount.min(liquidity_usd * 0.5),
                         };
@@ -432,15 +474,15 @@ impl FomoScraper {
                             continue;
                         }
 
-                        // 2. Strict Price & Minimum Liquidity Filter ($30,000 min liquidity floor)
-                        if price_usd <= 0.0 || liquidity_usd < 30_000.0 {
+                        // 2. Strict Price & Minimum Liquidity Filter
+                        let min_liq_threshold = self.config.min_liquidity_usd.min(10000.0);
+                        if price_usd <= 0.0 || (dex_id != "pumpfun" && liquidity_usd < min_liq_threshold) {
                             let _ = self.db.delete_tracked_token(&token_addr);
                             continue;
                         }
 
-                        // 3. Strict Real Quote Collateral Floor ($15,000 min real USDC/SOL/ETH in pool)
-                        // Destroys single-sided Raydium CLMM spoofed pools (e.g. AKE, BANANAS31 where quote is only $30 USDC)
-                        if real_quote_reserve_usd < 15_000.0 {
+                        // 3. Strict Real Quote Collateral Floor (Anti-CLMM spoof for non-pump pools)
+                        if dex_id != "pumpfun" && liquidity_usd >= 100_000.0 && real_quote_reserve_usd < 5_000.0 {
                             let _ = self.db.delete_tracked_token(&token_addr);
                             continue;
                         }

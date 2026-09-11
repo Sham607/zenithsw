@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-static PRICE_CACHE: OnceLock<RwLock<HashMap<String, (String, f64, f64, Instant)>>> =
+static PRICE_CACHE: OnceLock<RwLock<HashMap<String, (String, f64, f64, f64, Instant)>>> =
     OnceLock::new();
 
-fn get_price_cache() -> &'static RwLock<HashMap<String, (String, f64, f64, Instant)>> {
+fn get_price_cache() -> &'static RwLock<HashMap<String, (String, f64, f64, f64, Instant)>> {
     PRICE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -285,7 +285,7 @@ impl SolanaStreamListener {
         }
 
         let mut execution_price_usd = 0.0;
-        if let Ok((sym, price, _)) = Self::fetch_token_price(&token_mint).await {
+        if let Ok((sym, price, _, _)) = Self::fetch_token_price(&token_mint).await {
             if sym != "UNKNOWN" {
                 token_symbol = sym;
             }
@@ -330,12 +330,12 @@ impl SolanaStreamListener {
     }
 
     /// Fetches live price & aggregated liquidity with multi-pool scanning & in-memory TTL caching (DexScreener + Search Fallback)
-    pub async fn fetch_token_price(mint: &str) -> Result<(String, f64, f64)> {
+    pub async fn fetch_token_price(mint: &str) -> Result<(String, f64, f64, f64)> {
         // Step 1: Check in-memory price cache (TTL 3 seconds)
         if let Ok(cache) = get_price_cache().read() {
-            if let Some((sym, price, liq, ts)) = cache.get(mint) {
+            if let Some((sym, price, liq, mcap, ts)) = cache.get(mint) {
                 if ts.elapsed() < Duration::from_secs(3) {
-                    return Ok((sym.clone(), *price, *liq));
+                    return Ok((sym.clone(), *price, *liq, *mcap));
                 }
             }
         }
@@ -355,6 +355,7 @@ impl SolanaStreamListener {
                         let mut total_liq = 0.0;
                         let mut best_symbol = "TOKEN".to_string();
                         let mut best_price = 0.0;
+                        let mut best_mcap = 0.0;
 
                         for pair in pairs {
                             let base_addr = pair
@@ -386,6 +387,12 @@ impl SolanaStreamListener {
                                 .and_then(|v| v.as_f64())
                                 .unwrap_or(0.0);
 
+                            let mcap: f64 = pair
+                                .get("marketCap")
+                                .or_else(|| pair.get("fdv"))
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
+
                             let quote_sym = pair
                                 .get("quoteToken")
                                 .and_then(|q| q.get("symbol"))
@@ -402,7 +409,7 @@ impl SolanaStreamListener {
                                 "USDC" | "USDT" | "USD" | "USDG" | "DAI" | "USDS" | "PYUSD" => {
                                     quote_amt
                                 }
-                                "SOL" | "WSOL" => quote_amt * 120.0,
+                                "SOL" | "WSOL" => quote_amt * 102.0,
                                 "ETH" | "WETH" => quote_amt * 2500.0,
                                 _ => quote_amt.min(liq * 0.5),
                             };
@@ -418,11 +425,6 @@ impl SolanaStreamListener {
 
                             // For Pump.fun bonding curves where liquidity object is null/0, derive virtual liquidity from marketCap / fdv
                             if dex_id == "pumpfun" && liq <= 0.0 {
-                                let mcap: f64 = pair
-                                    .get("marketCap")
-                                    .or_else(|| pair.get("fdv"))
-                                    .and_then(|v| v.as_f64())
-                                    .unwrap_or(0.0);
                                 if mcap > 0.0 {
                                     liq = mcap * 0.50; // Pump.fun virtual pool reserve ~ 50% of MC
                                 }
@@ -433,11 +435,17 @@ impl SolanaStreamListener {
                             if liq >= max_liq && price > 0.0 {
                                 max_liq = liq;
                                 best_price = price;
+                                if mcap > 0.0 {
+                                    best_mcap = mcap;
+                                }
                                 if !sym.is_empty() {
                                     best_symbol = sym.to_string();
                                 }
                             } else if best_price <= 0.0 && price > 0.0 {
                                 best_price = price;
+                                if mcap > 0.0 && best_mcap <= 0.0 {
+                                    best_mcap = mcap;
+                                }
                                 if !sym.is_empty() {
                                     best_symbol = sym.to_string();
                                 }
@@ -453,11 +461,12 @@ impl SolanaStreamListener {
                                         best_symbol.clone(),
                                         best_price,
                                         effective_liq,
+                                        best_mcap,
                                         Instant::now(),
                                     ),
                                 );
                             }
-                            return Ok((best_symbol, best_price, effective_liq));
+                            return Ok((best_symbol, best_price, effective_liq, best_mcap));
                         }
                     }
                 }
@@ -492,20 +501,25 @@ impl SolanaStreamListener {
                             .and_then(|l| l.get("usd"))
                             .and_then(|v| v.as_f64())
                             .unwrap_or(0.0);
+                        let mcap: f64 = pair
+                            .get("marketCap")
+                            .or_else(|| pair.get("fdv"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
                         if price_usd > 0.0 && liquidity_usd > 0.0 {
                             if let Ok(mut cache) = get_price_cache().write() {
                                 cache.insert(
                                     mint.to_string(),
-                                    (symbol.clone(), price_usd, liquidity_usd, Instant::now()),
+                                    (symbol.clone(), price_usd, liquidity_usd, mcap, Instant::now()),
                                 );
                             }
-                            return Ok((symbol, price_usd, liquidity_usd));
+                            return Ok((symbol, price_usd, liquidity_usd, mcap));
                         }
                     }
                 }
             }
         }
 
-        Ok(("UNKNOWN".to_string(), 0.0, 0.0))
+        Ok(("UNKNOWN".to_string(), 0.0, 0.0, 0.0))
     }
 }

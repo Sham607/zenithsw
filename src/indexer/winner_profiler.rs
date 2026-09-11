@@ -137,22 +137,9 @@ impl WinnerProfiler {
                             (52.0 + ((tx_count % 7) as f64 * 1.1)).clamp(50.0, 60.0)
                         };
 
-                        // Realized PnL Priority Tiering: High real PnL is primary criterion
-                        let tier = if estimated_pnl_usd >= 50_000.0 || sol_bal >= 10.0 {
-                            WalletTier::TierS
-                        } else if estimated_pnl_usd >= 10_000.0 || sol_bal >= 2.0 {
-                            WalletTier::TierA
-                        } else {
-                            WalletTier::TierB
-                        };
-
-                        let reputation_score = if tier == WalletTier::TierS {
-                            90.0
-                        } else if tier == WalletTier::TierA {
-                            75.0
-                        } else {
-                            (40.0 + (sol_bal * 2.0).min(20.0)).clamp(30.0, 59.0)
-                        };
+                        // Auto-discovered DEX buyers are strictly quarantined to Tier-B (Monitor Only)
+                        let tier = WalletTier::TierB;
+                        let reputation_score = (40.0 + (sol_bal * 2.0).min(15.0)).clamp(30.0, 55.0);
 
                         let handle = format!(
                             "sol_{}_{}",
@@ -200,22 +187,9 @@ impl WinnerProfiler {
                             (53.0 + ((tx_count % 7) as f64 * 1.1)).clamp(50.0, 60.0)
                         };
 
-                        // Realized PnL Priority Tiering: High real PnL is primary criterion
-                        let tier = if estimated_pnl_usd >= 50_000.0 || eth_bal >= 2.0 {
-                            WalletTier::TierS
-                        } else if estimated_pnl_usd >= 10_000.0 || eth_bal >= 0.5 {
-                            WalletTier::TierA
-                        } else {
-                            WalletTier::TierB
-                        };
-
-                        let reputation_score = if tier == WalletTier::TierS {
-                            90.0
-                        } else if tier == WalletTier::TierA {
-                            75.0
-                        } else {
-                            (40.0 + (eth_bal * 10.0).min(20.0)).clamp(30.0, 59.0)
-                        };
+                        // Auto-discovered DEX buyers are strictly quarantined to Tier-B (Monitor Only)
+                        let tier = WalletTier::TierB;
+                        let reputation_score = (40.0 + (eth_bal * 10.0).min(15.0)).clamp(30.0, 55.0);
 
                         let handle = format!(
                             "rh_{}_{}",

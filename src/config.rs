@@ -32,7 +32,7 @@ pub struct Config {
     pub max_market_cap_usd: f64,  // Max $20M market cap
     pub trailing_stop_pct: f64,   // 10% trailing stop
     pub stop_loss_pct: f64,       // 15% stop loss
-    pub take_profit_pct: f64,     // 50% take profit
+    pub take_profit_pct: f64,     // 100% take profit trigger (50% partial exit)
     pub shadow_exit_enabled: bool, // Mirror sell when whale dumps
     pub confluence_mode: String,  // "TIER_S_OR_DUAL_A"
     pub dry_run: bool,
@@ -108,7 +108,7 @@ impl Config {
         let min_whale_buy_usd = env::var("MIN_WHALE_BUY_USD")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(250.0);
+            .unwrap_or(150.0);
 
         let max_price_impact_pct = env::var("MAX_PRICE_IMPACT_PCT")
             .ok()
@@ -138,7 +138,7 @@ impl Config {
         let take_profit_pct = env::var("TAKE_PROFIT_PCT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(50.0);
+            .unwrap_or(100.0);
 
         let shadow_exit_enabled = env::var("SHADOW_EXIT_ENABLED")
             .map(|v| v.to_lowercase() == "true")

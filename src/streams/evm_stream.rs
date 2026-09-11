@@ -200,7 +200,7 @@ impl EvmStreamListener {
             let mut token_symbol = asset.to_string();
             let mut execution_price_usd = 0.0;
 
-            if let Ok((sym, price, _)) = SolanaStreamListener::fetch_token_price(raw_contract).await
+            if let Ok((sym, price, _, _)) = SolanaStreamListener::fetch_token_price(raw_contract).await
             {
                 if sym != "UNKNOWN" && !sym.is_empty() {
                     token_symbol = sym;

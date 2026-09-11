@@ -12,7 +12,7 @@ use zenithsw::gating::confluence::ConfluenceEngine;
 use zenithsw::indexer::SmartMoneyIndexer;
 use zenithsw::ingestion::fomo_scraper::FomoScraper;
 use zenithsw::ipc::{IpcMessage, IpcServer};
-use zenithsw::models::{ActivityType, Chain, ShadowPosition, WalletTier};
+use zenithsw::models::{ActivityType, Chain, WalletTier};
 use zenithsw::streams::evm_stream::EvmStreamListener;
 use zenithsw::streams::fomo_api_stream::FomoApiStreamListener;
 use zenithsw::streams::solana_stream::SolanaStreamListener;
@@ -257,24 +257,25 @@ async fn main() -> Result<()> {
                                 }
                             }
                         } else if act.activity_type == ActivityType::Buy {
-                            // Fetch real-time pool price & liquidity across Solana/EVM
-                            let (current_price, pool_liq) =
+                            // Fetch real-time pool price, liquidity & market cap across Solana/EVM
+                            let (current_price, pool_liq, live_mcap) =
                                 SolanaStreamListener::fetch_token_price(&act.token_mint)
                                     .await
-                                    .map(|(_, p, l)| (p, l))
-                                    .unwrap_or((act.execution_price_usd, 35000.0));
+                                    .map(|(_, p, l, m)| (p, l, m))
+                                    .unwrap_or((act.execution_price_usd, 35000.0, 0.0));
 
                             let mut act_to_eval = act.clone();
                             if act_to_eval.execution_price_usd <= 0.0 && current_price > 0.0 {
                                 act_to_eval.execution_price_usd = current_price;
                             }
 
-                            // Strict Gating & Confluence Evaluation
-                            if let Ok(sig) = confluence_stream.evaluate_activity(
+                            // Strict Gating & Confluence Evaluation with Live Market Cap
+                            if let Ok(sig) = confluence_stream.evaluate_activity_with_mcap(
                                 &act_to_eval,
                                 &w,
                                 current_price,
                                 pool_liq,
+                                live_mcap,
                             ) {
                                 let _ = ipc_stream.broadcast(&IpcMessage::SignalBroadcast {
                                     signal: sig.clone(),
@@ -338,8 +339,8 @@ async fn main() -> Result<()> {
                     let live_price = match SolanaStreamListener::fetch_token_price(&pos.token_mint)
                         .await
                     {
-                        Ok((_, price, liquidity)) if price > 0.0 && liquidity > 0.0 => price,
-                        Ok((symbol, price, liquidity)) => {
+                        Ok((_, price, liquidity, _)) if price > 0.0 && liquidity > 0.0 => price,
+                        Ok((symbol, price, liquidity, _)) => {
                             eprintln!(
                                 "[PRICE UPDATE SKIP ⚠️] {} returned invalid market data (price=${:.8}, liquidity=${:.2}); keeping last price with no refresh.",
                                 if symbol.is_empty() { &pos.token_symbol } else { &symbol },
@@ -376,12 +377,12 @@ async fn main() -> Result<()> {
                         pos.last_update = Utc::now();
                         let _ = db_pos_tracker.upsert_position(pos);
 
-                        // 1. Independent Auto Take Profit (50% Partial Exit at +50% / +100% PnL to free-roll initial capital)
+                        // 1. Tier 1 Auto Take Profit (Sell 50% of initial position at +100% PnL to free-roll initial capital)
                         if pos.unrealized_pnl_pct >= config_pos.take_profit_pct
-                            && pos.status == "OPEN"
+                            && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
                             && pos.remaining_portion_pct >= 90.0
                         {
-                            println!("[AUTO-TP +{:.0}% 🎯] Position {} ({}) reached +{:.1}% >= +{:.0}%! Executing 50% partial exit to secure capital (Free-Roll Moonbag)!",
+                            println!("[AUTO-TP 1 (+{:.0}%) 🎯] Position {} ({}) reached +{:.1}% >= +{:.0}%! Selling 50% to secure capital (Free-Roll Mode)!",
                                 config_pos.take_profit_pct, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.take_profit_pct);
                             match pos.chain {
                                 Chain::Solana => {
@@ -389,7 +390,7 @@ async fn main() -> Result<()> {
                                         .execute_partial_shadow_sell(
                                             &pos.id,
                                             50.0,
-                                            "AUTO_TP_PARTIAL_FREE_ROLL",
+                                            "AUTO_TP_50_FREE_ROLL",
                                             live_price,
                                         )
                                         .await;
@@ -399,7 +400,7 @@ async fn main() -> Result<()> {
                                         .execute_partial_shadow_sell(
                                             &pos.id,
                                             50.0,
-                                            "AUTO_TP_PARTIAL_FREE_ROLL",
+                                            "AUTO_TP_50_FREE_ROLL",
                                             live_price,
                                         )
                                         .await;
@@ -407,12 +408,80 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // 2. Trailing Profit-Lock Floor on Moonbag (+100% -> Floor +25.0%)
-                        if pos.status == "PARTIAL_EXIT"
+                        // 2. Tier 2 Moonbag Take Profit (Sell 25% of initial at +300% PnL / 4x price, leaving 25% runner)
+                        let tp2_target_pnl = 300.0;
+                        if pos.unrealized_pnl_pct >= tp2_target_pnl
+                            && pos.status == "PARTIAL_EXIT"
+                            && pos.remaining_portion_pct > 35.0
                             && pos.remaining_portion_pct <= 55.0
-                            && pos.unrealized_pnl_pct <= 25.0
                         {
-                            println!("[PROFIT-LOCK FLOOR 🛡️] Position {} ({}) moonbag dropped to +{:.1}% <= +25.0%! Closing remaining portion to lock gains!", pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
+                            println!("[AUTO-TP 2 (+{:.0}%) 🚀] Position {} ({}) hit +{:.1}%! Selling 25% of initial position to lock moonbag gains!",
+                                tp2_target_pnl, pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
+                            match pos.chain {
+                                Chain::Solana => {
+                                    let _ = sol_exec_pos
+                                        .execute_partial_shadow_sell(
+                                            &pos.id,
+                                            25.0,
+                                            "AUTO_TP_25_RUNNER_LOCK",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
+                                _ => {
+                                    let _ = evm_exec_pos
+                                        .execute_partial_shadow_sell(
+                                            &pos.id,
+                                            25.0,
+                                            "AUTO_TP_25_RUNNER_LOCK",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+
+                        // 3. Tier 3 Catastrophic Peak Drawdown Guard on Runner / Moonbag
+                        // If price drops > 50% from peak after a 2x+ pump, dump remaining portion to prevent roundtripping to zero
+                        if pos.status == "PARTIAL_EXIT"
+                            && pos.peak_price >= pos.entry_price * 2.0
+                            && pos.current_price <= pos.peak_price * 0.50
+                            && pos.remaining_portion_pct <= 55.0
+                        {
+                            println!("[PEAK DRAWDOWN GUARD 🛡️] Position {} ({}) dropped >50% from peak (${:.6} -> ${:.6})! Dumping remaining {:.0}% to lock profit!",
+                                pos.id, pos.token_symbol, pos.peak_price, pos.current_price, pos.remaining_portion_pct);
+                            match pos.chain {
+                                Chain::Solana => {
+                                    let _ = sol_exec_pos
+                                        .execute_shadow_sell(
+                                            &pos.id,
+                                            "PEAK_DRAWDOWN_GUARD_EXIT",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
+                                _ => {
+                                    let _ = evm_exec_pos
+                                        .execute_shadow_sell(
+                                            &pos.id,
+                                            "PEAK_DRAWDOWN_GUARD_EXIT",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+
+                        // 4. Profit-Lock Floor on Moonbag (+100% -> Floor +20.0%)
+                        // STRICT SAFETY: Must have reached at least +100% PnL initially and current PnL must be positive (> +5.0%)
+                        if pos.status == "PARTIAL_EXIT"
+                            && pos.peak_price >= pos.entry_price * 2.0
+                            && pos.unrealized_pnl_pct <= 20.0
+                            && pos.unrealized_pnl_pct >= 5.0
+                            && pos.remaining_portion_pct <= 55.0
+                        {
+                            println!("[PROFIT-LOCK FLOOR 🛡️] Position {} ({}) moonbag dropped to +{:.1}%! Closing remaining portion to guarantee green trade!",
+                                pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
                             match pos.chain {
                                 Chain::Solana => {
                                     let _ = sol_exec_pos
@@ -435,7 +504,7 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // 3. Emergency Hard SL Trigger (-35.0%) to prevent -99.9% rug pull wipeouts
+                        // 5. Emergency Hard SL Trigger (-35.0%) to prevent -99.9% rug pull wipeouts
                         if pos.unrealized_pnl_pct <= -config_pos.stop_loss_pct && pos.status != "CLOSED" {
                             println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) hit {:.1}% <= -{:.1}%! Force closing immediately to protect capital!",
                                 pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct);

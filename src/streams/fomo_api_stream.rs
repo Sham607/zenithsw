@@ -180,7 +180,7 @@ impl FomoApiStreamListener {
                 };
 
                 let mut execution_price_usd = 0.0;
-                if let Ok((sym, price, _)) =
+                if let Ok((sym, price, _, _)) =
                     crate::streams::solana_stream::SolanaStreamListener::fetch_token_price(
                         &token_mint,
                     )

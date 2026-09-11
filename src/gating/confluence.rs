@@ -22,6 +22,17 @@ impl ConfluenceEngine {
         current_pool_price: f64,
         pool_liquidity_usd: f64,
     ) -> Result<ShadowSignal> {
+        self.evaluate_activity_with_mcap(activity, wallet, current_pool_price, pool_liquidity_usd, 0.0)
+    }
+
+    pub fn evaluate_activity_with_mcap(
+        &self,
+        activity: &WalletActivity,
+        wallet: &SmartWallet,
+        current_pool_price: f64,
+        pool_liquidity_usd: f64,
+        live_market_cap_usd: f64,
+    ) -> Result<ShadowSignal> {
         let now = Utc::now();
         let mut is_passed = true;
         let mut rejection_reason = None;
@@ -209,38 +220,61 @@ impl ConfluenceEngine {
         }
 
         // Gating Check A3: Market Cap Range Gate ($50k Min to $20M Max).
-        // Fail closed: a missing/zero market-cap snapshot is not evidence of eligibility.
-        match self.db.get_tracked_token_by_mint(&activity.token_mint) {
-            Ok(Some(tracked)) if tracked.market_cap_usd > 0.0 => {
-                if tracked.market_cap_usd < self.config.min_market_cap_usd {
-                    is_passed = false;
-                    if rejection_reason.is_none() {
-                        rejection_reason = Some(format!(
-                            "REJECTED_MARKET_CAP_TOO_LOW (${:.0} < ${:.0})",
-                            tracked.market_cap_usd, self.config.min_market_cap_usd
-                        ));
-                    }
-                } else if tracked.market_cap_usd > self.config.max_market_cap_usd {
-                    is_passed = false;
-                    if rejection_reason.is_none() {
-                        rejection_reason = Some(format!(
-                            "REJECTED_MARKET_CAP_TOO_HIGH (${:.0} > ${:.0})",
-                            tracked.market_cap_usd, self.config.max_market_cap_usd
-                        ));
-                    }
-                }
-            }
-            Ok(Some(_)) | Ok(None) | Err(_) => {
+        // Check live market cap from DexScreener first, fallback to DB snapshot.
+        let effective_mcap = if live_market_cap_usd > 0.0 {
+            live_market_cap_usd
+        } else {
+            self.db
+                .get_tracked_token_by_mint(&activity.token_mint)
+                .ok()
+                .flatten()
+                .map(|t| t.market_cap_usd)
+                .unwrap_or(0.0)
+        };
+
+        if effective_mcap > 0.0 {
+            if effective_mcap < self.config.min_market_cap_usd {
                 is_passed = false;
                 if rejection_reason.is_none() {
-                    rejection_reason = Some("REJECTED_MARKET_CAP_UNVERIFIED".to_string());
+                    rejection_reason = Some(format!(
+                        "REJECTED_MARKET_CAP_TOO_LOW (${:.0} < ${:.0})",
+                        effective_mcap, self.config.min_market_cap_usd
+                    ));
                 }
+            } else if effective_mcap > self.config.max_market_cap_usd {
+                is_passed = false;
+                if rejection_reason.is_none() {
+                    rejection_reason = Some(format!(
+                        "REJECTED_MARKET_CAP_TOO_HIGH (${:.0} > ${:.0})",
+                        effective_mcap, self.config.max_market_cap_usd
+                    ));
+                }
+            }
+        } else {
+            is_passed = false;
+            if rejection_reason.is_none() {
+                rejection_reason = Some("REJECTED_MARKET_CAP_UNVERIFIED".to_string());
             }
         }
 
-        // Gating Check B: Multi-Wallet Confluence Rule
-        // Tier-S & Tier-A (Rank 1-15): Direct copy execution
-        // Tier-B (Rank >15): Passive monitoring only, requires >= 2 multi-wallet confluence
+        // Gating Check B: Strict Execution Whitelist Guard
+        // 1. Unverified automated sources (Cluster Detective, On-Chain Indexer) are strictly blocked from execution
+        if wallet.source.contains("CLUSTER")
+            || wallet.source.contains("DETECTIVE")
+            || wallet.source.contains("INDEXER")
+        {
+            is_passed = false;
+            if rejection_reason.is_none() {
+                rejection_reason = Some(format!(
+                    "REJECTED_UNVERIFIED_INDEXER_OR_CLUSTER (@{} source: {})",
+                    wallet.handle, wallet.source
+                ));
+            }
+        }
+
+        // 2. Multi-Wallet Confluence Rule:
+        // Tier-S & Tier-A: Direct copy execution
+        // Tier-B: Passive monitoring only, requires >= 2 multi-wallet confluence
         let confluence_count = self
             .db
             .count_recent_buyers_for_mint(&activity.token_mint, 300)
