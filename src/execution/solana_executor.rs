@@ -75,6 +75,37 @@ impl SolanaExecutor {
         Ok((signing_key, pubkey_b58))
     }
 
+    /// Helper to send RPC requests with automatic multi-endpoint fallback
+    pub async fn post_rpc(&self, payload: &Value) -> Result<Value> {
+        let rpcs = [
+            &self.config.solana_rpc_url,
+            "https://api.mainnet-beta.solana.com",
+            "https://solana-rpc.publicnode.com",
+        ];
+
+        let mut last_err = anyhow!("All RPC endpoints failed");
+        for rpc in rpcs {
+            if rpc.trim().is_empty() {
+                continue;
+            }
+            match self.client.post(rpc).json(payload).send().await {
+                Ok(res) => {
+                    if let Ok(json) = res.json::<Value>().await {
+                        if json.get("error").is_none() && json.get("result").is_some() {
+                            return Ok(json);
+                        } else if let Some(err) = json.get("error") {
+                            last_err = anyhow!("RPC ({}) Error: {}", rpc, err);
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = anyhow!("RPC ({}) Network Error: {}", rpc, e);
+                }
+            }
+        }
+        Err(last_err)
+    }
+
     /// Fetches native SOL balance via Solana RPC
     pub async fn get_native_balance(&self, pubkey: &str) -> Result<f64> {
         let payload = serde_json::json!({
@@ -84,14 +115,7 @@ impl SolanaExecutor {
             "params": [pubkey]
         });
 
-        let res = self
-            .client
-            .post(&self.config.solana_rpc_url)
-            .json(&payload)
-            .send()
-            .await?;
-
-        let res_json: Value = res.json().await?;
+        let res_json = self.post_rpc(&payload).await?;
         if let Some(lamports) = res_json["result"]["value"].as_f64() {
             Ok(lamports / 1_000_000_000.0)
         } else {
@@ -129,13 +153,7 @@ impl SolanaExecutor {
             ]
         });
 
-        let res = self
-            .client
-            .post(&self.config.solana_rpc_url)
-            .json(&payload)
-            .send()
-            .await?;
-        let json: Value = res.json().await?;
+        let json = self.post_rpc(&payload).await?;
         if let Some(accs) = json["result"]["value"].as_array() {
             if let Some(first) = accs.first() {
                 if let Some(amt_str) =
@@ -219,9 +237,8 @@ impl SolanaExecutor {
         Ok(signed_tx_base64)
     }
 
-    /// Broadcasts signed transaction via Helius RPC & Jito Anti-MEV Bundles
+    /// Broadcasts signed transaction via Multi-RPC & Jito Anti-MEV Bundles
     pub async fn broadcast_tx(&self, signed_base64: &str) -> Result<String> {
-        // 1. Direct Helius RPC broadcast
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -237,24 +254,13 @@ impl SolanaExecutor {
             ]
         });
 
-        let res = self
-            .client
-            .post(&self.config.solana_rpc_url)
-            .json(&payload)
-            .send()
-            .await?;
-
-        let res_json: Value = res.json().await?;
-        if let Some(err) = res_json.get("error") {
-            return Err(anyhow!("RPC Broadcast error: {}", err));
-        }
-
+        let res_json = self.post_rpc(&payload).await?;
         let tx_signature = res_json["result"]
             .as_str()
-            .unwrap_or("UNKNOWN_SIG")
+            .ok_or_else(|| anyhow!("Invalid RPC sendTransaction response: {:?}", res_json))?
             .to_string();
 
-        // 2. Dual Broadcast to Jito Anti-MEV Block Engine
+        // Dual Broadcast to Jito Anti-MEV Block Engine
         let jito_url = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
         let jito_payload = serde_json::json!({
             "jsonrpc": "2.0",
@@ -346,15 +352,23 @@ impl SolanaExecutor {
                                 }
                                 Err(e) => {
                                     eprintln!("[ONCHAIN BROADCAST FAILED ❌] {}", e);
+                                    return Ok(None);
                                 }
                             },
-                            Err(e) => eprintln!("[JUPITER TX BUILD FAILED ❌] {}", e),
+                            Err(e) => {
+                                eprintln!("[JUPITER TX BUILD FAILED ❌] {}", e);
+                                return Ok(None);
+                            }
                         }
                     }
-                    Err(e) => eprintln!("[JUPITER QUOTE FAILED ❌] {}", e),
+                    Err(e) => {
+                        eprintln!("[JUPITER QUOTE FAILED ❌] {}", e);
+                        return Ok(None);
+                    }
                 }
             } else {
-                println!("[SIMULATION MODE 🧪] No Solana private key found. Recording paper shadow position.");
+                eprintln!("[LIVE EXECUTION ERROR ❌] No valid Solana private key found. Refusing trade.");
+                return Ok(None);
             }
         } else {
             println!(
