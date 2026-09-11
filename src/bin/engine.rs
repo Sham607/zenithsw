@@ -317,14 +317,16 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Task 3: Live Position Lifecycle & Real-Time Price Tracker Worker (Whale Mirror + Emergency Hard SL -20%)
+    // Task 3: Live Position Lifecycle & Real-Time Price Tracker Worker (Whale Mirror + Dynamic Hard SL)
     let db_pos_tracker = db.clone();
     let ipc_pos_tracker = ipc_server.clone();
     let sol_exec_pos = sol_exec.clone();
     let evm_exec_pos = evm_exec.clone();
+    let config_pos = config.clone();
 
     tokio::spawn(async move {
-        println!("[POSITION TRACKER] Position & Floating PnL Tracker online (Whale Mirror + Emergency Hard SL -20% active)");
+        println!("[POSITION TRACKER] Position & Floating PnL Tracker online (SL: -{:.1}%, TP: +{:.1}%)",
+            config_pos.stop_loss_pct, config_pos.take_profit_pct);
         loop {
             if let Ok(mut positions) = db_pos_tracker.get_active_positions() {
                 for pos in &mut positions {
@@ -374,19 +376,20 @@ async fn main() -> Result<()> {
                         pos.last_update = Utc::now();
                         let _ = db_pos_tracker.upsert_position(pos);
 
-                        // 1. Independent Auto Take Profit (50% Partial Exit at +100% PnL to free-roll initial capital)
-                        if pos.unrealized_pnl_pct >= 100.0
+                        // 1. Independent Auto Take Profit (50% Partial Exit at +50% / +100% PnL to free-roll initial capital)
+                        if pos.unrealized_pnl_pct >= config_pos.take_profit_pct
                             && pos.status == "OPEN"
                             && pos.remaining_portion_pct >= 90.0
                         {
-                            println!("[AUTO-TP +100% 🎯] Position {} ({}) reached +{:.1}% >= +100.0%! Executing 50% partial exit to secure initial capital (Free-Roll Moonbag)!", pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
+                            println!("[AUTO-TP +{:.0}% 🎯] Position {} ({}) reached +{:.1}% >= +{:.0}%! Executing 50% partial exit to secure capital (Free-Roll Moonbag)!",
+                                config_pos.take_profit_pct, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.take_profit_pct);
                             match pos.chain {
                                 Chain::Solana => {
                                     let _ = sol_exec_pos
                                         .execute_partial_shadow_sell(
                                             &pos.id,
                                             50.0,
-                                            "AUTO_TP_100PCT_FREE_ROLL",
+                                            "AUTO_TP_PARTIAL_FREE_ROLL",
                                             live_price,
                                         )
                                         .await;
@@ -396,7 +399,7 @@ async fn main() -> Result<()> {
                                         .execute_partial_shadow_sell(
                                             &pos.id,
                                             50.0,
-                                            "AUTO_TP_100PCT_FREE_ROLL",
+                                            "AUTO_TP_PARTIAL_FREE_ROLL",
                                             live_price,
                                         )
                                         .await;
@@ -432,9 +435,10 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // 3. Emergency Hard SL Trigger (-20.0%) to prevent -99.9% rug pull wipeouts
-                        if pos.unrealized_pnl_pct <= -20.0 && pos.status != "CLOSED" {
-                            println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) hit {:.1}% <= -20.0%! Force closing immediately to protect capital!", pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
+                        // 3. Emergency Hard SL Trigger (-35.0%) to prevent -99.9% rug pull wipeouts
+                        if pos.unrealized_pnl_pct <= -config_pos.stop_loss_pct && pos.status != "CLOSED" {
+                            println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) hit {:.1}% <= -{:.1}%! Force closing immediately to protect capital!",
+                                pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct);
                             match pos.chain {
                                 Chain::Solana => {
                                     let _ = sol_exec_pos
@@ -472,6 +476,8 @@ async fn main() -> Result<()> {
     // Task 4: Heartbeat & IPC Metrics Broadcast
     let db_heartbeat = db.clone();
     let ipc_heartbeat = ipc_server.clone();
+    let sol_exec_hb = sol_exec.clone();
+    let config_hb = config.clone();
     let start_time = Utc::now();
     tokio::spawn(async move {
         let mut sync_tick = 0u64;
@@ -483,10 +489,34 @@ async fn main() -> Result<()> {
                 .map(|w| w.len())
                 .unwrap_or(0);
             let qualified_wallets = db_heartbeat.get_qualified_wallets().unwrap_or_default();
-            let active_positions_count = db_heartbeat
-                .get_active_positions()
-                .map(|p: Vec<ShadowPosition>| p.len())
-                .unwrap_or(0);
+            let active_positions = db_heartbeat.get_active_positions().unwrap_or_default();
+            let active_positions_count = active_positions.len();
+
+            // Calculate real on-chain wallet balances & portfolio USD
+            let (wallet_pubkey, wallet_sol_balance) = if let Ok((_, pubkey)) = sol_exec_hb.get_keypair() {
+                let bal = sol_exec_hb.get_native_balance(&pubkey).await.unwrap_or(0.0);
+                (pubkey, bal)
+            } else {
+                (String::new(), 0.0)
+            };
+
+            let sol_price_usd = sol_exec_hb.get_sol_price().await;
+            let sol_usd_val = wallet_sol_balance * sol_price_usd;
+
+            let open_positions_usd: f64 = active_positions
+                .iter()
+                .map(|p| {
+                    (p.amount_usd * (p.remaining_portion_pct / 100.0))
+                        * (1.0 + p.unrealized_pnl_pct / 100.0)
+                })
+                .sum();
+
+            let wallet_equity_usd = sol_usd_val + open_positions_usd;
+
+            let total_realized_pnl_usd: f64 = db_heartbeat
+                .get_recent_trades(500)
+                .map(|trades| trades.iter().map(|t| t.pnl_usd).sum())
+                .unwrap_or(0.0);
 
             let hb = IpcMessage::Heartbeat {
                 uptime_secs,
@@ -495,6 +525,18 @@ async fn main() -> Result<()> {
                 base_latency_ms: 45,
                 tracked_wallets_count: total_tracked_count,
                 active_positions_count,
+                wallet_sol_balance,
+                sol_price_usd,
+                wallet_equity_usd,
+                total_realized_pnl_usd,
+                min_liquidity_usd: config_hb.min_liquidity_usd,
+                max_price_delta_pct: config_hb.max_price_delta_pct,
+                position_size_usd: config_hb.position_size_usd,
+                stop_loss_pct: config_hb.stop_loss_pct,
+                take_profit_pct: config_hb.take_profit_pct,
+                min_whale_buy_usd: config_hb.min_whale_buy_usd,
+                is_live_mode: !config_hb.dry_run,
+                wallet_pubkey,
             };
             let _ = ipc_heartbeat.broadcast(&hb);
 

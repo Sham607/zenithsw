@@ -18,6 +18,30 @@ pub enum IpcMessage {
         base_latency_ms: u64,
         tracked_wallets_count: usize,
         active_positions_count: usize,
+        #[serde(default)]
+        wallet_sol_balance: f64,
+        #[serde(default)]
+        sol_price_usd: f64,
+        #[serde(default)]
+        wallet_equity_usd: f64,
+        #[serde(default)]
+        total_realized_pnl_usd: f64,
+        #[serde(default)]
+        min_liquidity_usd: f64,
+        #[serde(default)]
+        max_price_delta_pct: f64,
+        #[serde(default)]
+        position_size_usd: f64,
+        #[serde(default)]
+        stop_loss_pct: f64,
+        #[serde(default)]
+        take_profit_pct: f64,
+        #[serde(default)]
+        min_whale_buy_usd: f64,
+        #[serde(default)]
+        is_live_mode: bool,
+        #[serde(default)]
+        wallet_pubkey: String,
     },
     WalletSync {
         wallets: Vec<SmartWallet>,
@@ -90,6 +114,18 @@ impl IpcServer {
                                 base_latency_ms: 32,
                                 tracked_wallets_count: 100,
                                 active_positions_count: 0,
+                                wallet_sol_balance: 0.0,
+                                sol_price_usd: 100.0,
+                                wallet_equity_usd: 0.0,
+                                total_realized_pnl_usd: 0.0,
+                                min_liquidity_usd: 30000.0,
+                                max_price_delta_pct: 5.0,
+                                position_size_usd: 5.0,
+                                stop_loss_pct: 35.0,
+                                take_profit_pct: 50.0,
+                                min_whale_buy_usd: 250.0,
+                                is_live_mode: true,
+                                wallet_pubkey: String::new(),
                             })
                         } else {
                             IpcMessage::Heartbeat {
@@ -99,6 +135,18 @@ impl IpcServer {
                                 base_latency_ms: 32,
                                 tracked_wallets_count: 100,
                                 active_positions_count: 0,
+                                wallet_sol_balance: 0.0,
+                                sol_price_usd: 100.0,
+                                wallet_equity_usd: 0.0,
+                                total_realized_pnl_usd: 0.0,
+                                min_liquidity_usd: 30000.0,
+                                max_price_delta_pct: 5.0,
+                                position_size_usd: 5.0,
+                                stop_loss_pct: 35.0,
+                                take_profit_pct: 50.0,
+                                min_whale_buy_usd: 250.0,
+                                is_live_mode: true,
+                                wallet_pubkey: String::new(),
                             }
                         }
                     };

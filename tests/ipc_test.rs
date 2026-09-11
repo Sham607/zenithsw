@@ -33,6 +33,18 @@ async fn test_ipc_broadcast_and_client_roundtrip() {
         base_latency_ms: 35,
         tracked_wallets_count: 5,
         active_positions_count: 1,
+        wallet_sol_balance: 0.25,
+        sol_price_usd: 100.0,
+        wallet_equity_usd: 35.0,
+        total_realized_pnl_usd: 5.0,
+        min_liquidity_usd: 30000.0,
+        max_price_delta_pct: 5.0,
+        position_size_usd: 5.0,
+        stop_loss_pct: 35.0,
+        take_profit_pct: 50.0,
+        min_whale_buy_usd: 250.0,
+        is_live_mode: true,
+        wallet_pubkey: "bLiHABX6WnneYX94mqR7eUh9VsMvZB23772eWAtvvdk".to_string(),
     };
 
     server.broadcast(&test_hb).unwrap();

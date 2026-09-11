@@ -50,6 +50,15 @@ async fn main() -> Result<()> {
     });
 
     let app = Arc::new(Mutex::new(App::new()));
+    if let Ok(mut state) = app.lock() {
+        state.min_liquidity_usd = config.min_liquidity_usd;
+        state.max_price_delta_pct = config.max_price_delta_pct;
+        state.position_size_usd = config.position_size_usd;
+        state.stop_loss_pct = config.stop_loss_pct;
+        state.take_profit_pct = config.take_profit_pct;
+        state.min_whale_buy_usd = config.min_whale_buy_usd;
+        state.is_live_mode = !config.dry_run;
+    }
 
     // Helper to filter data by active chains
     let enable_sol = config.enable_solana;
@@ -189,14 +198,44 @@ async fn main() -> Result<()> {
                             state.is_connected_ipc = true;
                             match msg {
                                 IpcMessage::Heartbeat {
+                                    uptime_secs,
                                     solana_latency_ms,
                                     arbitrum_latency_ms,
                                     base_latency_ms,
+                                    wallet_sol_balance,
+                                    sol_price_usd,
+                                    wallet_equity_usd,
+                                    total_realized_pnl_usd,
+                                    min_liquidity_usd,
+                                    max_price_delta_pct,
+                                    position_size_usd,
+                                    stop_loss_pct,
+                                    take_profit_pct,
+                                    min_whale_buy_usd,
+                                    is_live_mode,
+                                    wallet_pubkey,
                                     ..
                                 } => {
+                                    state.uptime_secs = uptime_secs;
                                     state.solana_latency_ms = solana_latency_ms;
                                     state.arbitrum_latency_ms = arbitrum_latency_ms;
                                     state.base_latency_ms = base_latency_ms;
+                                    if wallet_sol_balance > 0.0 || wallet_equity_usd > 0.0 {
+                                        state.wallet_sol_balance = wallet_sol_balance;
+                                        state.sol_price_usd = sol_price_usd;
+                                        state.wallet_equity_usd = wallet_equity_usd;
+                                        state.total_realized_pnl_usd = total_realized_pnl_usd;
+                                    }
+                                    if min_liquidity_usd > 0.0 {
+                                        state.min_liquidity_usd = min_liquidity_usd;
+                                        state.max_price_delta_pct = max_price_delta_pct;
+                                        state.position_size_usd = position_size_usd;
+                                        state.stop_loss_pct = stop_loss_pct;
+                                        state.take_profit_pct = take_profit_pct;
+                                        state.min_whale_buy_usd = min_whale_buy_usd;
+                                        state.is_live_mode = is_live_mode;
+                                        state.wallet_pubkey = wallet_pubkey;
+                                    }
                                 }
                                 IpcMessage::WalletSync { wallets } => {
                                     state.wallets = wallets;

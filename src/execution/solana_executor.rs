@@ -52,7 +52,7 @@ impl SolanaExecutor {
     }
 
     /// Derives Solana SigningKey and Base58 Public Key from private key in config
-    fn get_keypair(&self) -> Result<(SigningKey, String)> {
+    pub fn get_keypair(&self) -> Result<(SigningKey, String)> {
         let pk_str = self
             .config
             .solana_private_key

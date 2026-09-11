@@ -68,11 +68,46 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         ]),
     ];
 
+    let total_pos_usd: f64 = app
+        .positions
+        .iter()
+        .map(|p| {
+            (p.amount_usd * (p.remaining_portion_pct / 100.0))
+                * (1.0 + p.unrealized_pnl_pct / 100.0)
+        })
+        .sum();
+
+    let pubkey_short = if app.wallet_pubkey.len() > 10 {
+        format!(
+            "{}...{}",
+            &app.wallet_pubkey[..4],
+            &app.wallet_pubkey[app.wallet_pubkey.len() - 4..]
+        )
+    } else {
+        "bLiH...vvdk".to_string()
+    };
+    let mode_str = if app.is_live_mode {
+        "LIVE ON-CHAIN 🟢"
+    } else {
+        "DRY RUN 🟡"
+    };
+
+    let header_title = format!(
+        " ZENITHSW • {} • [{}] • SOL: {:.4} (${:.2}) • POS: ${:.2} • TOTAL EQUITY: ${:.2} • REALIZED: ${:+.2} ",
+        mode_str,
+        pubkey_short,
+        app.wallet_sol_balance,
+        app.wallet_sol_balance * app.sol_price_usd,
+        total_pos_usd,
+        app.wallet_equity_usd,
+        app.total_realized_pnl_usd
+    );
+
     let tabs = Tabs::new(tab_titles)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" ZENITHSW - SMART MONEY SHADOW BOT "),
+                .title(header_title),
         )
         .select(app.current_tab)
         .style(Style::default().fg(Color::DarkGray))
@@ -146,19 +181,35 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         ipc_status,
         Span::raw(" | "),
         Span::styled("[1-5]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Switch Tabs | "),
+        Span::raw(" Switch | "),
         Span::styled("[Q]", Style::default().fg(Color::Red)),
-        Span::raw(" Quit | Qualified Wallets: "),
+        Span::raw(" Quit | Wallets: "),
         Span::styled(qualified_str, Style::default().fg(Color::Yellow)),
-        Span::raw(" | Tracked Gems: "),
+        Span::raw(" | Real Equity: "),
         Span::styled(
-            format!("{}", app.tracked_tokens.len()),
+            format!("${:.2}", app.wallet_equity_usd),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" (SOL: "),
+        Span::styled(
+            format!("{:.4}", app.wallet_sol_balance),
+            Style::default().fg(Color::White),
+        ),
+        Span::raw(" | Pos: "),
+        Span::styled(
+            format!("${:.2}", total_pos_usd),
             Style::default().fg(Color::Cyan),
         ),
-        Span::raw(" | Active Positions: "),
+        Span::raw(") | Realized PnL: "),
         Span::styled(
-            format!("{}", app.positions.len()),
-            Style::default().fg(Color::Green),
+            format!("${:+.2}", app.total_realized_pnl_usd),
+            Style::default().fg(if app.total_realized_pnl_usd >= 0.0 {
+                Color::Green
+            } else {
+                Color::Red
+            }),
         ),
     ]);
 
@@ -332,9 +383,19 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
         sig_items.push(ListItem::new(sublines));
     }
 
+    let gating_title = format!(
+        " Gating Matrix (Max Delta +{:.1}% | Min Liq ${:.0}k | Min Whale ${:.0} | Pos Size ${:.0} | SL -{:.0}% | TP +{:.0}%) ",
+        app.max_price_delta_pct,
+        app.min_liquidity_usd / 1000.0,
+        app.min_whale_buy_usd,
+        app.position_size_usd,
+        app.stop_loss_pct,
+        app.take_profit_pct
+    );
+
     let sig_list = List::new(sig_items).block(
         Block::default().borders(Borders::ALL).title(Span::styled(
-            " Gating Matrix (Max Delta +10.0% | Min Liq $5k | Pure Whale Mirror) ",
+            gating_title,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -713,6 +774,25 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
+    let total_pos_usd: f64 = app
+        .positions
+        .iter()
+        .map(|p| {
+            (p.amount_usd * (p.remaining_portion_pct / 100.0))
+                * (1.0 + p.unrealized_pnl_pct / 100.0)
+        })
+        .sum();
+
+    let pos_title = format!(
+        " ACTIVE SHADOW POSITIONS • Real Equity: ${:.2} (SOL: {:.4} @ ${:.1} = ${:.2} | Positions: ${:.2} | Realized: ${:+.2}) ",
+        app.wallet_equity_usd,
+        app.wallet_sol_balance,
+        app.sol_price_usd,
+        app.wallet_sol_balance * app.sol_price_usd,
+        total_pos_usd,
+        app.total_realized_pnl_usd
+    );
+
     let table = Table::new(
         rows,
         [
@@ -730,12 +810,14 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     )
     .header(header)
     .block(
-        Block::default().borders(Borders::ALL).title(Span::styled(
-            " ACTIVE SHADOW POSITIONS (LIVE REAL-TIME FLOATING PNL & CONTRACT DISPLAY) ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )),
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                pos_title,
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
     );
 
     frame.render_widget(table, area);
@@ -744,67 +826,143 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
 fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(0)])
+        .constraints([Constraint::Length(12), Constraint::Min(0)])
         .split(area);
 
+    let total_pos_usd: f64 = app
+        .positions
+        .iter()
+        .map(|p| {
+            (p.amount_usd * (p.remaining_portion_pct / 100.0))
+                * (1.0 + p.unrealized_pnl_pct / 100.0)
+        })
+        .sum();
+
+    let mode_desc = if app.is_live_mode {
+        format!(
+            "LIVE ON-CHAIN 🟢 (Signer: {})",
+            if app.wallet_pubkey.is_empty() {
+                "bLiHABX6WnneYX94mqR7eUh9VsMvZB23772eWAtvvdk"
+            } else {
+                &app.wallet_pubkey
+            }
+        )
+    } else {
+        "DRY RUN SIMULATION 🟡".to_string()
+    };
+
     let info_text = vec![
-        Line::from(vec![Span::styled(
-            "Multi-Chain Stream Health & Network Latencies:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]),
         Line::from(vec![
-            Span::raw(" • Solana (Helius Dedicated WS/RPC): "),
+            Span::styled(
+                "Multi-Chain Stream Health & Real-Time Portfolio:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | Mode: "),
+            Span::styled(
+                mode_desc,
+                Style::default()
+                    .fg(if app.is_live_mode {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw(" • Real On-Chain Portfolio: SOL Cash = "),
+            Span::styled(
+                format!(
+                    "{:.6} SOL (${:.2} USD)",
+                    app.wallet_sol_balance,
+                    app.wallet_sol_balance * app.sol_price_usd
+                ),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | Open Positions = "),
+            Span::styled(
+                format!("${:.2} USD", total_pos_usd),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | Total Real Equity = "),
+            Span::styled(
+                format!("${:.2} USD", app.wallet_equity_usd),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | Realized PnL = "),
+            Span::styled(
+                format!("${:+.2} USD", app.total_realized_pnl_usd),
+                Style::default()
+                    .fg(if app.total_realized_pnl_usd >= 0.0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw(" • Network Latencies: Solana RPC = "),
             Span::styled(
                 format!("{} ms", app.solana_latency_ms),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" | Jito Anti-MEV Bundles: Active 🟢"),
+            Span::raw(" | Jito Anti-MEV Bundles: Active 🟢 | Multi-RPC Failover: Active 🟢"),
         ]),
         Line::from(vec![
-            Span::raw(" • Robinhood / Arbitrum (Alchemy EVM): "),
+            Span::raw(" • Execution Rules: Position Size = "),
             Span::styled(
-                format!("{} ms", app.arbitrum_latency_ms),
+                format!("${:.2} USD", app.position_size_usd),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | Stop Loss = "),
+            Span::styled(
+                format!("-{:.1}% (Whale Mirror Priority)", app.stop_loss_pct),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | Auto-TP = "),
+            Span::styled(
+                format!("+{:.1}% (50% Partial Free-Roll)", app.take_profit_pct),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" | Full Asset Transfers Stream: Active 🟢"),
         ]),
         Line::from(vec![
-            Span::raw(" • Exit Mechanism: "),
+            Span::raw(" • Active Calibrated Gating: Max Price Delta = "),
             Span::styled(
-                "Pure Whale Mirror (Proportional Partial & Full Exit)",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw(" • Active Calibrated Gating: Max Entry Delta = "),
-            Span::styled(
-                "+10.0%",
+                format!("+{:.1}%", app.max_price_delta_pct),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | Min Pool Liquidity = "),
             Span::styled(
-                "$5,000",
+                format!("${:.0}", app.min_liquidity_usd),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" | Position Size = "),
+            Span::raw(" | Min Whale Order = "),
             Span::styled(
-                "$5.00",
+                format!("${:.0}", app.min_whale_buy_usd),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::raw(" | MCap Range = $50k - $20M"),
         ]),
     ];
 

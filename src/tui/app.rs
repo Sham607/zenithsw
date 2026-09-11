@@ -16,6 +16,23 @@ pub struct App {
     pub base_latency_ms: u64,
     pub is_connected_ipc: bool,
     pub should_quit: bool,
+
+    // Real On-Chain Wallet Equity & Portfolio
+    pub wallet_sol_balance: f64,
+    pub sol_price_usd: f64,
+    pub wallet_equity_usd: f64,
+    pub total_realized_pnl_usd: f64,
+
+    // Live Synchronized Parameters (from Engine Config)
+    pub min_liquidity_usd: f64,
+    pub max_price_delta_pct: f64,
+    pub position_size_usd: f64,
+    pub stop_loss_pct: f64,
+    pub take_profit_pct: f64,
+    pub min_whale_buy_usd: f64,
+    pub is_live_mode: bool,
+    pub wallet_pubkey: String,
+    pub uptime_secs: u64,
 }
 
 impl App {
@@ -34,6 +51,19 @@ impl App {
             base_latency_ms: 42,
             is_connected_ipc: false,
             should_quit: false,
+            wallet_sol_balance: 0.0,
+            sol_price_usd: 100.0,
+            wallet_equity_usd: 0.0,
+            total_realized_pnl_usd: 0.0,
+            min_liquidity_usd: 30000.0,
+            max_price_delta_pct: 5.0,
+            position_size_usd: 5.0,
+            stop_loss_pct: 35.0,
+            take_profit_pct: 50.0,
+            min_whale_buy_usd: 250.0,
+            is_live_mode: true,
+            wallet_pubkey: String::new(),
+            uptime_secs: 0,
         }
     }
 
