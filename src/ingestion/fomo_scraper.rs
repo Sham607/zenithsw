@@ -255,7 +255,9 @@ impl FomoScraper {
                     last_seen_at: Some(Utc::now()),
                     updated_at: Utc::now(),
                 };
-                let _ = self.db.upsert_wallet(&smart_wallet);
+                // Do NOT upsert unverified FOMO scrapings into verified smart_wallets table!
+                // Wallets must come strictly from on-chain verified harvesters.
+                // let _ = self.db.upsert_wallet(&smart_wallet);
 
                 if let Some(holdings) = item.get("topHoldings").and_then(|h| h.as_array()) {
                     for h in holdings {
