@@ -336,6 +336,62 @@ impl SolanaExecutor {
         Ok(tx_signature)
     }
 
+    /// Polls Solana RPC getSignatureStatuses until the transaction is confirmed or finalized
+    pub async fn confirm_transaction_signature(
+        &self,
+        signature: &str,
+        max_wait_secs: u64,
+    ) -> Result<bool> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [
+                [signature],
+                {"searchTransactionHistory": true}
+            ]
+        });
+
+        let start = std::time::Instant::now();
+        while start.elapsed().as_secs() < max_wait_secs {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            if let Ok(res) = self.post_rpc(&payload).await {
+                if let Some(statuses) = res["result"]["value"].as_array() {
+                    if let Some(status) = statuses.first() {
+                        if !status.is_null() {
+                            if let Some(err) = status.get("err") {
+                                if !err.is_null() {
+                                    eprintln!(
+                                        "[SOLANA CONFIRM ERROR ❌] Tx {} failed on-chain: {:?}",
+                                        signature, err
+                                    );
+                                    return Ok(false);
+                                }
+                            }
+                            if let Some(conf) = status
+                                .get("confirmationStatus")
+                                .and_then(|s| s.as_str())
+                            {
+                                if conf == "confirmed" || conf == "finalized" {
+                                    println!(
+                                        "[SOLANA CONFIRM SUCCESS ✅] Tx {} confirmed ({})",
+                                        signature, conf
+                                    );
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[SOLANA CONFIRM TIMEOUT ⚠️] Tx {} not confirmed within {}s",
+            signature, max_wait_secs
+        );
+        Ok(false)
+    }
+
     /// Executes End-to-End Shadow Buy on Solana
     pub async fn execute_shadow_buy(
         &self,
@@ -553,14 +609,29 @@ impl SolanaExecutor {
                 if let Ok(active_pos) = self.db.get_active_positions() {
                     if let Some(pos) = active_pos.iter().find(|p| p.id == position_id) {
                         println!(
-                            "[ONCHAIN SOLANA SELL 🚀] Executing {:.1}% partial swap for {} to SOL",
-                            sell_ratio_pct, pos.token_symbol
+                            "[ONCHAIN SOLANA SELL 🚀] Executing {:.1}% partial swap for {} ({}) to SOL (Reason: {})",
+                            sell_ratio_pct, pos.token_symbol, pos.token_mint, exit_reason
                         );
                         // Query real on-chain token balance
                         let token_amount_raw = self
                             .get_raw_token_balance(&user_pubkey, &pos.token_mint)
                             .await
                             .unwrap_or(0);
+
+                        if token_amount_raw == 0 {
+                            println!(
+                                "[ONCHAIN BALANCE ZERO ⚪] Wallet holds 0 tokens of {}. Closing DB position directly.",
+                                pos.token_symbol
+                            );
+                            self.db.close_position_portion(
+                                position_id,
+                                sell_ratio_pct,
+                                exit_reason,
+                                current_price,
+                            )?;
+                            return Ok(());
+                        }
+
                         let effective_wallet_fraction = if pos.remaining_portion_pct > 0.0 {
                             (sell_ratio_pct / pos.remaining_portion_pct).clamp(0.0, 1.0)
                         } else {
@@ -568,23 +639,101 @@ impl SolanaExecutor {
                         };
                         let sell_units =
                             ((token_amount_raw as f64) * effective_wallet_fraction) as u64;
-                        if sell_units > 0 {
-                            if let Ok(quote) = self
-                                .fetch_jupiter_quote(
-                                    &pos.token_mint,
-                                    wsol_mint,
-                                    sell_units,
-                                    150,
-                                )
-                                .await
-                            {
-                                if let Ok(signed_tx) = self
-                                    .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
-                                    .await
-                                {
-                                    let _ = self.broadcast_tx(&signed_tx).await;
-                                }
+
+                        if sell_units == 0 {
+                            eprintln!("[SELL ABORT ⚠️] Calculated sell units are 0.");
+                            return Ok(());
+                        }
+
+                        // Dynamic slippage: 500 bps for emergency cutloss, 300 bps for trailing/dump, 250 bps for TP
+                        let slippage_bps: u16 = if exit_reason.contains("EMERGENCY")
+                            || exit_reason.contains("HARD_SL")
+                        {
+                            500
+                        } else if exit_reason.contains("PEAK") || exit_reason.contains("DUMP") {
+                            300
+                        } else {
+                            250
+                        };
+
+                        let quote = match self
+                            .fetch_jupiter_quote(
+                                &pos.token_mint,
+                                wsol_mint,
+                                sell_units,
+                                slippage_bps,
+                            )
+                            .await
+                        {
+                            Ok(q) => q,
+                            Err(e) => {
+                                eprintln!(
+                                    "[SELL JUPITER QUOTE FAILED ❌] Mint: {} -> Error: {}. DB position will NOT be closed.",
+                                    pos.token_mint, e
+                                );
+                                return Err(e);
                             }
+                        };
+
+                        let signed_tx = match self
+                            .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
+                            .await
+                        {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                eprintln!(
+                                    "[SELL JUPITER BUILD FAILED ❌] Error: {}. DB position will NOT be closed.",
+                                    e
+                                );
+                                return Err(e);
+                            }
+                        };
+
+                        let tx_sig = match self.broadcast_tx(&signed_tx).await {
+                            Ok(sig) => sig,
+                            Err(e) => {
+                                eprintln!(
+                                    "[SELL BROADCAST FAILED ❌] Error: {}. DB position will NOT be closed.",
+                                    e
+                                );
+                                return Err(e);
+                            }
+                        };
+
+                        println!(
+                            "[SELL BROADCASTED 📡] Sig: https://solscan.io/tx/{} -> Awaiting confirmation...",
+                            tx_sig
+                        );
+
+                        // Strict on-chain confirmation check (20s timeout)
+                        let is_confirmed = self
+                            .confirm_transaction_signature(&tx_sig, 20)
+                            .await
+                            .unwrap_or(false);
+
+                        if !is_confirmed {
+                            eprintln!(
+                                "[SELL CONFIRMATION FAILED ❌] On-chain tx {} failed, reverted, or timed out. Position {} will remain OPEN in DB!",
+                                tx_sig, position_id
+                            );
+                            return Err(anyhow!("On-chain swap transaction reverted or unconfirmed"));
+                        }
+
+                        println!(
+                            "[ONCHAIN SOLANA SELL CONFIRMED 🟢] Swap {} confirmed successfully on-chain!",
+                            tx_sig
+                        );
+
+                        // If 100% full exit, trigger asynchronous rent reclamation for newly empty ATA
+                        if sell_ratio_pct >= 99.0 {
+                            tokio::spawn(async {
+                                tokio::time::sleep(Duration::from_secs(3)).await;
+                                let _ = tokio::process::Command::new("node")
+                                    .arg("scripts/reclaim_rent.js")
+                                    .current_dir("/home/node/Developments/zenithsw")
+                                    .output()
+                                    .await;
+                            });
                         }
                     }
                 }
