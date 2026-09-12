@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
+use futures_util::stream::{self, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -12,7 +13,7 @@ use zenithsw::gating::confluence::ConfluenceEngine;
 use zenithsw::indexer::SmartMoneyIndexer;
 use zenithsw::ingestion::fomo_scraper::FomoScraper;
 use zenithsw::ipc::{IpcMessage, IpcServer};
-use zenithsw::models::{ActivityType, Chain, WalletTier};
+use zenithsw::models::{ActivityType, Chain, SmartWallet, WalletActivity, WalletTier};
 use zenithsw::streams::evm_stream::EvmStreamListener;
 use zenithsw::streams::fomo_api_stream::FomoApiStreamListener;
 use zenithsw::streams::solana_stream::SolanaStreamListener;
@@ -126,47 +127,64 @@ async fn main() -> Result<()> {
                     WalletTier::TierB => 2,
                 });
 
-                for w in wallets {
-                    let mut activity_opt = if w.source == "FOMO" && w.tier == WalletTier::TierS {
-                        fomo_listener_stream
-                            .check_trader_swaps(&w.handle, &w.address, db_stream.clone())
-                            .await
-                            .ok()
-                            .flatten()
-                    } else {
-                        None
-                    };
+                // Concurrently poll wallet activities across high-speed RPC (8 concurrent workers)
+                let activity_results: Vec<(WalletActivity, SmartWallet)> =
+                    stream::iter(wallets.into_iter())
+                        .map(|w| {
+                            let sol_listener = sol_listener_stream.clone();
+                            let arb_listener = arb_listener_stream.clone();
+                            let base_listener = base_listener_stream.clone();
+                            let fomo_listener = fomo_listener_stream.clone();
+                            let db = db_stream.clone();
+                            async move {
+                                let mut activity_opt =
+                                    if w.source == "FOMO" && w.tier == WalletTier::TierS {
+                                        fomo_listener
+                                            .check_trader_swaps(&w.handle, &w.address, db.clone())
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                    } else {
+                                        None
+                                    };
 
-                    if activity_opt.is_none() {
-                        activity_opt = match w.chain {
-                            Chain::Solana => sol_listener_stream
-                                .check_recent_txs(&w.handle, &w.address, db_stream.clone())
-                                .await
-                                .ok()
-                                .flatten(),
-                            Chain::Robinhood | Chain::Arbitrum => arb_listener_stream
-                                .check_wallet_activity(&w.handle, &w.address, db_stream.clone())
-                                .await
-                                .ok()
-                                .flatten(),
-                            Chain::Base => base_listener_stream
-                                .check_wallet_activity(&w.handle, &w.address, db_stream.clone())
-                                .await
-                                .ok()
-                                .flatten(),
-                            _ => None,
-                        };
-                    }
+                                if activity_opt.is_none() {
+                                    activity_opt = match w.chain {
+                                        Chain::Solana => sol_listener
+                                            .check_recent_txs(&w.handle, &w.address, db.clone())
+                                            .await
+                                            .ok()
+                                            .flatten(),
+                                        Chain::Robinhood | Chain::Arbitrum => arb_listener
+                                            .check_wallet_activity(&w.handle, &w.address, db.clone())
+                                            .await
+                                            .ok()
+                                            .flatten(),
+                                        Chain::Base => base_listener
+                                            .check_wallet_activity(&w.handle, &w.address, db.clone())
+                                            .await
+                                            .ok()
+                                            .flatten(),
+                                        _ => None,
+                                    };
+                                }
+                                activity_opt.map(|act| (act, w))
+                            }
+                        })
+                        .buffer_unordered(8)
+                        .filter_map(|res| async move { res })
+                        .collect()
+                        .await;
 
-                    if let Some(act) = activity_opt {
-                        println!(
-                            "[ACTIVITY 🔥] {} by @{} ({}) -> Token: {} (${:.2})",
-                            act.activity_type,
-                            act.wallet_handle,
-                            act.chain,
-                            act.token_symbol,
-                            act.amount_usd
-                        );
+                for (act, w) in activity_results {
+                    println!(
+                        "[ACTIVITY 🔥] {} by @{} ({}) -> Token: {} (${:.2})",
+                        act.activity_type,
+                        act.wallet_handle,
+                        act.chain,
+                        act.token_symbol,
+                        act.amount_usd
+                    );
                         let _ = ipc_stream.broadcast(&IpcMessage::ActivityBroadcast {
                             activity: act.clone(),
                         });
@@ -308,13 +326,9 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-
-                    // Pacing 200ms between wallets (5 RPS total, zero 429)
-                    sleep(Duration::from_millis(200)).await;
                 }
-            }
 
-            sleep(Duration::from_millis(200)).await;
+            sleep(Duration::from_millis(500)).await;
         }
     });
 
@@ -335,11 +349,11 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Fetch latest live price for open position; never relabel stale price as fresh.
-                    let live_price = match SolanaStreamListener::fetch_token_price(&pos.token_mint)
+                    // Fetch latest live price & pool liquidity; never relabel stale price as fresh.
+                    let (live_price, live_liquidity) = match SolanaStreamListener::fetch_token_price(&pos.token_mint)
                         .await
                     {
-                        Ok((_, price, liquidity, _)) if price > 0.0 && liquidity > 0.0 => price,
+                        Ok((_, price, liquidity, _)) if price > 0.0 => (price, liquidity),
                         Ok((symbol, price, liquidity, _)) => {
                             eprintln!(
                                 "[PRICE UPDATE SKIP ⚠️] {} returned invalid market data (price=${:.8}, liquidity=${:.2}); keeping last price with no refresh.",
@@ -368,6 +382,8 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
+                        let prev_pnl = pos.unrealized_pnl_pct;
+                        let prev_peak = pos.peak_price;
                         pos.current_price = live_price;
                         pos.peak_price = pos.peak_price.max(live_price);
                         if pos.entry_price > 0.0 {
@@ -375,7 +391,44 @@ async fn main() -> Result<()> {
                                 ((pos.current_price - pos.entry_price) / pos.entry_price) * 100.0;
                         }
                         pos.last_update = Utc::now();
-                        let _ = db_pos_tracker.upsert_position(pos);
+
+                        // Database write throttling: only persist on significant price/pnl change
+                        let pnl_delta = (pos.unrealized_pnl_pct - prev_pnl).abs();
+                        if pnl_delta >= 2.0 || pos.peak_price > prev_peak {
+                            let _ = db_pos_tracker.upsert_position(pos);
+                        }
+
+                        // Liquidity Drain Guard (Rug-pull trap protection: exit immediately if pool liquidity collapses below $10k)
+                        if live_liquidity > 0.0
+                            && live_liquidity < 10000.0
+                            && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
+                        {
+                            println!(
+                                "[LIQUIDITY DRAIN GUARD 🚨] Position {} ({}) pool liquidity dropped to ${:.0} (<$10k)! Emergency dumping to avoid rug-pull trap!",
+                                pos.id, pos.token_symbol, live_liquidity
+                            );
+                            match pos.chain {
+                                Chain::Solana => {
+                                    let _ = sol_exec_pos
+                                        .execute_shadow_sell(
+                                            &pos.id,
+                                            "LIQUIDITY_DRAIN_EXIT",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
+                                _ => {
+                                    let _ = evm_exec_pos
+                                        .execute_shadow_sell(
+                                            &pos.id,
+                                            "LIQUIDITY_DRAIN_EXIT",
+                                            live_price,
+                                        )
+                                        .await;
+                                }
+                            }
+                            continue;
+                        }
 
                         // 1. Tier 1 Auto Take Profit (Sell 50% of initial position at +100% PnL to free-roll initial capital)
                         if pos.unrealized_pnl_pct >= config_pos.take_profit_pct
