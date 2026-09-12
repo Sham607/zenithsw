@@ -348,6 +348,10 @@ async fn main() -> Result<()> {
                     if pos.status == "CLOSED" {
                         continue;
                     }
+                    let track_policy = pos.track.policy(
+                        config_pos.stop_loss_pct,
+                        config_pos.take_profit_pct,
+                    );
 
                     // Fetch latest live price & pool liquidity; never relabel stale price as fresh.
                     let (live_price, live_liquidity) = match SolanaStreamListener::fetch_token_price(&pos.token_mint)
@@ -431,7 +435,7 @@ async fn main() -> Result<()> {
                         }
 
                         // 1. Tier 1 Auto Take Profit (Sell 50% of initial position at +100% PnL to free-roll initial capital)
-                        if pos.unrealized_pnl_pct >= config_pos.take_profit_pct
+                        if pos.unrealized_pnl_pct >= track_policy.initial_take_profit_pct
                             && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
                             && pos.remaining_portion_pct >= 90.0
                         {
@@ -557,8 +561,12 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // 5. Emergency Hard SL Trigger (-35.0%) to prevent -99.9% rug pull wipeouts
-                        if pos.unrealized_pnl_pct <= -config_pos.stop_loss_pct && pos.status != "CLOSED" {
+                        // 5. Fixed hard SL hanya berlaku untuk Fast-Lane.
+                        let hard_sl_trigger = track_policy
+                            .fixed_stop_loss_pct
+                            .map(|stop_loss_pct| pos.unrealized_pnl_pct <= -stop_loss_pct)
+                            .unwrap_or(false);
+                        if hard_sl_trigger && pos.status != "CLOSED" {
                             println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) hit {:.1}% <= -{:.1}%! Force closing immediately to protect capital!",
                                 pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct);
                             match pos.chain {

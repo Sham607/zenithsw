@@ -245,6 +245,7 @@ impl WinnerProfiler {
                     total_trades: tx_count,
                     source: "ONCHAIN_INDEXER".to_string(),
                     reputation_score,
+                    execution_track: crate::models::ExecutionTrack::FastLane,
                     is_active: true,
                     last_seen_at: Some(Utc::now()),
                     updated_at: Utc::now(),

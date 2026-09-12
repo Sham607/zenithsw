@@ -103,6 +103,7 @@ impl EvmExecutor {
             token_mint: signal.token_mint.clone(),
             target_whale_handle: format!("@{}", signal.whale_handle),
             target_whale_address: signal.whale_address.clone(),
+            track: signal.track,
             entry_price,
             current_price: entry_price,
             peak_price: entry_price,

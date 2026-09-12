@@ -1,5 +1,5 @@
 use crate::models::{
-    ActivityType, Chain, ShadowPosition, ShadowSignal, SmartWallet, TrackedToken, TradeRecord,
+    ActivityType, Chain, ExecutionTrack, ShadowPosition, ShadowSignal, SmartWallet, TrackedToken, TradeRecord,
     WalletActivity, WalletTier,
 };
 use anyhow::Result;
@@ -39,7 +39,8 @@ impl SmartWalletDb {
                  reputation_score REAL NOT NULL DEFAULT 80.0,
                  is_active INTEGER NOT NULL DEFAULT 1,
                  last_seen_at TEXT,
-                 updated_at TEXT NOT NULL
+                 updated_at TEXT NOT NULL,
+                 execution_track TEXT NOT NULL DEFAULT 'FAST_LANE'
              );
              
              CREATE TABLE IF NOT EXISTS wallet_activities (
@@ -75,6 +76,7 @@ impl SmartWalletDb {
                  is_passed INTEGER NOT NULL,
                  rejection_reason TEXT,
                  confluence_count INTEGER NOT NULL,
+                 track TEXT NOT NULL DEFAULT 'FAST_LANE',
                  timestamp TEXT NOT NULL
              );
              
@@ -93,6 +95,7 @@ impl SmartWalletDb {
                  remaining_portion_pct REAL NOT NULL DEFAULT 100.0,
                  unrealized_pnl_pct REAL NOT NULL,
                  realized_pnl_usd REAL NOT NULL DEFAULT 0.0,
+                 track TEXT NOT NULL DEFAULT 'FAST_LANE',
                  entry_time TEXT NOT NULL,
                  last_update TEXT NOT NULL,
                  status TEXT NOT NULL
@@ -107,6 +110,7 @@ impl SmartWalletDb {
                  mint TEXT NOT NULL,
                  target_whale TEXT NOT NULL,
                  exit_reason TEXT NOT NULL,
+                 track TEXT NOT NULL DEFAULT 'FAST_LANE',
                  portion_sold_pct REAL NOT NULL DEFAULT 100.0,
                  entry_price REAL NOT NULL,
                  exit_price REAL NOT NULL,
@@ -251,6 +255,13 @@ impl SmartWalletDb {
                  last_scanned_at TEXT NOT NULL
              );",
         )?;
+
+        // Migrations for Dual-Track Execution
+        let _ = conn.execute("ALTER TABLE wallets ADD COLUMN execution_track TEXT NOT NULL DEFAULT 'FAST_LANE';", []);
+        let _ = conn.execute("ALTER TABLE shadow_positions ADD COLUMN track TEXT NOT NULL DEFAULT 'FAST_LANE';", []);
+        let _ = conn.execute("ALTER TABLE shadow_signals ADD COLUMN track TEXT NOT NULL DEFAULT 'FAST_LANE';", []);
+        let _ = conn.execute("ALTER TABLE trade_history ADD COLUMN track TEXT NOT NULL DEFAULT 'FAST_LANE';", []);
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -261,12 +272,13 @@ impl SmartWalletDb {
         let last_seen_str = wallet.last_seen_at.map(|t| t.to_rfc3339());
         let chain_str = wallet.chain.to_string();
         let tier_str = wallet.tier.to_string();
+        let track_str = wallet.execution_track.to_string();
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO wallets (
-                rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at, execution_track
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(handle) DO UPDATE SET
                 rank = excluded.rank,
                 name = excluded.name,
@@ -280,7 +292,8 @@ impl SmartWalletDb {
                 reputation_score = excluded.reputation_score,
                 is_active = excluded.is_active,
                 last_seen_at = coalesce(excluded.last_seen_at, wallets.last_seen_at),
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                execution_track = excluded.execution_track",
             params![
                 wallet.rank,
                 wallet.name,
@@ -296,6 +309,7 @@ impl SmartWalletDb {
                 if wallet.is_active { 1 } else { 0 },
                 last_seen_str,
                 updated_at_str,
+                track_str,
             ],
         )?;
         Ok(())
@@ -304,7 +318,7 @@ impl SmartWalletDb {
     pub fn get_active_wallets(&self) -> Result<Vec<SmartWallet>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at
+            "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at, execution_track
              FROM wallets WHERE is_active = 1 ORDER BY pnl_24h_usd DESC, rank ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -334,6 +348,8 @@ impl SmartWalletDb {
             let updated_at = DateTime::parse_from_rfc3339(&updated_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            let track_str: String = row.get(15).unwrap_or_else(|_| "FAST_LANE".to_string());
+            let execution_track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             Ok(SmartWallet {
                 id,
@@ -348,6 +364,7 @@ impl SmartWalletDb {
                 total_trades,
                 source,
                 reputation_score,
+                execution_track,
                 is_active: is_active_int == 1,
                 last_seen_at,
                 updated_at,
@@ -366,7 +383,7 @@ impl SmartWalletDb {
         let tier_str1 = tier.to_string();
         let tier_str2 = format!("Tier{}", tier_str1.trim_start_matches("TIER-"));
         let mut stmt = conn.prepare(
-            "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at
+            "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at, execution_track
              FROM wallets WHERE is_active = 1 AND (tier = ?1 OR tier = ?2 OR tier LIKE ?3) ORDER BY pnl_24h_usd DESC, reputation_score DESC",
         )?;
         let like_str = format!("%{}%", tier);
@@ -397,6 +414,8 @@ impl SmartWalletDb {
             let updated_at = DateTime::parse_from_rfc3339(&updated_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            let track_str: String = row.get(15).unwrap_or_else(|_| "FAST_LANE".to_string());
+            let execution_track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             Ok(SmartWallet {
                 id,
@@ -411,6 +430,7 @@ impl SmartWalletDb {
                 total_trades,
                 source,
                 reputation_score,
+                execution_track,
                 is_active: is_active_int == 1,
                 last_seen_at,
                 updated_at,
@@ -427,7 +447,7 @@ impl SmartWalletDb {
     pub fn get_qualified_wallets(&self) -> Result<Vec<SmartWallet>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at
+            "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at, execution_track
              FROM wallets WHERE is_active = 1 AND tier IN ('TIER-S', 'TIER-A') ORDER BY pnl_24h_usd DESC, reputation_score DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -457,6 +477,8 @@ impl SmartWalletDb {
             let updated_at = DateTime::parse_from_rfc3339(&updated_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            let track_str: String = row.get(15).unwrap_or_else(|_| "FAST_LANE".to_string());
+            let execution_track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             Ok(SmartWallet {
                 id,
@@ -471,6 +493,7 @@ impl SmartWalletDb {
                 total_trades,
                 source,
                 reputation_score,
+                execution_track,
                 is_active: is_active_int == 1,
                 last_seen_at,
                 updated_at,
@@ -487,7 +510,7 @@ impl SmartWalletDb {
     pub fn get_wallet_by_address(&self, address: &str) -> Result<Option<SmartWallet>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at
+            "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at, execution_track
              FROM wallets WHERE address = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![address], |row| {
@@ -517,6 +540,8 @@ impl SmartWalletDb {
             let updated_at = DateTime::parse_from_rfc3339(&updated_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            let track_str: String = row.get(15).unwrap_or_else(|_| "FAST_LANE".to_string());
+            let execution_track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             Ok(SmartWallet {
                 id,
@@ -531,6 +556,7 @@ impl SmartWalletDb {
                 total_trades,
                 source,
                 reputation_score,
+                execution_track,
                 is_active: is_active_int == 1,
                 last_seen_at,
                 updated_at,
@@ -644,8 +670,8 @@ impl SmartWalletDb {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO shadow_signals (
-                chain, token_symbol, token_mint, whale_handle, whale_address, whale_tier, whale_entry_price, current_pool_price, price_delta_pct, pool_liquidity_usd, is_passed, rejection_reason, confluence_count, timestamp
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                chain, token_symbol, token_mint, whale_handle, whale_address, whale_tier, whale_entry_price, current_pool_price, price_delta_pct, pool_liquidity_usd, is_passed, rejection_reason, confluence_count, track, timestamp
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 chain_str,
                 sig.token_symbol,
@@ -660,6 +686,7 @@ impl SmartWalletDb {
                 if sig.is_passed { 1 } else { 0 },
                 sig.rejection_reason,
                 sig.confluence_count,
+                sig.track.to_string(),
                 ts_str,
             ],
         )?;
@@ -669,7 +696,7 @@ impl SmartWalletDb {
     pub fn get_recent_signals(&self, limit: usize) -> Result<Vec<ShadowSignal>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT chain, token_symbol, token_mint, whale_handle, whale_address, whale_tier, whale_entry_price, current_pool_price, price_delta_pct, pool_liquidity_usd, is_passed, rejection_reason, confluence_count, timestamp
+            "SELECT chain, token_symbol, token_mint, whale_handle, whale_address, whale_tier, whale_entry_price, current_pool_price, price_delta_pct, pool_liquidity_usd, is_passed, rejection_reason, confluence_count, timestamp, track
              FROM shadow_signals ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |row| {
@@ -693,6 +720,8 @@ impl SmartWalletDb {
             let timestamp = DateTime::parse_from_rfc3339(&ts_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            let track_str: String = row.get(14).unwrap_or_else(|_| "FAST_LANE".to_string());
+            let track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             Ok(ShadowSignal {
                 chain,
@@ -701,6 +730,7 @@ impl SmartWalletDb {
                 whale_handle,
                 whale_address,
                 whale_tier,
+                track,
                 whale_entry_price,
                 current_pool_price,
                 price_delta_pct,
@@ -727,8 +757,8 @@ impl SmartWalletDb {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO shadow_positions (
-                id, chain, token_symbol, token_mint, target_whale_handle, target_whale_address, entry_price, current_price, peak_price, amount_native, amount_usd, remaining_portion_pct, unrealized_pnl_pct, realized_pnl_usd, entry_time, last_update, status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                id, chain, token_symbol, token_mint, target_whale_handle, target_whale_address, entry_price, current_price, peak_price, amount_native, amount_usd, remaining_portion_pct, unrealized_pnl_pct, realized_pnl_usd, track, entry_time, last_update, status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
                 entry_price = excluded.entry_price,
                 amount_usd = excluded.amount_usd,
@@ -740,6 +770,7 @@ impl SmartWalletDb {
                 remaining_portion_pct = excluded.remaining_portion_pct,
                 unrealized_pnl_pct = excluded.unrealized_pnl_pct,
                 realized_pnl_usd = excluded.realized_pnl_usd,
+                track = excluded.track,
                 last_update = excluded.last_update,
                 status = excluded.status",
             params![
@@ -757,6 +788,7 @@ impl SmartWalletDb {
                 pos.remaining_portion_pct,
                 pos.unrealized_pnl_pct,
                 pos.realized_pnl_usd,
+                pos.track.to_string(),
                 entry_str,
                 update_str,
                 pos.status,
@@ -768,7 +800,7 @@ impl SmartWalletDb {
     pub fn get_active_positions(&self) -> Result<Vec<ShadowPosition>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chain, token_symbol, token_mint, target_whale_handle, target_whale_address, entry_price, current_price, peak_price, amount_native, amount_usd, remaining_portion_pct, unrealized_pnl_pct, realized_pnl_usd, entry_time, last_update, status
+            "SELECT id, chain, token_symbol, token_mint, target_whale_handle, target_whale_address, entry_price, current_price, peak_price, amount_native, amount_usd, remaining_portion_pct, unrealized_pnl_pct, realized_pnl_usd, entry_time, last_update, status, track
              FROM shadow_positions WHERE status != 'CLOSED' ORDER BY entry_time DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -797,6 +829,8 @@ impl SmartWalletDb {
             let last_update = DateTime::parse_from_rfc3339(&update_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            let track_str: String = row.get(17).unwrap_or_else(|_| "FAST_LANE".to_string());
+            let track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             Ok(ShadowPosition {
                 id,
@@ -805,6 +839,7 @@ impl SmartWalletDb {
                 token_mint,
                 target_whale_handle,
                 target_whale_address,
+                track,
                 entry_price,
                 current_price,
                 peak_price,
@@ -836,7 +871,7 @@ impl SmartWalletDb {
     ) -> Result<()> {
         let portion_clamped = portion_pct.clamp(1.0, 100.0);
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT entry_price, amount_usd, remaining_portion_pct, realized_pnl_usd, entry_time, chain, token_symbol, token_mint, target_whale_handle FROM shadow_positions WHERE id = ?1")?;
+        let mut stmt = conn.prepare("SELECT entry_price, amount_usd, remaining_portion_pct, realized_pnl_usd, entry_time, chain, token_symbol, token_mint, target_whale_handle, track FROM shadow_positions WHERE id = ?1")?;
         let pos_opt = stmt
             .query_row(params![id], |row| {
                 let entry_price: f64 = row.get(0)?;
@@ -848,6 +883,7 @@ impl SmartWalletDb {
                 let symbol: String = row.get(6)?;
                 let mint: String = row.get(7)?;
                 let target_whale: String = row.get(8)?;
+                let track_s: String = row.get(9).unwrap_or_else(|_| "FAST_LANE".to_string());
                 Ok((
                     entry_price,
                     amount_usd,
@@ -858,6 +894,7 @@ impl SmartWalletDb {
                     symbol,
                     mint,
                     target_whale,
+                    track_s,
                 ))
             })
             .optional()?;
@@ -872,6 +909,7 @@ impl SmartWalletDb {
             symbol,
             mint,
             target_whale,
+            track_s,
         )) = pos_opt
         {
             let now = Utc::now();
@@ -908,8 +946,8 @@ impl SmartWalletDb {
             // Record into trade_history
             conn.execute(
                 "INSERT INTO trade_history (
-                    timestamp, chain, action, symbol, mint, target_whale, exit_reason, portion_sold_pct, entry_price, exit_price, pnl_pct, pnl_usd, duration_secs
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    timestamp, chain, action, symbol, mint, target_whale, exit_reason, portion_sold_pct, entry_price, exit_price, pnl_pct, pnl_usd, duration_secs, track
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     now.to_rfc3339(),
                     chain.to_string(),
@@ -924,6 +962,7 @@ impl SmartWalletDb {
                     pnl_pct,
                     pnl_usd_this_trade,
                     duration_secs,
+                    track_s,
                 ],
             )?;
 
@@ -944,7 +983,7 @@ impl SmartWalletDb {
     pub fn get_recent_trades(&self, limit: usize) -> Result<Vec<TradeRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT timestamp, chain, action, symbol, mint, target_whale, exit_reason, portion_sold_pct, entry_price, exit_price, pnl_pct, pnl_usd, duration_secs
+            "SELECT timestamp, chain, action, symbol, mint, target_whale, exit_reason, portion_sold_pct, entry_price, exit_price, pnl_pct, pnl_usd, duration_secs, track
              FROM trade_history ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |row| {
@@ -961,6 +1000,8 @@ impl SmartWalletDb {
             let pnl_pct: f64 = row.get(10)?;
             let pnl_usd: f64 = row.get(11)?;
             let duration_secs: u64 = row.get(12)?;
+            let track_str: String = row.get(13).unwrap_or_else(|_| "FAST_LANE".to_string());
+            let track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
             let timestamp = DateTime::parse_from_rfc3339(&ts_str)
@@ -975,6 +1016,7 @@ impl SmartWalletDb {
                 mint,
                 target_whale,
                 exit_reason,
+                track,
                 portion_sold_pct,
                 entry_price,
                 exit_price,

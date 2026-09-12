@@ -58,6 +58,79 @@ impl Serialize for Chain {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionTrack {
+    FastLane,  // Momentum / Quick Scalp (Hold: 15m - 120m)
+    VaultLane, // Whale Conviction / Multi-Bagger (Hold: 1d - 7d)
+}
+
+impl fmt::Display for ExecutionTrack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExecutionTrack::FastLane => write!(f, "FAST_LANE"),
+            ExecutionTrack::VaultLane => write!(f, "VAULT_LANE"),
+        }
+    }
+}
+
+impl FromStr for ExecutionTrack {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_uppercase().as_str() {
+            "VAULT_LANE" | "VAULT" => Ok(ExecutionTrack::VaultLane),
+            _ => Ok(ExecutionTrack::FastLane),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ExecutionTrack {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        ExecutionTrack::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for ExecutionTrack {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+pub fn default_track() -> ExecutionTrack {
+    ExecutionTrack::FastLane
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrackPolicy {
+    pub fixed_stop_loss_pct: Option<f64>,
+    pub initial_take_profit_pct: f64,
+    pub max_hold_secs: Option<u64>,
+}
+
+impl ExecutionTrack {
+    pub fn policy(self, global_stop_loss_pct: f64, global_take_profit_pct: f64) -> TrackPolicy {
+        match self {
+            ExecutionTrack::FastLane => TrackPolicy {
+                fixed_stop_loss_pct: Some(global_stop_loss_pct),
+                initial_take_profit_pct: global_take_profit_pct,
+                max_hold_secs: Some(2 * 60 * 60),
+            },
+            ExecutionTrack::VaultLane => TrackPolicy {
+                // Vault exits via whale invalidation/liquidity guard, not a fixed SL.
+                fixed_stop_loss_pct: None,
+                initial_take_profit_pct: 150.0,
+                max_hold_secs: Some(7 * 24 * 60 * 60),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalletTier {
     TierS, // Top Whale / Legend (PnL > $100k, instant copy eligibility)
     TierA, // Alpha Hunter (PnL $30k - $100k, requires 2x confluence)
@@ -122,6 +195,8 @@ pub struct SmartWallet {
     pub source: String, // "FOMO" | "ONCHAIN_INDEXER"
     #[serde(default = "default_reputation")]
     pub reputation_score: f64, // 0.0 - 100.0
+    #[serde(default = "default_track")]
+    pub execution_track: ExecutionTrack,
     #[serde(default = "default_active")]
     pub is_active: bool,
     #[serde(default)]
@@ -220,6 +295,8 @@ pub struct ShadowSignal {
     pub whale_handle: String,
     pub whale_address: String,
     pub whale_tier: WalletTier,
+    #[serde(default = "default_track")]
+    pub track: ExecutionTrack,
     pub whale_entry_price: f64,
     pub current_pool_price: f64,
     pub price_delta_pct: f64,
@@ -238,6 +315,8 @@ pub struct ShadowPosition {
     pub token_mint: String,
     pub target_whale_handle: String,
     pub target_whale_address: String,
+    #[serde(default = "default_track")]
+    pub track: ExecutionTrack,
     pub entry_price: f64,
     pub current_price: f64,
     pub peak_price: f64,
@@ -360,6 +439,8 @@ pub struct TradeRecord {
     pub mint: String,
     pub target_whale: String,
     pub exit_reason: String,
+    #[serde(default = "default_track")]
+    pub track: ExecutionTrack,
     #[serde(default = "default_portion")]
     pub portion_sold_pct: f64,
     pub entry_price: f64,

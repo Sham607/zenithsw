@@ -1,4 +1,4 @@
-use crate::models::{ActivityType, WalletTier};
+use crate::models::{ActivityType, ExecutionTrack, WalletTier};
 use crate::tui::app::App;
 use chrono::FixedOffset;
 use ratatui::{
@@ -327,7 +327,16 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
             (Color::Red, "REJECTED ❌")
         };
 
+        let (track_badge, track_color) = match sig.track {
+            ExecutionTrack::FastLane => ("[FAST ⚡] ", Color::Cyan),
+            ExecutionTrack::VaultLane => ("[VAULT 🏛️] ", Color::Yellow),
+        };
+
         let line1 = Line::from(vec![
+            Span::styled(
+                track_badge,
+                Style::default().fg(track_color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!("[{}] ", sig.chain),
                 Style::default().fg(Color::Cyan),
@@ -711,6 +720,7 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     let header = Row::new(vec![
+        "Track",
         "Symbol",
         "Chain",
         "Contract / Mint Address",
@@ -756,21 +766,35 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
                 format!("@{}", pos.target_whale_handle)
             };
 
+            let (track_badge, track_color) = match pos.track {
+                ExecutionTrack::FastLane => ("FAST ⚡", Color::Cyan),
+                ExecutionTrack::VaultLane => ("VAULT 🏛️", Color::Yellow),
+            };
+
             Row::new(vec![
-                pos.token_symbol.clone(),
-                pos.chain.to_string(),
-                mint_display,
-                handle_display,
-                format!("${:.6}", pos.entry_price),
-                format!("${:.6}", pos.current_price),
-                portion_str,
-                format!(
+                Cell::from(Span::styled(
+                    track_badge,
+                    Style::default()
+                        .fg(track_color)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(pos.token_symbol.clone()),
+                Cell::from(pos.chain.to_string()),
+                Cell::from(mint_display),
+                Cell::from(handle_display),
+                Cell::from(format!("${:.6}", pos.entry_price)),
+                Cell::from(format!("${:.6}", pos.current_price)),
+                Cell::from(portion_str),
+                Cell::from(format!(
                     "${:+.2}",
                     (pos.amount_usd * (pos.remaining_portion_pct / 100.0))
                         * (pos.unrealized_pnl_pct / 100.0)
-                ),
-                format!("{:+.2}%", pos.unrealized_pnl_pct),
-                pos.status.clone(),
+                )),
+                Cell::from(Span::styled(
+                    format!("{:+.2}%", pos.unrealized_pnl_pct),
+                    Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(pos.status.clone()),
             ])
             .style(Style::default().fg(pnl_color))
         })
@@ -800,16 +824,17 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(10),
             Constraint::Percentage(8),
-            Constraint::Percentage(18),
+            Constraint::Percentage(9),
+            Constraint::Percentage(7),
+            Constraint::Percentage(16),
             Constraint::Percentage(13),
-            Constraint::Percentage(11),
-            Constraint::Percentage(11),
-            Constraint::Percentage(8),
+            Constraint::Percentage(10),
+            Constraint::Percentage(10),
+            Constraint::Percentage(7),
             Constraint::Percentage(10),
             Constraint::Percentage(9),
-            Constraint::Percentage(9),
+            Constraint::Percentage(8),
         ],
     )
     .header(header)
@@ -830,7 +855,7 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
 fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(12), Constraint::Min(0)])
+        .constraints([Constraint::Length(14), Constraint::Min(0)])
         .split(area);
 
     let total_pos_usd: f64 = app
@@ -841,6 +866,33 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
                 * (1.0 + p.unrealized_pnl_pct / 100.0)
         })
         .sum();
+
+    let fast_trades: Vec<&crate::models::TradeRecord> = app
+        .trades
+        .iter()
+        .filter(|t| t.track == ExecutionTrack::FastLane)
+        .collect();
+    let vault_trades: Vec<&crate::models::TradeRecord> = app
+        .trades
+        .iter()
+        .filter(|t| t.track == ExecutionTrack::VaultLane)
+        .collect();
+
+    let fast_pnl: f64 = fast_trades.iter().map(|t| t.pnl_usd).sum();
+    let fast_wins = fast_trades.iter().filter(|t| t.pnl_usd > 0.0).count();
+    let fast_wr = if !fast_trades.is_empty() {
+        (fast_wins as f64 / fast_trades.len() as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let vault_pnl: f64 = vault_trades.iter().map(|t| t.pnl_usd).sum();
+    let vault_wins = vault_trades.iter().filter(|t| t.pnl_usd > 0.0).count();
+    let vault_wr = if !vault_trades.is_empty() {
+        (vault_wins as f64 / vault_trades.len() as f64) * 100.0
+    } else {
+        0.0
+    };
 
     let mode_desc = if app.is_live_mode {
         format!(
@@ -914,6 +966,30 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(vec![
+            Span::raw(" • Dual-Track Analytics: "),
+            Span::styled(
+                "⚡ Fast-Lane: ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("${:+.2} (WR: {:.1}%, {} closed) ", fast_pnl, fast_wr, fast_trades.len()),
+                Style::default()
+                    .fg(if fast_pnl >= 0.0 { Color::Green } else { Color::Red })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("| "),
+            Span::styled(
+                "🏛️ Vault-Lane: ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("${:+.2} (WR: {:.1}%, {} closed)", vault_pnl, vault_wr, vault_trades.len()),
+                Style::default()
+                    .fg(if vault_pnl >= 0.0 { Color::Green } else { Color::Red })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
             Span::raw(" • Network Latencies: Solana RPC = "),
             Span::styled(
                 format!("{} ms", app.solana_latency_ms),
@@ -980,6 +1056,7 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
     // Trade History Table
     let header = Row::new(vec![
         "Timestamp (WIB)",
+        "Track",
         "Chain",
         "Action",
         "Symbol",
@@ -1018,18 +1095,35 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
                 tr.mint.clone()
             };
 
+            let (track_badge, track_color) = match tr.track {
+                ExecutionTrack::FastLane => ("FAST ⚡", Color::Cyan),
+                ExecutionTrack::VaultLane => ("VAULT 🏛️", Color::Yellow),
+            };
+
             Row::new(vec![
-                ts_str,
-                tr.chain.to_string(),
-                tr.action.clone(),
-                tr.symbol.clone(),
-                mint_display,
-                format!("@{}", tr.target_whale),
-                format!("${:.6}", tr.entry_price),
-                format!("${:.6}", tr.exit_price),
-                format!("{:+.2}%", tr.pnl_pct),
-                format!("${:+.2}", tr.pnl_usd),
-                tr.exit_reason.clone(),
+                Cell::from(ts_str),
+                Cell::from(Span::styled(
+                    track_badge,
+                    Style::default()
+                        .fg(track_color)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(tr.chain.to_string()),
+                Cell::from(tr.action.clone()),
+                Cell::from(tr.symbol.clone()),
+                Cell::from(mint_display),
+                Cell::from(format!("@{}", tr.target_whale)),
+                Cell::from(format!("${:.6}", tr.entry_price)),
+                Cell::from(format!("${:.6}", tr.exit_price)),
+                Cell::from(Span::styled(
+                    format!("{:+.2}%", tr.pnl_pct),
+                    Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(Span::styled(
+                    format!("${:+.2}", tr.pnl_usd),
+                    Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(tr.exit_reason.clone()),
             ])
             .style(Style::default().fg(pnl_color))
         })
@@ -1038,17 +1132,18 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(10),
+            Constraint::Percentage(9),
+            Constraint::Percentage(7),
+            Constraint::Percentage(7),
             Constraint::Percentage(8),
+            Constraint::Percentage(8),
+            Constraint::Percentage(15),
+            Constraint::Percentage(12),
+            Constraint::Percentage(9),
             Constraint::Percentage(9),
             Constraint::Percentage(8),
-            Constraint::Percentage(16),
+            Constraint::Percentage(8),
             Constraint::Percentage(13),
-            Constraint::Percentage(10),
-            Constraint::Percentage(10),
-            Constraint::Percentage(8),
-            Constraint::Percentage(8),
-            Constraint::Percentage(14),
         ],
     )
     .header(header)
