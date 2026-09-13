@@ -1,6 +1,7 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
+use sha3::{Digest, Keccak256};
 use std::time::Duration;
 
 pub const ROBINHOOD_CHAIN_ID_HEX: &str = "0x1237";
@@ -9,10 +10,73 @@ pub const POSITION_MANAGER_V4: &str = "0x58daec3116aae6D93017bAAea7749052E8a04fA
 pub const V4_QUOTER: &str = "0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94";
 pub const UNIVERSAL_ROUTER: &str = "0x8876789976decbfcbbbe364623c63652db8c0904";
 pub const PERMIT2: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+pub const V3_FACTORY: &str = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa";
+pub const V3_QUOTER_V2: &str = "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7";
+pub const V3_SWAP_ROUTER_02: &str = "0xcaf681a66d020601342297493863e78c959e5cb2";
+pub const USDG: &str = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
+pub const STATE_VIEW: &str = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b";
+pub const WETH9: &str = "0x0Bd7D308f8E1639FAb988df18A8011F41EAcAD73";
 pub const ERC20_TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55aebc6f6f8";
 pub const ERC20_APPROVE_SELECTOR: &str = "0x095ea7b3";
 pub const ERC20_BALANCE_OF_SELECTOR: &str = "0x70a08231";
 pub const V4_INITIALIZE_TOPIC: &str = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
+pub const PONS_V2_LAUNCH_ROUTER: &str = "0xe33e9e479df8802cb0866d5d05258bec4cf62948";
+pub const PONS_V2_GRADUATION_EXECUTOR: &str = "0xc7819b64a1daecd7ec19856d026cb14efbd89046";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RobinhoodVenue {
+    PonsV2Curve,
+    PonsV1V3,
+    PonsV2GraduatedV4,
+    UniswapV3,
+    UniswapV4,
+    Unknown,
+    TransferOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedRobinhoodReceipt {
+    pub venue: RobinhoodVenue,
+    pub success: bool,
+    pub has_transfer: bool,
+    pub token_contracts: Vec<String>,
+}
+
+/// Classifies only evidence present in a successful receipt. A token transfer
+/// without a known venue remains TransferOnly and must not create a BUY signal.
+pub fn classify_robinhood_receipt(receipt: &Value, wallet: &str) -> Result<ClassifiedRobinhoodReceipt> {
+    if !is_address(wallet) { bail!("invalid wallet address"); }
+    let success = receipt.get("status").and_then(Value::as_str) == Some("0x1");
+    if !success {
+        return Ok(ClassifiedRobinhoodReceipt { venue: RobinhoodVenue::Unknown, success: false, has_transfer: false, token_contracts: Vec::new() });
+    }
+    let logs = receipt.get("logs").and_then(Value::as_array).ok_or_else(|| anyhow::anyhow!("receipt logs missing"))?;
+    let mut has_transfer = false;
+    let mut contracts = Vec::new();
+    let mut venue = match receipt.get("to").and_then(Value::as_str).unwrap_or("") {
+        address if address.eq_ignore_ascii_case(PONS_V2_LAUNCH_ROUTER) => RobinhoodVenue::PonsV2Curve,
+        address if address.eq_ignore_ascii_case(PONS_V2_GRADUATION_EXECUTOR) => RobinhoodVenue::PonsV2GraduatedV4,
+        address if address.eq_ignore_ascii_case(V3_SWAP_ROUTER_02) => RobinhoodVenue::UniswapV3,
+        address if address.eq_ignore_ascii_case(UNIVERSAL_ROUTER) => RobinhoodVenue::PonsV2GraduatedV4,
+        _ => RobinhoodVenue::TransferOnly,
+    };
+    for log in logs {
+        let address = log.get("address").and_then(Value::as_str).unwrap_or("");
+        let topics = log.get("topics").and_then(Value::as_array).cloned().unwrap_or_default();
+        let topic0 = topics.first().and_then(Value::as_str).unwrap_or("");
+        if topic0.eq_ignore_ascii_case(ERC20_TRANSFER_TOPIC) {
+            has_transfer = true;
+            if is_address(address) && !contracts.iter().any(|v: &String| v.eq_ignore_ascii_case(address)) { contracts.push(address.to_string()); }
+        }
+        if address.eq_ignore_ascii_case(PONS_V2_LAUNCH_ROUTER) { venue = RobinhoodVenue::PonsV2Curve; }
+        else if address.eq_ignore_ascii_case(PONS_V2_GRADUATION_EXECUTOR) { venue = RobinhoodVenue::PonsV2GraduatedV4; }
+        else if address.eq_ignore_ascii_case(UNIVERSAL_ROUTER) && topic0.starts_with("0x40e9cecb") { venue = RobinhoodVenue::UniswapV4; }
+        else if address.eq_ignore_ascii_case(V3_SWAP_ROUTER_02) { venue = RobinhoodVenue::UniswapV3; }
+        else if address.eq_ignore_ascii_case(POOL_MANAGER_V4) && topic0.starts_with("0x40e9cecb") { venue = RobinhoodVenue::UniswapV4; }
+    }
+    if !has_transfer { venue = RobinhoodVenue::Unknown; }
+    Ok(ClassifiedRobinhoodReceipt { venue, success: true, has_transfer, token_contracts: contracts })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V4InitializedPool {
@@ -135,6 +199,7 @@ pub struct UniversalRouterV4Swap {
     pub zero_for_one: bool,
     pub amount_in: u128,
     pub amount_out_minimum: u128,
+    pub min_hop_price_x36: u128,
     pub hook_data: Vec<u8>,
     pub deadline: u64,
 }
@@ -171,7 +236,9 @@ impl UniversalRouterV4Swap {
 }
 
 fn encode_v4_exact_input_single(plan: &UniversalRouterV4Swap) -> Result<Vec<u8>> {
-    let mut head = Vec::with_capacity(32 * 9);
+    // Robinhood Universal Router V4 requires minHopPriceX36 between amountOutMinimum and hookData.
+    let mut head = Vec::with_capacity(32 * 12);
+    head.extend_from_slice(&abi_uint(32));
     head.extend_from_slice(&abi_address(&plan.pool_key.currency0));
     head.extend_from_slice(&abi_address(&plan.pool_key.currency1));
     head.extend_from_slice(&abi_uint(plan.pool_key.fee as u128));
@@ -180,9 +247,10 @@ fn encode_v4_exact_input_single(plan: &UniversalRouterV4Swap) -> Result<Vec<u8>>
     head.extend_from_slice(&abi_bool(plan.zero_for_one));
     head.extend_from_slice(&abi_uint(plan.amount_in));
     head.extend_from_slice(&abi_uint(plan.amount_out_minimum));
-    head.extend_from_slice(&abi_uint(32 * 9));
+    head.extend_from_slice(&abi_uint(plan.min_hop_price_x36));
+    head.extend_from_slice(&abi_uint(10 * 32));
+    head.extend_from_slice(&abi_uint(plan.hook_data.len() as u128));
     let mut out = head;
-    out.extend_from_slice(&abi_uint(plan.hook_data.len() as u128));
     out.extend_from_slice(&plan.hook_data);
     pad_32(&mut out);
     Ok(out)
@@ -308,6 +376,18 @@ impl V4QuoteExactInputSingle {
     }
 }
 
+/// Computes the canonical Uniswap V4 PoolId: keccak256(abi.encode(PoolKey)).
+pub fn pool_id_for_key(pool_key: &V4PoolKey) -> Result<[u8; 32]> {
+    pool_key.validate()?;
+    let mut encoded = Vec::with_capacity(32 * 5);
+    encoded.extend_from_slice(&abi_address(&pool_key.currency0));
+    encoded.extend_from_slice(&abi_address(&pool_key.currency1));
+    encoded.extend_from_slice(&abi_uint(pool_key.fee as u128));
+    encoded.extend_from_slice(&abi_int24(pool_key.tick_spacing));
+    encoded.extend_from_slice(&abi_address(&pool_key.hooks));
+    Ok(Keccak256::digest(encoded).into())
+}
+
 fn function_selector(signature: &str) -> [u8; 4] {
     use sha3::{Digest, Keccak256};
     let digest = Keccak256::digest(signature.as_bytes());
@@ -336,6 +416,12 @@ fn abi_int24(value: i32) -> [u8; 32] {
 
 fn abi_bool(value: bool) -> [u8; 32] {
     abi_uint(if value { 1 } else { 0 })
+}
+
+fn parse_first_abi_word(value: &str) -> Result<u128> {
+    let raw = value.strip_prefix("0x").ok_or_else(|| anyhow::anyhow!("invalid ABI output"))?;
+    if raw.len() < 64 { bail!("ABI output too short"); }
+    u128::from_str_radix(&raw[..64], 16).context("ABI amount overflow")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,6 +640,73 @@ impl RobinhoodRpc {
         self.eth_call(&json!({"to": token, "data": format!("0x{}", hex::encode(data))})).await
     }
 
+    /// Quotes a Uniswap V3 single hop using the official Robinhood QuoterV2.
+    /// The tuple is static: do not prepend a dynamic outer offset.
+    pub async fn v3_quote_exact_input_single(
+        &self,
+        token_in: &str,
+        token_out: &str,
+        amount_in: u128,
+        fee: u32,
+    ) -> Result<u128> {
+        for address in [token_in, token_out] {
+            if !is_address(address) { bail!("invalid V3 quote token address"); }
+        }
+        if amount_in == 0 || fee > 1_000_000 { bail!("invalid V3 quote amount or fee"); }
+        let mut data = function_selector("quoteExactInputSingle((address,address,uint256,uint24,uint160))").to_vec();
+        data.extend_from_slice(&abi_address(token_in));
+        data.extend_from_slice(&abi_address(token_out));
+        data.extend_from_slice(&abi_uint(amount_in));
+        data.extend_from_slice(&abi_uint(fee as u128));
+        data.extend_from_slice(&abi_uint(0));
+        let result = self.eth_call(&json!({"to": V3_QUOTER_V2, "data": format!("0x{}", hex::encode(data))})).await?;
+        parse_first_abi_word(&result)
+    }
+
+    /// Quotes a Uniswap V3 multi-hop via encoded path using QuoterV2.quoteExactInput.
+    pub async fn v3_quote_exact_input(&self, encoded_path_hex: &str, amount_in: u128) -> Result<u128> {
+        if amount_in == 0 { bail!("amount_in harus > 0"); }
+        let path_bytes = hex::decode(encoded_path_hex.trim_start_matches("0x"))
+            .context("encoded_path bukan hex yang valid")?;
+        // quoteExactInput(bytes path, uint256 amountIn)
+        // path is dynamic bytes, amountIn is uint256
+        // calldata: selector + offset_path(32) + amountIn(32) + path_len(32) + path_data
+        let sel = function_selector("quoteExactInput(bytes,uint256)");
+        let mut data = sel.to_vec();
+        data.extend_from_slice(&abi_uint(64u128));                       // offset of path = 2*32
+        data.extend_from_slice(&abi_uint(amount_in));
+        data.extend_from_slice(&abi_uint(path_bytes.len() as u128));
+        data.extend_from_slice(&path_bytes);
+        while data.len() % 32 != 0 { data.push(0); }
+        let result = self.eth_call(&json!({"to": V3_QUOTER_V2, "data": format!("0x{}", hex::encode(data))})).await?;
+        parse_first_abi_word(&result)
+    }
+
+    /// Returns the V3 pool address for a token pair and fee tier.
+    pub async fn v3_pool(&self, token_a: &str, token_b: &str, fee: u32) -> Result<String> {
+        for address in [token_a, token_b] {
+            if !is_address(address) { bail!("invalid V3 pool token address"); }
+        }
+        let mut data = function_selector("getPool(address,address,uint24)").to_vec();
+        data.extend_from_slice(&abi_address(token_a));
+        data.extend_from_slice(&abi_address(token_b));
+        data.extend_from_slice(&abi_uint(fee as u128));
+        let result = self.eth_call(&json!({"to": V3_FACTORY, "data": format!("0x{}", hex::encode(data))})).await?;
+        let raw = result.strip_prefix("0x").ok_or_else(|| anyhow::anyhow!("invalid V3 pool output"))?;
+        if raw.len() < 64 { bail!("V3 factory output too short"); }
+        let address = format!("0x{}", &raw[24..64]);
+        if address == "0x0000000000000000000000000000000000000000" { bail!("V3 pool does not exist"); }
+        Ok(address)
+    }
+
+    /// Reads the V4 PoolManager slot0 state for a pool ID at the current latest block.
+    pub async fn pool_slot0(&self, pool_id: &str) -> Result<String> {
+        if !is_hex_bytes32(pool_id) { bail!("invalid V4 pool id"); }
+        let mut data = function_selector("getSlot0(bytes32)").to_vec();
+        data.extend_from_slice(&hex::decode(&pool_id[2..])?);
+        self.eth_call(&json!({"to": POOL_MANAGER_V4, "data": format!("0x{}", hex::encode(data))})).await
+    }
+
     pub async fn send_raw_transaction(&self, _raw_tx: &str) -> Result<String> {
         bail!("raw transaction broadcast is intentionally disabled until live gate approval")
     }
@@ -620,11 +773,13 @@ impl RobinhoodRpc {
             "params":[{"to": V4_QUOTER, "data": calldata}, block_tag]
         });
         let mut last_error = String::new();
-        for attempt in 0..2 {
+        for (attempt, tag) in [block_tag, "latest".to_string()].into_iter().enumerate() {
+            let mut request = payload.clone();
+            request["params"][1] = json!(tag);
             let response: Value = self
                 .client
                 .post(&self.url)
-                .json(&payload)
+                .json(&request)
                 .send()
                 .await?
                 .error_for_status()?
@@ -640,7 +795,7 @@ impl RobinhoodRpc {
             last_error = response.get("error").map(Value::to_string).unwrap_or_else(|| "unknown revert".to_string());
             if attempt == 0 { tokio::time::sleep(Duration::from_millis(250)).await; }
         }
-        bail!("Robinhood V4Quoter eth_call reverted after one retry: {}", last_error)
+        bail!("Robinhood V4Quoter eth_call reverted after snapshot/latest attempts: {}", last_error)
     }
 
     pub fn parse_verified_swap(receipt: &Value, swap_topics: &[&str]) -> Result<VerifiedSwap> {
@@ -713,6 +868,39 @@ mod tests {
 
     #[test]
     fn transfer_only_is_rejected() { assert!(RobinhoodRpc::parse_verified_swap(&receipt("0x1", false), &["0xswap"]).is_err()); }
+
+    #[test]
+    fn classifier_keeps_unknown_transfer_fail_closed() {
+        let receipt = json!({
+            "status": "0x1",
+            "logs": [{
+                "address": "0x0000000000000000000000000000000000000009",
+                "topics": [ERC20_TRANSFER_TOPIC]
+            }]
+        });
+        let classified = classify_robinhood_receipt(
+            &receipt,
+            "0x0000000000000000000000000000000000000001",
+        ).unwrap();
+        assert_eq!(classified.venue, RobinhoodVenue::TransferOnly);
+        assert!(classified.has_transfer);
+    }
+
+    #[test]
+    fn classifier_identifies_pons_v2_curve_router() {
+        let receipt = json!({
+            "status": "0x1",
+            "logs": [
+                {"address": PONS_V2_LAUNCH_ROUTER, "topics": []},
+                {"address": "0x0000000000000000000000000000000000000009", "topics": [ERC20_TRANSFER_TOPIC]}
+            ]
+        });
+        let classified = classify_robinhood_receipt(
+            &receipt,
+            "0x0000000000000000000000000000000000000001",
+        ).unwrap();
+        assert_eq!(classified.venue, RobinhoodVenue::PonsV2Curve);
+    }
     #[test]
     fn failed_receipt_is_rejected() { assert!(RobinhoodRpc::parse_verified_swap(&receipt("0x0", true), &["0xswap"]).is_err()); }
     #[test]
@@ -753,6 +941,7 @@ mod tests {
             zero_for_one: false,
             amount_in: 1_000,
             amount_out_minimum: 900,
+            min_hop_price_x36: 0,
             hook_data: Vec::new(),
             deadline: 1_900_000_000,
         };
@@ -776,6 +965,7 @@ mod tests {
             zero_for_one: true,
             amount_in: 1_000,
             amount_out_minimum: 900,
+            min_hop_price_x36: 0,
             hook_data: Vec::new(),
             deadline: 1_900_000_000,
         };

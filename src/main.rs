@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
         shadow_exit_enabled: true,
         confluence_mode: "TIER_S_OR_DUAL_A".to_string(),
         dry_run: true,
+        live_robinhood_enabled: false,
         enable_solana: true,
         enable_robinhood: false,
         enable_base: false,

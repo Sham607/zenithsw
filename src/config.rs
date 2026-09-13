@@ -35,6 +35,8 @@ pub struct Config {
     pub shadow_exit_enabled: bool, // Mirror sell when whale dumps
     pub confluence_mode: String,  // "TIER_S_OR_DUAL_A"
     pub dry_run: bool,
+    /// Live Robinhood gate tambahan; tidak cukup sendiri untuk broadcast.
+    pub live_robinhood_enabled: bool,
 
     // Chains enabled
     pub enable_solana: bool,
@@ -148,6 +150,10 @@ impl Config {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(true);
 
+        let live_robinhood_enabled = env::var("LIVE_ROBINHOOD_ENABLED")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         let enable_solana = env::var("ENABLE_SOLANA")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(true);
@@ -192,6 +198,7 @@ impl Config {
             shadow_exit_enabled,
             confluence_mode,
             dry_run,
+            live_robinhood_enabled,
             enable_solana,
             enable_robinhood,
             enable_base,

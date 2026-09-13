@@ -42,14 +42,17 @@ TUI juga melakukan refresh database berkala. Status IPC harus dibedakan dari sna
 ### Robinhood Chain
 
 - Chain ID: `4663` (`0x1237`).
-- Venue: Uniswap V4 deployment Robinhood.
-- RPC aktif dikonfigurasi melalui `ROBINHOOD_RPC_URL`.
-- Pool discovery memakai `PoolManager.Initialize` dan filter token.
-- Native-currency route mengenali `address(0)` sebagai currency native.
-- V4 quote memakai `quoteExactInputSingle` melalui `eth_call`.
-- Router simulation memakai calldata Universal Router yang sama dengan rencana transaksi.
+- RPC aktif dikonfigurasi melalui `ROBINHOOD_RPC_URL`; chain ID wajib `4663` (`0x1237`).
+- Discovery V4 memakai `PoolManager.Initialize` dan filter token.
+- Route probing read-only mencakup Uniswap V3 (direct dan two-hop melalui USDG), V4, serta deployment Pons yang sudah dikenal.
+- Native-currency route mengenali `address(0)` secara eksplisit; token/WETH tidak boleh ditebak.
+- V3 quote memakai QuoterV2 melalui `eth_call`; V4 quote memakai `quoteExactInputSingle` melalui `eth_call`.
+- Route terbaik dipilih berdasarkan `amountOut`, lalu calldata dibuat untuk router venue yang sesuai.
+- Stream Robinhood hanya menerima receipt sukses dengan transfer dan venue teridentifikasi; transfer-only/venue unknown ditolak.
+- Router simulation memakai calldata yang sama dengan rencana transaksi: `eth_call` lalu `eth_estimateGas`.
 - Dry-run tidak signing, broadcast, atau membuat posisi `OPEN`.
 - `send_raw_transaction` masih diblokir sampai live gate/canary disetujui.
+- `LIVE_ROBINHOOD_ENABLED` hanya gate tambahan; `DRY_RUN=false` tetap ditolak bila signer, broadcast, receipt, dan reconciliation belum lengkap.
 - SELL Robinhood masih fail-closed dan belum boleh mengubah posisi database.
 
 Alamat kontrak Robinhood yang dikunci di source:
