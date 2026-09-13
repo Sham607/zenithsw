@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dotenvy::dotenv;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -10,11 +10,10 @@ pub struct Config {
     pub solana_ws_url: String,
     pub solana_private_key: Option<String>,
 
-    // EVM settings (Arbitrum & Base)
-    pub arbitrum_rpc_url: String,
-    pub arbitrum_ws_url: String,
-    pub base_rpc_url: String,
-    pub base_ws_url: String,
+    // Robinhood Chain settings
+    pub robinhood_rpc_url: String,
+    pub robinhood_ws_url: String,
+    pub robinhood_api_key: Option<String>,
     pub evm_private_key: Option<String>,
 
     // FOMO Auth & Ingestion settings
@@ -43,7 +42,8 @@ pub struct Config {
     pub enable_base: bool,
 
     // Persistence & IPC
-    pub db_path: String,
+    pub trading_db_path: String,
+    pub wallet_db_path: String,
     pub ipc_socket_path: String,
 }
 
@@ -51,30 +51,27 @@ impl Config {
     pub fn load() -> Result<Self> {
         let _ = dotenv();
 
-        let solana_rpc_url = env::var("SOLANA_RPC_URL").unwrap_or_else(|_| {
-            "https://mainnet.helius-rpc.com/?api-key=def963d9-3753-4fe1-a609-f0534ead614f"
-                .to_string()
-        });
-
-        let solana_ws_url = env::var("SOLANA_WS_URL").unwrap_or_else(|_| {
-            "wss://mainnet.helius-rpc.com/?api-key=def963d9-3753-4fe1-a609-f0534ead614f".to_string()
-        });
+        let solana_rpc_url = env::var("SOLANA_RPC_URL")
+            .context("SOLANA_RPC_URL wajib diatur di .env/secret manager")?;
+        let solana_ws_url = env::var("SOLANA_WS_URL")
+            .context("SOLANA_WS_URL wajib diatur di .env/secret manager")?;
 
         let solana_private_key = env::var("SOLANA_PRIVATE_KEY").ok();
 
-        let arbitrum_rpc_url = env::var("ARBITRUM_RPC_URL").unwrap_or_else(|_| {
-            "https://arb-mainnet.g.alchemy.com/v2/alch_PS21nEmHejPxYhypdUH1A".to_string()
-        });
-        let arbitrum_ws_url = env::var("ARBITRUM_WS_URL").unwrap_or_else(|_| {
-            "wss://arb-mainnet.g.alchemy.com/v2/alch_PS21nEmHejPxYhypdUH1A".to_string()
-        });
+        let robinhood_rpc_url = env::var("ROBINHOOD_RPC_URL")
+            .context("ROBINHOOD_RPC_URL wajib diatur di .env/secret manager")?;
+        let robinhood_ws_url = env::var("ROBINHOOD_WS_URL")
+            .context("ROBINHOOD_WS_URL wajib diatur di .env/secret manager")?;
 
-        let base_rpc_url = env::var("BASE_RPC_URL")
-            .unwrap_or_else(|_| "https://base-mainnet.g.alchemy.com/v2/demo".to_string());
-        let base_ws_url = env::var("BASE_WS_URL")
-            .unwrap_or_else(|_| "wss://base-mainnet.g.alchemy.com/v2/demo".to_string());
+        let robinhood_api_key = env::var("ROBINHOOD_BLOCKSCOUT_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
 
-        let evm_private_key = env::var("EVM_PRIVATE_KEY").ok();
+        // Robinhood uses its own explicit credential name; retain EVM_PRIVATE_KEY as a
+        // compatibility fallback without ever logging or exposing the secret.
+        let evm_private_key = env::var("ROBINHOOD_PRIVATE_KEY")
+            .ok()
+            .or_else(|| env::var("EVM_PRIVATE_KEY").ok());
 
         let fomo_auth_token = env::var("FOMO_AUTH_TOKEN")
             .ok()
@@ -98,17 +95,17 @@ impl Config {
         let min_liquidity_usd = env::var("MIN_LIQUIDITY_USD")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(30000.0);
+            .unwrap_or(15000.0);
 
         let position_size_usd = env::var("POSITION_SIZE_USD")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(15.0);
+            .unwrap_or(10.0);
 
         let min_whale_buy_usd = env::var("MIN_WHALE_BUY_USD")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(150.0);
+            .unwrap_or(50.0);
 
         let max_price_impact_pct = env::var("MAX_PRICE_IMPACT_PCT")
             .ok()
@@ -163,7 +160,10 @@ impl Config {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
 
-        let db_path = env::var("DB_PATH").unwrap_or_else(|_| "data/smart_wallets.db".to_string());
+        let trading_db_path = env::var("TRADING_DB_PATH")
+            .unwrap_or_else(|_| "data/trading_state.db".to_string());
+        let wallet_db_path = env::var("WALLET_DB_PATH")
+            .unwrap_or_else(|_| "data/wallet_registry.db".to_string());
 
         let ipc_socket_path =
             env::var("IPC_SOCKET_PATH").unwrap_or_else(|_| "/tmp/zenithsw.sock".to_string());
@@ -172,10 +172,9 @@ impl Config {
             solana_rpc_url,
             solana_ws_url,
             solana_private_key,
-            arbitrum_rpc_url,
-            arbitrum_ws_url,
-            base_rpc_url,
-            base_ws_url,
+            robinhood_rpc_url,
+            robinhood_ws_url,
+            robinhood_api_key,
             evm_private_key,
             fomo_auth_token,
             fomo_sync_interval_sec,
@@ -196,7 +195,8 @@ impl Config {
             enable_solana,
             enable_robinhood,
             enable_base,
-            db_path,
+            trading_db_path,
+            wallet_db_path,
             ipc_socket_path,
         })
     }

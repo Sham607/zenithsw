@@ -132,14 +132,14 @@ for idx, (handle, item) in enumerate(all_traders.items()):
     fomo_pnl = float(item.get("totalPnL") or 0.0)
     num_trades = int(item.get("numTrades") or item.get("swapCount") or 0)
     top_holdings = item.get("topHoldings", [])
-    
+
     # Calculate reported holdings USD value
     reported_holdings_usd = sum(float(h.get("value", 0.0)) for h in top_holdings)
 
     # Check Solana first
     sol_data = check_solana_onchain(sol_addr) if sol_addr else None
     time.sleep(0.05) # rate limit friendly
-    
+
     # Check EVM
     evm_data = check_evm_onchain(evm_addr) if evm_addr else None
     time.sleep(0.05)
@@ -176,7 +176,7 @@ for idx, (handle, item) in enumerate(all_traders.items()):
 
     # Real On-Chain Asset & PnL Scoring
     real_asset_usd = usd_bal + (reported_holdings_usd if tok_accs > 0 else 0.0)
-    
+
     # Determine Real Tier based on on-chain holdings & verified trades
     if real_asset_usd >= 50000.0 or (tx_count >= 30 and usd_bal >= 1000.0):
         tier = "TIER-S"

@@ -17,13 +17,13 @@ pub struct SmartMoneyIndexer {
 impl SmartMoneyIndexer {
     pub fn new(
         helius_rpc_url: &str,
-        arbitrum_rpc_url: &str,
+        robinhood_rpc_url: &str,
         db: Arc<SmartWalletDb>,
         interval_secs: u64,
     ) -> Self {
         Self {
-            profiler: WinnerProfiler::new(helius_rpc_url, arbitrum_rpc_url, db.clone()),
-            detective: WhaleClusterDetective::new(helius_rpc_url, arbitrum_rpc_url, db),
+            profiler: WinnerProfiler::new(helius_rpc_url, robinhood_rpc_url, db.clone()),
+            detective: WhaleClusterDetective::new(helius_rpc_url, robinhood_rpc_url, db),
             interval_secs,
         }
     }

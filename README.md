@@ -1,162 +1,184 @@
-# 🚀 ZenithSW — Multi-Chain Smart Money Shadow Engine & TUI Dashboard
+# ZenithSW
 
-**ZenithSW** adalah bot *shadow copy-trading* multi-chain berlatensi sub-detik (<150 ms) yang melacak dan mengeksekusi *copy-trade* cerdas mengikuti pergerakan **Smart Money Terverifikasi On-Chain** lintas blockchain (**Solana SVM** dan **Robinhood / Arbitrum EVM**).
+ZenithSW adalah engine *shadow copy-trading* multi-chain dengan daemon engine terpisah dan dashboard TUI Ratatui. Fokus implementasi saat ini adalah Solana dan fondasi eksekusi read-only Robinhood Chain.
 
-Dilengkapi dengan modul **Whale Cluster Detective** (pelacak dompet bayangan anak yang didanai whale), **Whale Gems Radar** (deteksi koin nano/micro-cap berkonsensus tinggi), serta **Strict Confluence Gating Matrix**.
+> **Status penting:** Solana memiliki jalur mirror execution yang lebih lengkap. Robinhood masih dalam tahap validasi dry-run dan **belum siap untuk copy-trade live**. `send_raw_transaction` tetap fail-closed.
 
----
-
-## 🏛️ Arsitektur Sistem (Decoupled Engine & Smart Money Intelligence)
+## Arsitektur
 
 ```text
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ 1. MULTI-SOURCE SMART MONEY INTELLIGENCE & WALLET FORENSICS                            │
-│ • Whale Cluster Detective: Trace parent-to-child funding graph (Direct On-Chain RPC)   │
-│ • Direct On-Chain DEX Graph Indexer: Reverse-lookup top profitable early buyers        │
-│ • Nansen AI API v2: Profiler 7D Realized PnL Terbesar & Real-Time DEX Trades          │
-│ • One-Shot Snapshot Ingestion: Imun dari restriksi API (100% on-chain live monitoring) │
-│ • Realized PnL Priority: Mengutamakan cuan terealisasi nyata di atas win rate semu     │
-└────────────────────────────────────────┬───────────────────────────────────────────────┘
-                                         │ (SQLite WAL + Thread-Safe Database)
-                                         ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ 2. SUB-SECOND MULTI-CHAIN STREAM INGESTION (<150 ms)                                   │
-├────────────────────────────────────────┬───────────────────────────────────────────────┤
-│           SOLANA SVM DRIVER            │            ROBINHOOD / ARBITRUM EVM           │
-│ • Helius Dedicated WebSocket & RPC     │ • Alchemy Dedicated Node & Asset Transfers    │
-│ • Parsing Enhanced Txs & TokenBalances │ • Full Bi-directional Stream (BUY & SELL)     │
-│ • Zero Rate-Limit Paced Stream (5 RPS) │ • In-Memory Hash Cache Deduplication          │
-└────────────────────────────────────────┴───────────────────────────────────────────────┘
-                                         │ (Deteksi Sinyal Transaksi Smart Money)
-                                         ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ 3. STRICT CONFLUENCE & RISK GATING MATRIX                                              │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│ • Sweet Spot Market Cap Window: $50,000.0 s/d $20,000,000.0 (Asymmetric Upside Focus)  │
-│ • Minimum Whale Order Size: >= $250.0 (Saring transaksi debu/spam/lottery degen)      │
-│ • Max Price Impact Guard: <= 15.0% (Toleransi kedalaman pool koin nano/micro-cap)      │
-│ • Max Price Entry Delta: <= +10.0% dari harga eksekusi whale                           │
-│ • Anti-Stablecoin & Gas Blacklist: Blokir mutlak USDC, USDT, WETH, ETH, SOL, ARB, dll. │
-│ • Same-Whale Deduplication: Tolak akumulasi berulang dari 1 whale yang sama           │
-│ • Multi-Whale DCA Consolidation: Gabungkan entri dari whale berbeda via VWAP (1 pos)   │
-└────────────────────────────────────────┬───────────────────────────────────────────────┘
-                                         │ (Lolos Evaluasi Confluence)
-                                         ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ 4. PURE PROPORTIONAL WHALE MIRROR EXECUTION & RADAR                                    │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│ • Entry: Buka posisi shadow otomatis saat Whale Beli ($5.0 / calibrated position size) │
-│ • Proportional Partial Exit: Jual X% posisi jika Whale jual X% saldo koinnya           │
-│ • Full Exit Dump: Tutup 100% posisi saat Whale melepas seluruh koinnya (>=95%)         │
-│ • Auto Take-Profit Moonbag (+100% -> TP 50% & Lock Floor +25%) + Emergency SL (-20%)   │
-│ • Atomic State: Sync real-time via UNIX Domain Socket (/tmp/zenithsw.sock)             │
-└────────────────────────────────────────────────────────────────────────────────────────┘
+zenithsw-engine
+  ├─ wallet/activity ingestion
+  ├─ confluence gating
+  ├─ Solana executor
+  ├─ Robinhood RPC adapter + EVM dry-run executor
+  ├─ SQLite WAL trading state
+  └─ Unix socket IPC: /tmp/zenithsw.sock
+          │
+          ▼
+      zenithsw TUI
 ```
 
----
+Engine dan TUI berbagi:
 
-## 🧬 Whale Cluster Detective (Pelacak Dompet Terafiliasi)
+- `TRADING_DB_PATH` untuk posisi, signal, activity, trade history, dan tracked token;
+- `WALLET_DB_PATH` untuk registry wallet;
+- `IPC_SOCKET_PATH` untuk heartbeat, activity, signal, position update, trade sync, dan log.
 
-Whale Tier-S sering kali memecah modal ke beberapa *burner/shadow wallet* untuk membeli koin nano-cap sebelum koin tersebut dipromosikan ke publik. 
+TUI juga melakukan refresh database berkala. Status IPC harus dibedakan dari snapshot SQLite; data dashboard tidak boleh dianggap bukti transaksi live tanpa verifikasi on-chain.
 
-Modul **`WhaleClusterDetective`** memindai histori transfer modal awal (*parent-to-child initial funding*) via RPC Alchemy & Helius:
-* Mendeteksi transfer keluar $\ge 0.05\text{ ETH}$ atau $\ge \$500\text{ USDC}$ dari Top Whale ke alamat baru.
-* Otomatis menginjeksi dompet anak ke tabel `wallets` dengan badge **`[DETECTIVE 🕵️]`** dan handle terafiliasi (contoh: `@unipcs_sub_53a8`).
-* Memungkinkan bot mengeksekusi *Shadow Buy* di blok pertama ketika dompet rahasia ini mulai memborong koin nano-cap.
+## Chain yang didukung
 
----
+### Solana
 
-## 💎 Whale Gems Radar & Portfolio Harvester (Tab `[3]`)
+- RPC/WebSocket dikonfigurasi melalui environment.
+- Jupiter/PumpPortal digunakan oleh jalur executor yang tersedia.
+- Konfirmasi transaksi dipolling sebelum posisi dibuka atau ditutup.
+- Balance token direkonsiliasi dari RPC.
+- Posisi satu token digabung dengan VWAP.
+- Re-entry dari whale yang sama saat posisi masih terbuka ditolak.
+- Exit parsial mengikuti proporsi penjualan whale.
 
-Panel intelijen multi-whale yang memetakan konsensus kepemilikan koin dari Top Smart Wallets:
+### Robinhood Chain
 
-1. **Hierarki Kapitalisasi Pasar (Asymmetric Multiplier Focus):**
-   * **`NANO_CAP 🚀🚀`** ($< \$1\text{M}$): Prioritas #1 (Potensi upside $20\times - 100\times+$).
-   * **`MICRO_CAP 🚀`** ($\$1\text{M} - \$3\text{M}$): Prioritas #2 (Potensi upside $10\times - 50\times$).
-   * **`LOW_CAP 💎`** ($\$3\text{M} - \$15\text{M}$): Prioritas #3 (Potensi upside $3\times - 10\times$).
-   * **`SMALL_CAP`** ($\$15\text{M} - \$50\text{M}$) & **`MID_LARGE`** ($> \$50\text{M}$).
-2. **Kondisi Pasar & Indikator Teknikal:**
-   * **`ACCUMULATION_BOTTOM 🟢 (Ready Buy)`**: 24h Change $-30\%$ s/d $+25\%$, Pool Liquidity $\ge \$15\text{k}$.
-   * **`LOCAL_TOP 🔴 (Wait Pullback)`**: 24h Change $> +100\%$ atau 6h Change $> +35\%$.
-   * **`OVERSOLD_RECOVERY 🟡`**: 24h Change $< -30\%$.
+- Chain ID: `4663` (`0x1237`).
+- Venue: Uniswap V4 deployment Robinhood.
+- RPC aktif dikonfigurasi melalui `ROBINHOOD_RPC_URL`.
+- Pool discovery memakai `PoolManager.Initialize` dan filter token.
+- Native-currency route mengenali `address(0)` sebagai currency native.
+- V4 quote memakai `quoteExactInputSingle` melalui `eth_call`.
+- Router simulation memakai calldata Universal Router yang sama dengan rencana transaksi.
+- Dry-run tidak signing, broadcast, atau membuat posisi `OPEN`.
+- `send_raw_transaction` masih diblokir sampai live gate/canary disetujui.
+- SELL Robinhood masih fail-closed dan belum boleh mengubah posisi database.
 
----
+Alamat kontrak Robinhood yang dikunci di source:
 
-## 📊 TUI Dashboard Layout (Ratatui 5-Tab Matrix)
-
-* **Tab `[1] LIVE STREAM ⚡`**: Aliran real-time swap beli/jual target whale (termasuk deteksi `SOLD PARTIAL 🟡` vs `SOLD FULL DUMP 🔴`), **Smart Contract Mint Address**, dan keputusan evaluasi gating bot.
-* **Tab `[2] TARGET WALLETS 🎯`**: Tabel pemantauan dompet target dengan badge sumber terverifikasi:
-  * `[DETECTIVE 🕵️]`: Dompet bayangan anak yang terdeteksi didanai langsung oleh Top Whale Tier-S.
-  * `[NANSEN 🧠]`: Smart Money institusional dengan 7D Realized PnL terverifikasi.
-  * `[ONCHAIN 🌐]`: Whale aktif hasil temuan mandiri On-Chain DEX Graph Indexer.
-  * `[FOMO ⚡]`: Top trader FOMO hasil verifikasi on-chain.
-* **Tab `[3] WHALE GEMS RADAR 💎`**: Tabel konsensus multi-whale, klasifikasi MCap (Nano/Micro), pool liquidity, harga live, dan status akumulasi.
-* **Tab `[4] SHADOW POSITIONS 💼`**: Posisi trading aktif dengan live floating PnL, smart contract mint, sisa porsi bag (`Bag Remaining %`), dan harga live.
-* **Tab `[5] LATENCY & STATS 📊`**: Latensi RPC Helius & Alchemy, parameter aktif, serta audit log riwayat eksekusi lengkap beserta smart contract token.
-
----
-
-## ⚙️ Parameter Konfigurasi Aktif
-
-| Parameter | Nilai Aktif | Penjelasan Teknis |
-| :--- | :--- | :--- |
-| **`MIN_MARKET_CAP_USD`** | **`$50,000.0`** | Batas bawah MCap (menolak token mati / illiquid pump.fun dead pools). |
-| **`MAX_MARKET_CAP_USD`** | **`$20,000,000.0`** | Batas atas MCap (fokus pada koin mikro dengan potensi asymmetric upside). |
-| **`WRAPPED_ASSET_BLACKLIST`** | **`cbBTC`, `WBTC`, `WETH` + exact contracts** | Mencegah BTC/gas wrapper masuk sebagai posisi copy-trade. |
-| **`MARKET_CAP_FAIL_CLOSED`** | **`true` untuk EVM** | Market cap hilang/tidak valid ditolak dengan `REJECTED_MARKET_CAP_UNVERIFIED`. |
-| **`MIN_WHALE_BUY_USD`** | **`$250.0`** | Batas minimal order whale (menyaring transaksi debu/spam). |
-| **`MAX_PRICE_IMPACT_PCT`** | **`15.0%`** | Toleransi slippage kedalaman pool DEX nano/micro-cap. |
-| **`MAX_PRICE_DELTA_PCT`** | **`+10.0%`** | Batas toleransi lonjakan harga masuk bot vs harga entry whale (*anti-pucuk*). |
-| **`MIN_LIQUIDITY_USD`** | **`$5,000.0`** | Batas minimal likuiditas pool DEX efektif. |
-| **`POSITION_SIZE_USD`** | **`$5.0`** | Ukuran posisi trading per order shadow copy-trade. |
-| **`SHADOW_EXIT_ENABLED`** | **`true`** | Mode mirror murni (menjual parsial/penuh mengikuti persentase dump whale). |
-
----
-
-## 🛠️ Skrip Harvester & Forensik (`scripts/`)
-
-* **`whale_cluster_detective.py`**: Skrip forensik pelacak jejak pendanaan on-chain (parent-child transfer trace) untuk Top Tier-S Whales.
-* **`one_shot_fomo_harvester.py`**: Skrip ekstraksi snapshot 100 top traders (7D, 30D, All-Time) ke SQLite tanpa memicu restriksi API.
-* **`dune_smart_money_harvester.py`**: Ingestion smart money terkurasi dari Dune Analytics (mis. Top 10k Pump.fun Traders, multi-bagger 10x-100x snipers) dengan filter ketat win rate $\ge 55\%$, realized PnL $\ge \$10,000$, dan minimum 3 multi-baggers. Default **dry-run**, ingest dengan `--execute`.
-* **`leaderboard_wallet_harvester.py`**: One-shot harvester Solana Tracker dan OKX Smart Money leaderboard; default **dry-run**, validasi address chain-aware, deduplikasi, dan ingest eksplisit dengan `--execute`. Credential hanya dari environment (`SOLANA_TRACKER_API_KEY`, `OKX_API_KEY`, `OKX_SECRET_KEY`, `OKX_PASSPHRASE`).
-* Provider discovery baru tidak menggunakan Alchemy/Birdeye; live monitoring tetap mengikuti konfigurasi engine yang tersedia.
-
-Contoh aman (default dry-run):
-```bash
-export SOLANA_TRACKER_API_KEY='[REDACTED]'
-export OKX_API_KEY='[REDACTED]'
-export OKX_SECRET_KEY='[REDACTED]'
-export OKX_PASSPHRASE='[REDACTED]'
-python3 scripts/leaderboard_wallet_harvester.py --limit 100
-# Tambahkan --execute hanya setelah meninjau output kandidat.
+```text
+PoolManager:    0x8366a39CC670B4001A1121B8F6A443A643e40951
+PositionManager:0x58daec3116aae6D93017bAAea7749052E8a04fA7
+V4Quoter:       0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94
+UniversalRouter:0x8876789976decbfcbbbe364623c63652db8c0904
+Permit2:        0x000000000022D473030F116dDEE9F6B43aC78BA3
 ```
 
-OKX dipanggil per chain yang didukung adapter (Solana, Ethereum, Base; Arbitrum dapat ditolak API bila parameter tidak tersedia). Adapter tidak melakukan polling kontinu.
+## Position dan gating
 
-* **`nansen_7d_smart_money_harvester.py`**: Memindai Top Smart Money 7D PnL tertinggi via Nansen API v2.
-* **`screen_fomo_bottom_vs_top.py`**: Pemindaian koin berklaster modal besar pada whale portofolio.
+Aturan umum yang dipakai lintas executor:
 
----
+- identitas aset adalah `chain + contract/mint address`, bukan ticker;
+- asset blacklist diterapkan sebelum entry;
+- harga, liquidity, market cap, amount, dan slippage harus valid serta finite;
+- satu posisi aktif per token dan chain;
+- averaging hanya dari whale berbeda;
+- same-whale re-entry diblokir;
+- partial exit dan full exit diproses secara proporsional;
+- posisi live hanya boleh dipersist setelah bukti transaksi dan balance on-chain lengkap.
 
-## 🚀 Panduan Menjalankan Bot
+Parameter runtime dibaca dari `.env`/secret manager melalui `Config::load()`. Gunakan `.env.example` sebagai referensi nama variabel. Jangan commit `.env`, private key, API key, atau database runtime.
 
-### 1. Menjalankan Dashboard TUI (All-in-One)
-Perintah ini otomatis menyalakan background engine daemon dan membuka antarmuka TUI:
+## Mode dry-run Robinhood
+
+Runner dry-run eksplisit tersedia sebagai:
+
 ```bash
+ROBINHOOD_POOL_INIT_BLOCK=0x3ad690f \
+ROBINHOOD_DRY_RUN_TOKEN=0xfad40755de679b262337f8d964d75cac51f8c643 \
+ROBINHOOD_DRY_RUN_SYMBOL=AC \
+ROBINHOOD_TRADE_AMOUNT_WEI=1000000000000 \
+cargo run --release --bin robinhood-dry-run
+```
+
+Pipeline read-only:
+
+```text
+chain validation
+→ deployment validation
+→ wallet/native balance
+→ PoolKey discovery
+→ V4 quote eth_call
+→ Universal Router calldata
+→ router eth_call
+→ eth_estimateGas
+→ selesai tanpa signing/broadcast/DB position
+```
+
+`ROBINHOOD_POOL_INIT_BLOCK` opsional, tetapi disarankan bila block Initialize sudah diketahui agar tidak melakukan scan log besar berulang. Nominal dry-run di atas hanya berlaku untuk proses tersebut dan bukan konfigurasi strategi permanen.
+
+## Status eksekusi Robinhood
+
+Sebelum disebut siap live, jalur berikut wajib lulus pada data on-chain aktual:
+
+```text
+PoolKey valid
+→ quote stabil
+→ balance/allowance/nonce/gas
+→ router eth_call
+→ eth_estimateGas
+→ signing dengan key yang sudah dirotasi
+→ broadcast canary
+→ receipt status=1
+→ Swap event terverifikasi
+→ balance delta terverifikasi
+→ persist posisi
+```
+
+Saat ini fondasi RPC, discovery, encoder, dan test sudah tersedia. BUY dry-run masih memerlukan verifikasi provider/quote yang stabil; SELL on-chain dan live reconciliation Robinhood belum selesai. Jangan mengaktifkan Robinhood untuk copy-trade produksi berdasarkan test/build saja.
+
+## Database
+
+```text
+data/trading_state.db   posisi, signal, activity, trade history, tracked token
+data/wallet_registry.db registry smart wallet
+```
+
+Kedua database memakai SQLite WAL. Jangan menghapus atau mereset database tanpa backup dan persetujuan eksplisit. `make reset` bersifat destruktif terhadap state runtime dan tidak boleh dipakai sembarangan.
+
+## Menjalankan
+
+```bash
+# Build optimized binaries
+make release
+
+# Test suite
+make test
+
+# Jalankan engine daemon
+make engine
+
+# Jalankan engine + TUI
 make start
+
+# Hentikan engine
+make stop
+
+# Restart engine
+make restart
 ```
 
-### 2. Mengelola Engine Daemon
-* **Menyalakan Daemon di Background:** `make engine`
-* **Menghentikan Daemon:** `make stop`
-* **Restart Daemon & Clear Socket:** `make restart`
-* **Menjalankan Test Suite:** `make test`
+Binary utama:
 
-### 3. Shortcut Navigasi TUI:
-* **`[1]` / `[2]` / `[3]` / `[4]` / `[5]`**: Berpindah tab dashboard secara instan.
-* **`[Tab]` / `[Shift+Tab]`**: Rotasi tab berikutnya / sebelumnya.
-* **`[Q]` / `[Esc]`**: Keluar dari dashboard visual (engine tetap jalan di background).
+```text
+zenithsw-engine       daemon engine
+zenithsw              TUI dashboard
+robinhood_probe       RPC/pool discovery probe
+robinhood-dry-run     read-only Robinhood BUY simulation runner
+```
 
-## 🔐 Kebijakan Credential Provider
+## Verifikasi sebelum commit/release
 
-API key/secret/passphrase tidak pernah ditulis ke source code, SQLite, log, README, atau commit. Credential yang pernah dibagikan sebaiknya dirotasi setelah pengujian.
+```bash
+cargo test --locked
+cargo build --release --locked
+git diff --check
+```
+
+Warnings compiler harus dipisahkan dari failure. Lulus test/build tidak sama dengan bukti transaksi live.
+
+## Credential dan keamanan
+
+- Credential hanya dari environment atau secret manager.
+- Jangan cetak credential ke log, README, source, atau commit.
+- Credential yang pernah dikirim melalui chat harus dirotasi sebelum live.
+- Jangan menonaktifkan verifikasi TLS untuk mengatasi masalah endpoint.
+- Live broadcast memerlukan canary eksplisit: token, nominal, arah transaksi, batas gas/slippage, dan izin broadcast.

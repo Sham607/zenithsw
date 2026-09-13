@@ -21,10 +21,9 @@ async fn main() -> Result<()> {
         solana_rpc_url: "".to_string(),
         solana_ws_url: "".to_string(),
         solana_private_key: None,
-        arbitrum_rpc_url: "".to_string(),
-        arbitrum_ws_url: "".to_string(),
-        base_rpc_url: "".to_string(),
-        base_ws_url: "".to_string(),
+        robinhood_rpc_url: "".to_string(),
+        robinhood_ws_url: "".to_string(),
+        robinhood_api_key: None,
         evm_private_key: None,
         fomo_auth_token: None,
         fomo_sync_interval_sec: 60,
@@ -45,7 +44,8 @@ async fn main() -> Result<()> {
         enable_solana: true,
         enable_robinhood: false,
         enable_base: false,
-        db_path: "data/smart_wallets.db".to_string(),
+        trading_db_path: "data/trading_state.db".to_string(),
+        wallet_db_path: "data/wallet_registry.db".to_string(),
         ipc_socket_path: "/tmp/zenithsw.sock".to_string(),
     });
 
@@ -66,12 +66,15 @@ async fn main() -> Result<()> {
     let enable_base = config.enable_base;
 
     // Populate initial state from local SQLite database if available
-    if let Ok(db) = SmartWalletDb::new(&config.db_path) {
+    if let Ok(db) = SmartWalletDb::new_with_wallet_path(
+        &config.trading_db_path,
+        &config.wallet_db_path,
+    ) {
         if let Ok(mut state) = app.lock() {
             if let Ok(mut wallets) = db.get_qualified_wallets() {
                 wallets.retain(|w| match w.chain {
                     Chain::Solana => enable_sol,
-                    Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                    Chain::Robinhood => enable_rh,
                     Chain::Base => enable_base,
                     _ => false,
                 });
@@ -82,7 +85,7 @@ async fn main() -> Result<()> {
             if let Ok(mut tokens) = db.get_tracked_tokens(50) {
                 tokens.retain(|t| match t.chain {
                     Chain::Solana => enable_sol,
-                    Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                    Chain::Robinhood => enable_rh,
                     Chain::Base => enable_base,
                     _ => false,
                 });
@@ -91,7 +94,7 @@ async fn main() -> Result<()> {
             if let Ok(mut positions) = db.get_active_positions() {
                 positions.retain(|p| match p.chain {
                     Chain::Solana => enable_sol,
-                    Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                    Chain::Robinhood => enable_rh,
                     Chain::Base => enable_base,
                     _ => false,
                 });
@@ -100,7 +103,7 @@ async fn main() -> Result<()> {
             if let Ok(mut trades) = db.get_recent_trades(50) {
                 trades.retain(|t| match t.chain {
                     Chain::Solana => enable_sol,
-                    Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                    Chain::Robinhood => enable_rh,
                     Chain::Base => enable_base,
                     _ => false,
                 });
@@ -111,15 +114,19 @@ async fn main() -> Result<()> {
 
     // Task 1: Real-Time Periodic Local Database Sync (Ensures live PnL, fresh wallets, activities & trades)
     let app_db_sync = app.clone();
-    let db_path_sync = config.db_path.clone();
+    let trading_db_path_sync = config.trading_db_path.clone();
+    let wallet_db_path_sync = config.wallet_db_path.clone();
     tokio::spawn(async move {
-        if let Ok(db) = SmartWalletDb::new(&db_path_sync) {
+        if let Ok(db) = SmartWalletDb::new_with_wallet_path(
+            &trading_db_path_sync,
+            &wallet_db_path_sync,
+        ) {
             loop {
                 if let Ok(mut state) = app_db_sync.lock() {
                     if let Ok(mut wallets) = db.get_qualified_wallets() {
                         wallets.retain(|w| match w.chain {
                             Chain::Solana => enable_sol,
-                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Robinhood => enable_rh,
                             Chain::Base => enable_base,
                             _ => false,
                         });
@@ -130,7 +137,7 @@ async fn main() -> Result<()> {
                     if let Ok(mut tokens) = db.get_tracked_tokens(50) {
                         tokens.retain(|t| match t.chain {
                             Chain::Solana => enable_sol,
-                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Robinhood => enable_rh,
                             Chain::Base => enable_base,
                             _ => false,
                         });
@@ -139,7 +146,7 @@ async fn main() -> Result<()> {
                     if let Ok(mut positions) = db.get_active_positions() {
                         positions.retain(|p| match p.chain {
                             Chain::Solana => enable_sol,
-                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Robinhood => enable_rh,
                             Chain::Base => enable_base,
                             _ => false,
                         });
@@ -148,7 +155,7 @@ async fn main() -> Result<()> {
                     if let Ok(mut trades) = db.get_recent_trades(50) {
                         trades.retain(|t| match t.chain {
                             Chain::Solana => enable_sol,
-                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Robinhood => enable_rh,
                             Chain::Base => enable_base,
                             _ => false,
                         });
@@ -157,7 +164,7 @@ async fn main() -> Result<()> {
                     if let Ok(mut acts) = db.get_recent_activities(50) {
                         acts.retain(|a| match a.chain {
                             Chain::Solana => enable_sol,
-                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Robinhood => enable_rh,
                             Chain::Base => enable_base,
                             _ => false,
                         });
@@ -166,7 +173,7 @@ async fn main() -> Result<()> {
                     if let Ok(mut sigs) = db.get_recent_signals(50) {
                         sigs.retain(|s| match s.chain {
                             Chain::Solana => enable_sol,
-                            Chain::Robinhood | Chain::Arbitrum => enable_rh,
+                            Chain::Robinhood => enable_rh,
                             Chain::Base => enable_base,
                             _ => false,
                         });

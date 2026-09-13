@@ -10,14 +10,14 @@ use std::time::Duration;
 
 pub struct WhaleClusterDetective {
     solana_rpc_url: String,
-    arbitrum_rpc_url: String,
+    robinhood_rpc_url: String,
     db: Arc<SmartWalletDb>,
     client: Client,
     excluded_contracts: HashSet<String>,
 }
 
 impl WhaleClusterDetective {
-    pub fn new(solana_rpc_url: &str, arbitrum_rpc_url: &str, db: Arc<SmartWalletDb>) -> Self {
+    pub fn new(solana_rpc_url: &str, robinhood_rpc_url: &str, db: Arc<SmartWalletDb>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(12))
             .build()
@@ -39,14 +39,15 @@ impl WhaleClusterDetective {
 
         Self {
             solana_rpc_url: solana_rpc_url.to_string(),
-            arbitrum_rpc_url: arbitrum_rpc_url.to_string(),
+            robinhood_rpc_url: robinhood_rpc_url.to_string(),
             db,
             client,
             excluded_contracts: excluded,
         }
     }
 
-    /// Forensic scan: Traces funding transfers from top Tier-S/A smart wallets to identify subsidiary shadow wallets
+    /// Forensic dry-run: returns candidates without mutating the wallet registry.
+    /// Candidates require independent swap verification before explicit ingestion.
     pub async fn trace_top_whale_clusters(&self) -> Result<Vec<SmartWallet>> {
         let mut discovered_shadows = Vec::new();
 
@@ -61,27 +62,24 @@ impl WhaleClusterDetective {
 
         println!("[WHALE CLUSTER DETECTIVE 🕵️] Tracing on-chain funding clusters for {} Tier-S wallets...", top_wallets.len());
 
-        for parent in top_wallets.iter().take(20) {
+        for parent in top_wallets.iter().take(50) {
             match parent.chain {
-                Chain::Robinhood | Chain::Base | Chain::Arbitrum | Chain::Ethereum => {
+                Chain::Robinhood => {
                     let shadows = self
                         .trace_evm_subsidiaries(parent)
                         .await
                         .unwrap_or_default();
-                    for s in shadows {
-                        let _ = self.db.upsert_wallet(&s);
-                        discovered_shadows.push(s);
-                    }
+                    discovered_shadows.extend(shadows);
                 }
                 Chain::Solana => {
                     let shadows = self
                         .trace_solana_subsidiaries(parent)
                         .await
                         .unwrap_or_default();
-                    for s in shadows {
-                        let _ = self.db.upsert_wallet(&s);
-                        discovered_shadows.push(s);
-                    }
+                    discovered_shadows.extend(shadows);
+                }
+                Chain::Arbitrum | Chain::Base | Chain::Ethereum => {
+                    // Non-Robinhood EVM chains are not traced until chain-specific RPC is wired.
                 }
             }
         }
@@ -108,7 +106,7 @@ impl WhaleClusterDetective {
 
         let resp = self
             .client
-            .post(&self.arbitrum_rpc_url)
+            .post(&self.robinhood_rpc_url)
             .json(&payload)
             .send()
             .await?;
@@ -168,16 +166,16 @@ impl WhaleClusterDetective {
                     rank: parent.rank + 50,
                     name: sub_name,
                     handle: sub_handle,
-                    chain: Chain::Robinhood,
+                    chain: parent.chain,
                     address: to_addr,
                     tier: WalletTier::TierB,
-                    pnl_24h_usd: (parent.pnl_24h_usd * 0.35).max(15000.0),
-                    win_rate_pct: (parent.win_rate_pct * 0.95).max(72.0),
-                    total_trades: 35,
-                    source: "CLUSTER_DETECTIVE".to_string(),
-                    reputation_score: 55.0,
+                    pnl_24h_usd: 0.0,
+                    win_rate_pct: 0.0,
+                    total_trades: 0,
+                    source: "CLUSTER_FORENSIC_CANDIDATE".to_string(),
+                    reputation_score: 0.0,
                     execution_track: crate::models::ExecutionTrack::FastLane,
-                    is_active: true,
+                    is_active: false,
                     last_seen_at: Some(now),
                     updated_at: now,
                 };
@@ -188,69 +186,9 @@ impl WhaleClusterDetective {
         Ok(subsidiaries)
     }
 
-    async fn trace_solana_subsidiaries(&self, parent: &SmartWallet) -> Result<Vec<SmartWallet>> {
-        let mut subsidiaries = Vec::new();
-        // Solana public RPC query for signatures
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [parent.address, {"limit": 5}]
-        });
-
-        let rpc_endpoint = if self.solana_rpc_url.contains("helius-rpc") {
-            "https://api.mainnet-beta.solana.com"
-        } else {
-            &self.solana_rpc_url
-        };
-
-        let resp = self
-            .client
-            .post(rpc_endpoint)
-            .header("User-Agent", "Mozilla/5.0")
-            .json(&payload)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            return Ok(subsidiaries);
-        }
-
-        let json: Value = resp.json().await?;
-        if let Some(sigs) = json.get("result").and_then(|r| r.as_array()) {
-            if !sigs.is_empty() {
-                // Verified active Solana cluster activity
-                let clean_handle = parent.handle.trim_start_matches('@');
-                let sub_handle = format!("{}_shadow", clean_handle);
-
-                if let Ok(None) = self
-                    .db
-                    .get_wallet_by_address(&format!("sol_shadow_{}", &parent.address[..8]))
-                {
-                    let now = Utc::now();
-                    let shadow_wallet = SmartWallet {
-                        id: None,
-                        rank: parent.rank + 50,
-                        name: format!("{} Shadow #1", parent.name),
-                        handle: sub_handle,
-                        chain: Chain::Solana,
-                        address: format!("sol_shadow_{}", &parent.address[..8]),
-                        tier: WalletTier::TierB,
-                        pnl_24h_usd: (parent.pnl_24h_usd * 0.4).max(20000.0),
-                        win_rate_pct: (parent.win_rate_pct * 0.96).max(75.0),
-                        total_trades: 40,
-                        source: "CLUSTER_DETECTIVE".to_string(),
-                        reputation_score: 55.0,
-                        execution_track: crate::models::ExecutionTrack::FastLane,
-                        is_active: true,
-                        last_seen_at: Some(now),
-                        updated_at: now,
-                    };
-                    subsidiaries.push(shadow_wallet);
-                }
-            }
-        }
-
-        Ok(subsidiaries)
+    async fn trace_solana_subsidiaries(&self, _parent: &SmartWallet) -> Result<Vec<SmartWallet>> {
+        // A parent signature alone cannot identify a subsidiary address. Keep this path
+        // fail-closed until token-transfer and swap instructions are decoded together.
+        Ok(Vec::new())
     }
 }

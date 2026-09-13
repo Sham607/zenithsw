@@ -41,11 +41,11 @@ for s in sigs:
     delta = post - pre
 
     # Look at token balance changes for PUBKEY
-    pre_tokens = {tb["mint"]: float(tb["uiTokenAmount"]["uiAmount"] or 0) 
+    pre_tokens = {tb["mint"]: float(tb["uiTokenAmount"]["uiAmount"] or 0)
                   for tb in meta.get("preTokenBalances", []) if tb.get("owner") == PUBKEY}
-    post_tokens = {tb["mint"]: float(tb["uiTokenAmount"]["uiAmount"] or 0) 
+    post_tokens = {tb["mint"]: float(tb["uiTokenAmount"]["uiAmount"] or 0)
                    for tb in meta.get("postTokenBalances", []) if tb.get("owner") == PUBKEY}
-    
+
     all_mints = set(pre_tokens.keys()).union(set(post_tokens.keys()))
     token_diffs = {}
     for m in all_mints:

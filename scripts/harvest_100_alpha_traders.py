@@ -61,7 +61,7 @@ async def fetch_data():
                 url = f"https://data.solanatracker.io/v2/pnl/leaderboard/top?limit=50&days=30&pnlMode=adjusted&cursor={urllib.parse.quote(cursor)}"
             else:
                 url = "https://data.solanatracker.io/v2/pnl/leaderboard/top?limit=50&days=30&pnlMode=adjusted"
-            
+
             print(f"Fetching Page {page} from PnL V2...")
             try:
                 async with session.get(url, headers=headers) as resp:

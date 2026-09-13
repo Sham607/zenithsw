@@ -82,17 +82,15 @@ impl ConfluenceEngine {
             });
         }
 
-        // 1c. Duplicate Whale & Max Token Exposure Check on Active Positions
+        // 1c. Max Token Exposure Check on Active Positions ($50.0 max)
+        // Note: Re-entry / DCA is explicitly allowed across distinct whales or the same accumulating whale
         if let Ok(active_positions) = self.db.get_active_positions() {
             if let Some(pos) = active_positions.iter().find(|p| {
                 p.token_mint.eq_ignore_ascii_case(&activity.token_mint) && p.chain == activity.chain
             }) {
-                // Reject if THIS specific whale address is already part of this active position
-                if pos
-                    .target_whale_address
-                    .to_lowercase()
-                    .contains(&activity.wallet_address.to_lowercase())
-                {
+                let max_exposure_usd = 50.0;
+                let projected_exposure = pos.amount_usd + self.config.position_size_usd;
+                if !projected_exposure.is_finite() || projected_exposure > max_exposure_usd {
                     return Ok(ShadowSignal {
                         chain: activity.chain,
                         token_symbol: activity.token_symbol.clone(),
@@ -100,40 +98,15 @@ impl ConfluenceEngine {
                         whale_handle: activity.wallet_handle.clone(),
                         whale_address: activity.wallet_address.clone(),
                         whale_tier: wallet.tier,
-                track: wallet.execution_track,
+                        track: wallet.execution_track,
                         whale_entry_price: activity.execution_price_usd,
                         current_pool_price,
                         price_delta_pct: 0.0,
                         pool_liquidity_usd,
                         is_passed: false,
                         rejection_reason: Some(format!(
-                            "REJECTED_WHALE_ALREADY_IN_POSITION (@{})",
-                            activity.wallet_handle
-                        )),
-                        confluence_count: 0,
-                        timestamp: now,
-                    });
-                }
-
-                // Reject if max exposure per token is reached ($15.0 max)
-                let max_exposure_usd = 15.0;
-                if pos.amount_usd >= max_exposure_usd {
-                    return Ok(ShadowSignal {
-                        chain: activity.chain,
-                        token_symbol: activity.token_symbol.clone(),
-                        token_mint: activity.token_mint.clone(),
-                        whale_handle: activity.wallet_handle.clone(),
-                        whale_address: activity.wallet_address.clone(),
-                        whale_tier: wallet.tier,
-                track: wallet.execution_track,
-                        whale_entry_price: activity.execution_price_usd,
-                        current_pool_price,
-                        price_delta_pct: 0.0,
-                        pool_liquidity_usd,
-                        is_passed: false,
-                        rejection_reason: Some(format!(
-                            "REJECTED_MAX_TOKEN_EXPOSURE_REACHED (${:.2} >= ${:.2})",
-                            pos.amount_usd, max_exposure_usd
+                            "REJECTED_MAX_TOKEN_EXPOSURE_REACHED (projected ${:.2} > ${:.2})",
+                            projected_exposure, max_exposure_usd
                         )),
                         confluence_count: 0,
                         timestamp: now,
@@ -166,14 +139,22 @@ impl ConfluenceEngine {
             });
         }
 
-        // 2. Strict Price Discovery Gate (Zero price is an immediate reject)
-        let whale_entry_price = if activity.execution_price_usd > 0.0 {
+        // 2. Strict Price Discovery Gate (finite positive values are mandatory)
+        let whale_entry_price = if activity.execution_price_usd.is_finite()
+            && activity.execution_price_usd > 0.0
+        {
             activity.execution_price_usd
         } else {
             current_pool_price
         };
 
-        if whale_entry_price <= 0.0 || current_pool_price <= 0.0 {
+        if !whale_entry_price.is_finite()
+            || whale_entry_price <= 0.0
+            || !current_pool_price.is_finite()
+            || current_pool_price <= 0.0
+            || !pool_liquidity_usd.is_finite()
+            || pool_liquidity_usd <= 0.0
+        {
             is_passed = false;
             rejection_reason = Some(format!(
                 "INVALID_PRICE_OR_UNINDEXED_POOL (Whale: ${:.6}, Pool: ${:.6})",
@@ -263,11 +244,9 @@ impl ConfluenceEngine {
         }
 
         // Gating Check B: Strict Execution Whitelist Guard
-        // 1. Unverified automated sources (Cluster Detective, On-Chain Indexer) are strictly blocked from execution
-        if wallet.source.contains("CLUSTER")
-            || wallet.source.contains("DETECTIVE")
-            || wallet.source.contains("INDEXER")
-        {
+        // 1. Unverified automated sources (only generic auto-indexers without Tier-S reputation) are blocked
+        // Tier-S clusters and validated shadow arms are explicitly permitted to execute
+        if wallet.tier != WalletTier::TierS && (wallet.source.contains("INDEXER") || wallet.source.contains("DETECTIVE")) {
             is_passed = false;
             if rejection_reason.is_none() {
                 rejection_reason = Some(format!(

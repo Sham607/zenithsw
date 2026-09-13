@@ -348,7 +348,8 @@ impl SolanaStreamListener {
         // Source 1: DexScreener API with strict baseToken matching & aggregated liquidity
         let url = format!("https://api.dexscreener.com/latest/dex/tokens/{}", mint);
         if let Ok(res) = client.get(&url).send().await {
-            if let Ok(json) = res.json::<Value>().await {
+            if res.status().is_success() {
+                if let Ok(json) = res.json::<Value>().await {
                 if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
                     if !pairs.is_empty() {
                         let mut max_liq = 0.0;
@@ -387,9 +388,9 @@ impl SolanaStreamListener {
                                 .and_then(|v| v.as_f64())
                                 .unwrap_or(0.0);
 
+                            // Market cap harus berasal dari field marketCap; FDV bukan market cap.
                             let mcap: f64 = pair
                                 .get("marketCap")
-                                .or_else(|| pair.get("fdv"))
                                 .and_then(|v| v.as_f64())
                                 .unwrap_or(0.0);
 
@@ -471,6 +472,7 @@ impl SolanaStreamListener {
                     }
                 }
             }
+        }
         }
 
         // Source 2: DexScreener Search Endpoint Fallback with strict baseToken matching

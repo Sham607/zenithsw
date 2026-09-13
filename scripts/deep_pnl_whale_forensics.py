@@ -7,7 +7,7 @@ conn.row_factory = sqlite3.Row
 cur = conn.cursor()
 
 cur.execute("""
-    SELECT target_whale, 
+    SELECT target_whale,
            count(*) as total_trades,
            sum(case when pnl_usd > 0 then 1 else 0 end) as wins,
            sum(case when pnl_usd < 0 then 1 else 0 end) as losses,

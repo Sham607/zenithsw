@@ -37,17 +37,17 @@ def sync_leaderboard(token, conn):
     url = "https://prod-api.fomo.family/v2/leaderboard?timeframe=24h"
     headers = get_headers(token)
     req = urllib.request.Request(url, headers=headers)
-    
+
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
             items = data.get('responseObject', {}).get('leaderboard', [])
             if not items:
                 return (0, 200, None)
-            
+
             cursor = conn.cursor()
             now = datetime.now(timezone.utc).isoformat()
-            
+
             for idx, it in enumerate(items):
                 rank = idx + 1
                 name = it.get('displayName') or 'Trader'
@@ -56,7 +56,7 @@ def sync_leaderboard(token, conn):
                 evm_addr = it.get('evmAddress') or ''
                 pnl = float(it.get('totalPnL') or it.get('pnl') or 0.0)
                 num_trades = int(it.get('numTrades') or it.get('swapCount') or 20)
-                
+
                 if sol_addr:
                     chain = "SOLANA"
                     address = sol_addr
@@ -65,7 +65,7 @@ def sync_leaderboard(token, conn):
                     address = evm_addr
                 else:
                     continue
-                
+
                 # Dynamic Tier Allocation:
                 # Rank 1-3  => TIER-S (Top Whale / Legend)
                 # Rank 4-15 => TIER-A (Alpha Hunter)
@@ -76,9 +76,9 @@ def sync_leaderboard(token, conn):
                     tier = "TIER-A"
                 else:
                     tier = "TIER-B"
-                
+
                 win_rate = max(62.0, min(94.5, 88.0 - (rank * 0.25))) if pnl > 0 else 50.0
-                
+
                 cursor.execute("""
                     INSERT INTO wallets (rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, is_active, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
@@ -93,7 +93,7 @@ def sync_leaderboard(token, conn):
                         total_trades = excluded.total_trades,
                         updated_at = excluded.updated_at
                 """, (rank, name, handle, chain, address, tier, pnl, win_rate, num_trades, now))
-                
+
             conn.commit()
             return (len(items), 200, None)
     except urllib.error.HTTPError as e:
@@ -104,9 +104,9 @@ def sync_leaderboard(token, conn):
 def main():
     os.makedirs("data", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    
+
     print("🚀 FOMO Leaderboard Syncer Active (Calibrated Interval: 30s + Adaptive Backoff)")
-    
+
     backoff_sec = 30
     while True:
         token = load_token()
@@ -114,9 +114,9 @@ def main():
             print("[FOMO SYNC 🟡] No FOMO_AUTH_TOKEN in .env. Running on existing SQLite cached wallets.")
             time.sleep(60)
             continue
-            
+
         count, status_code, err_msg = sync_leaderboard(token, conn)
-        
+
         if status_code == 200 and count > 0:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [FOMO SYNC 🟢] Successfully synced {count} Smart Wallets with Realized PnL & Win Rate.")
             backoff_sec = 30
@@ -129,7 +129,7 @@ def main():
         else:
             backoff_sec = 30
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [FOMO SYNC ⚠️] Sync status {status_code}: {err_msg}")
-            
+
         time.sleep(backoff_sec)
 
 if __name__ == "__main__":

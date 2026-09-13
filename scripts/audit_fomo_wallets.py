@@ -14,7 +14,7 @@ for w in wallets:
     chain = w['chain']
     handle = w['handle']
     claimed_pnl = w.get('pnl_24h_usd', 0.0)
-    
+
     if chain == 'SOLANA':
         payload_bal = {'jsonrpc': '2.0', 'id': 1, 'method': 'getBalance', 'params': [addr]}
         try:
@@ -23,7 +23,7 @@ for w in wallets:
         except Exception:
             lamports = 0
         sol_bal = lamports / 1e9
-        
+
         payload_sig = {'jsonrpc': '2.0', 'id': 2, 'method': 'getSignaturesForAddress', 'params': [addr, {'limit': 100}]}
         try:
             r_sig = requests.post(helius_url, json=payload_sig, timeout=5).json()
@@ -32,7 +32,7 @@ for w in wallets:
             sigs = []
         sig_count = len(sigs)
         last_time = sigs[0].get('blockTime', 0) if sigs else 0
-        
+
         results.append({
             'handle': handle,
             'name': w.get('name', handle),
@@ -53,14 +53,14 @@ for w in wallets:
             eth_bal = int(hex_val, 16) / 1e18
         except Exception:
             eth_bal = 0.0
-        
+
         payload_tc = {'jsonrpc': '2.0', 'id': 2, 'method': 'eth_getTransactionCount', 'params': [addr, 'latest']}
         try:
             r_tc = requests.post(arb_url, json=payload_tc, timeout=5).json()
             tc = int(r_tc.get('result', '0x0'), 16)
         except Exception:
             tc = 0
-        
+
         results.append({
             'handle': handle,
             'name': w.get('name', handle),

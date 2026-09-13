@@ -18,10 +18,10 @@ for name, addr in addrs:
     req = urllib.request.Request("https://api.mainnet-beta.solana.com", data=json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress", "params": [addr, {"limit": 1000}]
     }).encode(), headers={"Content-Type": "application/json"})
-    
+
     with urllib.request.urlopen(req) as resp:
         sigs = json.loads(resp.read().decode())["result"]
-    
+
     # Check balance
     req_bal = urllib.request.Request("https://api.mainnet-beta.solana.com", data=json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [addr]

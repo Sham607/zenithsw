@@ -41,7 +41,7 @@ for row in sol_wallets:
     if address in qualified_addrs:
         retained_count += 1
         continue
-    
+
     # Determine reason
     if address in disqualified_alive_dict:
         info = disqualified_alive_dict[address]
@@ -51,7 +51,7 @@ for row in sol_wallets:
 
     # Insert into quarantine
     q_cur.execute("""
-        INSERT OR REPLACE INTO quarantined_wallets 
+        INSERT OR REPLACE INTO quarantined_wallets
         (original_id, rank, name, handle, chain, address, original_tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, quarantine_reason, quarantined_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (w_id, rank, name, handle, chain, address, tier, pnl, wr, trades, source, rep, reason, now_iso))
@@ -90,7 +90,7 @@ for idx, w in enumerate(qualified):
         tier_a_count += 1
 
     cur.execute("""
-        UPDATE wallets 
+        UPDATE wallets
         SET rank = ?, tier = ?, pnl_24h_usd = ?, reputation_score = ?, updated_at = ?, is_active = 1
         WHERE address = ? AND chain = 'SOLANA'
     """, (new_rank, new_tier, usd_equity, round(rep_score, 1), now_iso, addr))

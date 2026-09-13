@@ -1,6 +1,5 @@
 use crate::db::SmartWalletDb;
 use crate::models::{ActivityType, Chain, WalletActivity};
-use crate::streams::solana_stream::SolanaStreamListener;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -31,13 +30,44 @@ impl EvmStreamListener {
         }
     }
 
+    pub async fn validate_robinhood_chain(&self) -> Result<()> {
+        if self.chain != Chain::Robinhood {
+            return Err(anyhow::anyhow!("EVM listener chain is not Robinhood"));
+        }
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_chainId",
+            "params": []
+        });
+        let response = self.client.post(&self.rpc_url).json(&payload).send().await?;
+        let value: Value = response.error_for_status()?.json().await?;
+        let chain_id = value.get("result").and_then(Value::as_str).unwrap_or("");
+        if chain_id != "0x1237" {
+            return Err(anyhow::anyhow!(
+                "wrong Robinhood chain id: expected 0x1237 (4663), got {}",
+                chain_id
+            ));
+        }
+        Ok(())
+    }
+
     /// Pulls latest block logs or token balance changes for target EVM wallet
     pub async fn check_wallet_activity(
         &self,
-        handle: &str,
-        address: &str,
-        db: Arc<SmartWalletDb>,
+        _handle: &str,
+        _address: &str,
+        _db: Arc<SmartWalletDb>,
     ) -> Result<Option<WalletActivity>> {
+        if self.chain != Chain::Robinhood {
+            return Ok(None);
+        }
+        // Transfer-only polling is not a valid swap detector. Keep Robinhood
+        // fail-closed until receipt/log decoding verifies a real DEX swap.
+        eprintln!("[ROBINHOOD STREAM BLOCKED] swap log decoder is not installed; ignoring transfer-only data");
+        Ok(None)
+
+        /*
         if self.rpc_url.is_empty() {
             return Ok(None);
         }
@@ -250,5 +280,6 @@ impl EvmStreamListener {
         }
 
         Ok(None)
+        */
     }
 }

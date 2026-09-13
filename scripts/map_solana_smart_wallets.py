@@ -60,34 +60,34 @@ def get_token_metadata(mints):
 def main():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
+
     # Query Nansen, Dune, and FOMO Solana active wallets
     cursor.execute("""
-        SELECT id, rank, name, handle, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source 
-        FROM wallets 
+        SELECT id, rank, name, handle, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source
+        FROM wallets
         WHERE chain = 'SOLANA' AND is_active = 1
-        ORDER BY 
-            CASE source 
-                WHEN 'NANSEN_SOLANA_SM' THEN 1 
-                WHEN 'DUNE_SOLANA_PRO' THEN 2 
+        ORDER BY
+            CASE source
+                WHEN 'NANSEN_SOLANA_SM' THEN 1
+                WHEN 'DUNE_SOLANA_PRO' THEN 2
                 WHEN 'DUNE_PUMPFUN_SNIPERS' THEN 3
-                ELSE 4 
+                ELSE 4
             END,
             pnl_24h_usd DESC
     """)
     wallets = cursor.fetchall()
     conn.close()
-    
+
     print(f"[*] Scanning on-chain active token portfolios across Nansen & Dune Solana Smart Wallets...")
-    
+
     found_with_holdings = 0
     scanned = 0
-    
+
     for w in wallets:
         w_id, rank, name, handle, addr, tier, pnl, wr, trades, source = w
         token_accs = get_token_accounts(addr)
         scanned += 1
-        
+
         # Filter non-zero altcoins
         holding_mints = {}
         for acc in token_accs:
@@ -96,7 +96,7 @@ def main():
             amount = info["tokenAmount"]["uiAmount"]
             if amount and amount > 0 and mint not in ("So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"):
                 holding_mints[mint] = amount
-                
+
         if holding_mints:
             found_with_holdings += 1
             meta = get_token_metadata(list(holding_mints.keys()))
@@ -107,16 +107,16 @@ def main():
                     val_usd = amt * m["price_usd"]
                     if val_usd >= 10.0: # Filter dust tokens
                         valid_holdings.append((m["symbol"], m["name"], amt, val_usd, m["price_usd"], m["mcap_usd"], mint))
-                        
+
             valid_holdings.sort(key=lambda x: x[3], reverse=True)
-            
+
             if valid_holdings:
                 print(f"\n🐋 [{source}] {name} (@{handle})")
                 print(f"   Address: {addr} ({tier}) | WinRate: {wr:.1f}%")
                 print(f"   Tracked Significant Holdings:")
                 for sym, tname, amt, val_usd, price, mcap, mint in valid_holdings[:4]:
                     print(f"     • {sym} ({tname}) | Value: ${val_usd:,.2f} | Balance: {amt:,.1f} @ ${price:.6f} | MCap: ${mcap:,.0f} | Mint: {mint}")
-                    
+
         if found_with_holdings >= 8 or scanned >= 35:
             break
         time.sleep(0.3)

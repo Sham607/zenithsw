@@ -37,12 +37,12 @@ if not API_KEY:
 def gmgn_req(subpath: str, params: dict | None = None, max_retries: int = 3) -> dict:
     if params is None:
         params = {}
-    
+
     for attempt in range(max_retries):
         p = params.copy()
         p["timestamp"] = int(time.time())
         p["client_id"] = str(uuid.uuid4())
-        
+
         qs = "&".join(f"{k}={v}" for k, v in p.items())
         url = f"https://openapi.gmgn.ai{subpath}?{qs}"
         headers = {
@@ -50,7 +50,7 @@ def gmgn_req(subpath: str, params: dict | None = None, max_retries: int = 3) -> 
             "User-Agent": "gmgn-cli/1.0.0"
         }
         req = urllib.request.Request(url, headers=headers)
-        
+
         try:
             time.sleep(0.5) # Safe pacing between calls
             with urllib.request.urlopen(req, timeout=15) as res:

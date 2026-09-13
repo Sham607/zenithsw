@@ -300,6 +300,53 @@ impl SolanaExecutor {
         Ok(signed_tx_base64)
     }
 
+    /// Builds and signs a direct Pump.fun bonding curve swap transaction via PumpPortal Lightning Trade API
+    pub async fn build_and_sign_pumpfun_tx(
+        &self,
+        action: &str, // "buy" or "sell"
+        mint: &str,
+        amount: f64, // SOL amount for buy, Token units for sell
+        slippage_pct: f64,
+        user_pubkey: &str,
+        signing_key: &SigningKey,
+    ) -> Result<String> {
+        let url = "https://pumpportal.fun/api/trade-local";
+        let payload = serde_json::json!({
+            "publicKey": user_pubkey,
+            "action": action,
+            "mint": mint,
+            "denominatedInSol": if action == "buy" { "true" } else { "false" },
+            "amount": amount,
+            "slippage": slippage_pct,
+            "priorityFee": 0.005,
+            "pool": "pump"
+        });
+
+        let res = self.client.post(url).json(&payload).send().await?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let err_body = res.text().await.unwrap_or_default();
+            return Err(anyhow!("PumpPortal API failed ({}): {}", status, err_body));
+        }
+
+        let tx_bytes = res.bytes().await?;
+        if tx_bytes.len() <= 65 {
+            return Err(anyhow!("Invalid PumpPortal transaction payload received"));
+        }
+
+        let mut mutable_tx = tx_bytes.to_vec();
+        let message_bytes = &tx_bytes[65..];
+        let signature = signing_key.sign(message_bytes);
+        mutable_tx[1..65].copy_from_slice(&signature.to_bytes());
+
+        let signed_base64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &mutable_tx,
+        );
+
+        Ok(signed_base64)
+    }
+
     /// Broadcasts signed transaction via Multi-RPC & Jito Anti-MEV Bundles
     pub async fn broadcast_tx(&self, signed_base64: &str) -> Result<String> {
         let payload = serde_json::json!({
@@ -408,13 +455,15 @@ impl SolanaExecutor {
             return Ok(None);
         }
 
-        let mut entry_price = if signal.current_pool_price > 0.0 {
+        let mut entry_price = if signal.current_pool_price.is_finite()
+            && signal.current_pool_price > 0.0
+        {
             signal.current_pool_price
         } else {
             signal.whale_entry_price
         };
 
-        if entry_price <= 0.0 {
+        if !entry_price.is_finite() || entry_price <= 0.0 {
             eprintln!("[SOLANA EXEC ERROR] Cannot open shadow position with 0.0 price!");
             return Ok(None);
         }
@@ -450,51 +499,105 @@ impl SolanaExecutor {
                     }
                 }
 
-                println!(
-                    "[ONCHAIN SOLANA BUY 🚀] Executing real Jupiter swap for {} (${:.2}) with pubkey {}",
-                    signal.token_symbol, amount_usd, user_pubkey
-                );
+                let mut buy_success = false;
+                let is_pump_token = signal.token_mint.ends_with("pump");
 
-                match self
-                    .fetch_jupiter_quote(wsol_mint, &signal.token_mint, amount_lamports, 100)
-                    .await
-                {
-                    Ok(quote) => {
-                        match self
-                            .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
-                            .await
-                        {
-                            Ok(signed_tx) => match self.broadcast_tx(&signed_tx).await {
-                                Ok(sig) => {
-                                    println!("[ONCHAIN BUY CONFIRMED 🟢] TX Sig: {}", sig);
-                                    _onchain_tx_sig = Some(sig);
-
-                                    // Direct on-chain balance reconciliation: query actual token amount received
-                                    tokio::time::sleep(Duration::from_millis(600)).await;
-                                    if let Ok(onchain_bal) = self.get_ui_token_balance(&user_pubkey, &signal.token_mint).await {
-                                        if onchain_bal > 0.0 {
-                                            new_tokens = onchain_bal;
-                                            entry_price = amount_usd / onchain_bal;
-                                            println!("[ONCHAIN RECONCILED 📊] Exact Token Units: {:.4} -> Exact Real Entry Price: ${:.6}",
-                                                onchain_bal, entry_price);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[ONCHAIN BROADCAST FAILED ❌] {}", e);
-                                    return Ok(None);
-                                }
-                            },
-                            Err(e) => {
-                                eprintln!("[JUPITER TX BUILD FAILED ❌] {}", e);
-                                return Ok(None);
+                // Route 1: Direct Pump.fun Bonding Curve if token ends with "pump"
+                if is_pump_token {
+                    println!("[PUMPFUN ROUTE ⚡] Token ends with 'pump'. Attempting direct bonding curve buy...");
+                    match self
+                        .build_and_sign_pumpfun_tx("buy", &signal.token_mint, amount_native_sol, 15.0, &user_pubkey, &signing_key)
+                        .await
+                    {
+                        Ok(signed_pump_tx) => match self.broadcast_tx(&signed_pump_tx).await {
+                            Ok(sig) => {
+                                println!("[PUMPFUN BUY CONFIRMED 🟢] TX Sig: {}", sig);
+                                _onchain_tx_sig = Some(sig);
+                                buy_success = true;
                             }
+                            Err(e) => {
+                                eprintln!("[PUMPFUN BROADCAST FAILED ⚠️] {}. Falling back to Jupiter...", e);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("[PUMPFUN BUILD FAILED ⚠️] {}. Falling back to Jupiter...", e);
                         }
                     }
-                    Err(e) => {
-                        eprintln!("[JUPITER QUOTE FAILED ❌] {}", e);
+                }
+
+                // Route 2: Jupiter Swap (Default or Fallback if Pump.fun failed)
+                if !buy_success {
+                    println!(
+                        "[JUPITER ROUTE 🪐] Executing swap for {} (${:.2}) with pubkey {}",
+                        signal.token_symbol, amount_usd, user_pubkey
+                    );
+
+                    match self
+                        .fetch_jupiter_quote(wsol_mint, &signal.token_mint, amount_lamports, 100)
+                        .await
+                    {
+                        Ok(quote) => {
+                            match self
+                                .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
+                                .await
+                            {
+                                Ok(signed_tx) => match self.broadcast_tx(&signed_tx).await {
+                                    Ok(sig) => {
+                                        println!("[ONCHAIN BUY CONFIRMED 🟢] TX Sig: {}", sig);
+                                        _onchain_tx_sig = Some(sig);
+                                        buy_success = true;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[ONCHAIN BROADCAST FAILED ❌] {}", e);
+                                        return Ok(None);
+                                    }
+                                },
+                                Err(e) => {
+                                    eprintln!("[JUPITER TX BUILD FAILED ❌] {}", e);
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[JUPITER QUOTE FAILED ❌] {}", e);
+                            return Ok(None);
+                        }
+                    }
+                }
+
+                if buy_success {
+                    let tx_signature = _onchain_tx_sig.as_deref().ok_or_else(|| {
+                        anyhow!("buy broadcast returned success without a transaction signature")
+                    })?;
+                    let confirmed = self
+                        .confirm_transaction_signature(tx_signature, 20)
+                        .await
+                        .unwrap_or(false);
+                    if !confirmed {
+                        eprintln!(
+                            "[ONCHAIN BUY REJECTED ❌] Transaction {} was not confirmed; no position will be persisted.",
+                            tx_signature
+                        );
                         return Ok(None);
                     }
+
+                    // Reconcile exact token balance from chain before creating OPEN position.
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let onchain_bal = self
+                        .get_ui_token_balance(&user_pubkey, &signal.token_mint)
+                        .await
+                        .map_err(|error| anyhow!("buy balance reconciliation failed: {error}"))?;
+                    if !onchain_bal.is_finite() || onchain_bal <= 0.0 {
+                        eprintln!(
+                            "[ONCHAIN BUY REJECTED ❌] Confirmed transaction {} produced no positive token balance; no position will be persisted.",
+                            tx_signature
+                        );
+                        return Ok(None);
+                    }
+                    new_tokens = onchain_bal;
+                    entry_price = amount_usd / onchain_bal;
+                    println!("[ONCHAIN RECONCILED 📊] Exact Token Units: {:.4} -> Exact Real Entry Price: ${:.6}",
+                        onchain_bal, entry_price);
                 }
             } else {
                 eprintln!("[LIVE EXECUTION ERROR ❌] No valid Solana private key found. Refusing trade.");
@@ -512,6 +615,22 @@ impl SolanaExecutor {
             if let Some(mut existing) = active_pos.into_iter().find(|p| {
                 p.token_mint.eq_ignore_ascii_case(&signal.token_mint) && p.chain == Chain::Solana
             }) {
+                // SAME-WHALE RE-ENTRY GUARD: jika whale ini sudah berkontribusi ke posisi ini,
+                // tolak averaging — satu whale hanya boleh satu kontribusi per posisi terbuka.
+                let whale_addr_lower = signal.whale_address.trim().to_lowercase();
+                let whale_already_in = existing
+                    .target_whale_address
+                    .split(',')
+                    .map(|a| a.trim().to_lowercase())
+                    .any(|a| a == whale_addr_lower);
+                if whale_already_in {
+                    eprintln!(
+                        "[SAME-WHALE REENTRY BLOCKED 🛡️] @{} ({}) sudah berkontribusi ke posisi {} ({}). Averaging diblokir.",
+                        signal.whale_handle, &signal.whale_address[..10.min(signal.whale_address.len())],
+                        existing.id, existing.token_symbol
+                    );
+                    return Ok(None);
+                }
                 let prev_usd = existing.amount_usd;
                 let prev_tokens = existing.amount_native;
                 let total_usd = prev_usd + amount_usd;
@@ -657,72 +776,105 @@ impl SolanaExecutor {
                             250
                         };
 
-                        let quote = match self
-                            .fetch_jupiter_quote(
-                                &pos.token_mint,
-                                wsol_mint,
-                                sell_units,
-                                slippage_bps,
-                            )
-                            .await
-                        {
-                            Ok(q) => q,
-                            Err(e) => {
-                                eprintln!(
-                                    "[SELL JUPITER QUOTE FAILED ❌] Mint: {} -> Error: {}. DB position will NOT be closed.",
-                                    pos.token_mint, e
-                                );
-                                return Err(e);
-                            }
-                        };
+                        let is_pump_token = pos.token_mint.ends_with("pump");
+                        let mut sell_broadcasted = false;
+                        let mut final_tx_sig = String::new();
 
-                        let signed_tx = match self
-                            .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
-                            .await
-                        {
-                            Ok(tx) => tx,
-                            Err(e) => {
-                                eprintln!(
-                                    "[SELL JUPITER BUILD FAILED ❌] Error: {}. DB position will NOT be closed.",
-                                    e
-                                );
-                                return Err(e);
+                        // Route 1: If Pump token, attempt PumpPortal direct sell first
+                        if is_pump_token {
+                            println!("[PUMPFUN SELL ROUTE ⚡] Attempting direct bonding curve sell for {}...", pos.token_symbol);
+                            let sell_tokens_float = (sell_units as f64) / 1_000_000.0;
+                            match self
+                                .build_and_sign_pumpfun_tx("sell", &pos.token_mint, sell_tokens_float, 15.0, &user_pubkey, &signing_key)
+                                .await
+                            {
+                                Ok(signed_pump_tx) => match self.broadcast_tx(&signed_pump_tx).await {
+                                    Ok(sig) => {
+                                        println!("[PUMPFUN SELL CONFIRMED 🟢] TX Sig: {}", sig);
+                                        final_tx_sig = sig;
+                                        sell_broadcasted = true;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[PUMPFUN SELL BROADCAST FAILED ⚠️] {}. Falling back to Jupiter...", e);
+                                    }
+                                },
+                                Err(e) => {
+                                    eprintln!("[PUMPFUN SELL BUILD FAILED ⚠️] {}. Falling back to Jupiter...", e);
+                                }
                             }
-                        };
+                        }
 
-                        let tx_sig = match self.broadcast_tx(&signed_tx).await {
-                            Ok(sig) => sig,
-                            Err(e) => {
-                                eprintln!(
-                                    "[SELL BROADCAST FAILED ❌] Error: {}. DB position will NOT be closed.",
-                                    e
-                                );
-                                return Err(e);
-                            }
-                        };
+                        // Route 2: Jupiter Quote & Swap (Default or fallback)
+                        if !sell_broadcasted {
+                            let quote = match self
+                                .fetch_jupiter_quote(
+                                    &pos.token_mint,
+                                    wsol_mint,
+                                    sell_units,
+                                    slippage_bps,
+                                )
+                                .await
+                            {
+                                Ok(q) => q,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[SELL JUPITER QUOTE FAILED ❌] Mint: {} -> Error: {}. DB position will NOT be closed.",
+                                        pos.token_mint, e
+                                    );
+                                    return Err(e);
+                                }
+                            };
+
+                            let signed_tx = match self
+                                .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
+                                .await
+                            {
+                                Ok(tx) => tx,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[SELL JUPITER BUILD FAILED ❌] Error: {}. DB position will NOT be closed.",
+                                        e
+                                    );
+                                    return Err(e);
+                                }
+                            };
+
+                            let tx_sig = match self.broadcast_tx(&signed_tx).await {
+                                Ok(sig) => sig,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[SELL BROADCAST FAILED ❌] Error: {}. DB position will NOT be closed.",
+                                        e
+                                    );
+                                    return Err(e);
+                                }
+                            };
+                            println!("[ONCHAIN SELL CONFIRMED 🟢] TX Sig: {}", tx_sig);
+                            final_tx_sig = tx_sig;
+                        }
 
                         println!(
                             "[SELL BROADCASTED 📡] Sig: https://solscan.io/tx/{} -> Awaiting confirmation...",
-                            tx_sig
+                            final_tx_sig
                         );
 
                         // Strict on-chain confirmation check (20s timeout)
                         let is_confirmed = self
-                            .confirm_transaction_signature(&tx_sig, 20)
+                            .confirm_transaction_signature(&final_tx_sig, 20)
                             .await
                             .unwrap_or(false);
 
                         if !is_confirmed {
                             eprintln!(
                                 "[SELL CONFIRMATION FAILED ❌] On-chain tx {} failed, reverted, or timed out. Position {} will remain OPEN in DB!",
-                                tx_sig, position_id
+                                final_tx_sig, position_id
                             );
                             return Err(anyhow!("On-chain swap transaction reverted or unconfirmed"));
                         }
 
                         println!(
                             "[ONCHAIN SOLANA SELL CONFIRMED 🟢] Swap {} confirmed successfully on-chain!",
-                            tx_sig
+                            final_tx_sig
                         );
 
                         // If 100% full exit, trigger asynchronous rent reclamation for newly empty ATA

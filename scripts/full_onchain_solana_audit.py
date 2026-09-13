@@ -52,10 +52,10 @@ async def run_audit():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, handle, name, address, tier, source, win_rate_pct, pnl_24h_usd 
-        FROM wallets 
+        SELECT id, handle, name, address, tier, source, win_rate_pct, pnl_24h_usd
+        FROM wallets
         WHERE chain='SOLANA'
-        ORDER BY 
+        ORDER BY
             CASE tier WHEN 'TIER-S' THEN 1 WHEN 'TIER-A' THEN 2 ELSE 3 END,
             rank ASC
     """)

@@ -6,7 +6,7 @@ def extract_best_pool_and_liquidity(mint):
         r = requests.get(url, timeout=5).json()
     except Exception as e:
         return None
-    
+
     pairs = r.get("pairs") or []
     if not pairs:
         return None
@@ -22,11 +22,11 @@ def extract_best_pool_and_liquidity(mint):
         price_str = p.get("priceUsd")
         price = float(price_str) if price_str else 0.0
         sym = p.get("baseToken", {}).get("symbol", "")
-        
+
         # Check standard liquidity
         liq_obj = p.get("liquidity") or {}
         liq_usd = float(liq_obj.get("usd") or 0.0)
-        
+
         # If pumpfun curve with null liquidity, estimate from market cap
         if dex_id == "pumpfun" and liq_usd <= 0.0:
             mcap = float(p.get("marketCap") or p.get("fdv") or 0.0)

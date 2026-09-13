@@ -57,7 +57,7 @@ def harvest_solana_nansen_grade(api_key: str, min_winrate: float = 60.0, max_win
     print(f"[*] Querying Dune Analytics for Solana Smart Money (Query ID: {SOLANA_PUMPFUN_QUERY_ID})...")
     rows = fetch_dune_query(SOLANA_PUMPFUN_QUERY_ID, api_key)
     print(f"[*] Ingested {len(rows)} raw on-chain trader profiles from Dune.")
-    
+
     candidates = []
     for r in rows:
         raw_w = r.get("wallet", "")
@@ -78,24 +78,24 @@ def harvest_solana_nansen_grade(api_key: str, min_winrate: float = 60.0, max_win
             tokens_100x = int(r.get("tokens_100x_or_higher", 0))
             rank = int(r.get("rank", 999999))
             last_tx = str(r.get("last_tx", ""))
-            
+
             # --- 5-PILLAR NANSEN-GRADE CONFLUENCE FILTER ---
             # 1. Multi-Token Consistency: Must trade >= 5 distinct tokens (reject single-token dev insiders)
             if num_tokens < 5:
                 continue
-                
+
             # 2. Realistic Human/Semi-Algo Win Rate (60% - 88%, reject pure sandwich MEV 99%)
             if wr < min_winrate or wr > max_winrate:
                 continue
-                
+
             # 3. High Realized Profit (>= $25k)
             if profit < min_pnl:
                 continue
-                
+
             # 4. Asymmetric Multi-Bagger Evidence: Must have caught >= 3 tokens with >= 10x gains
             if tokens_10x < 3:
                 continue
-                
+
             # 5. Activity Bound: >= 20 swaps and <= 300,000 swaps (exclude pure infrastructure spam bots)
             if total_swaps < 20 or total_swaps > 300000:
                 continue
@@ -114,7 +114,7 @@ def harvest_solana_nansen_grade(api_key: str, min_winrate: float = 60.0, max_win
 
             handle = f"dune_sol_{addr[:4]}_{addr[-4:]}".lower()
             name = f"Dune Solana Sniper #{rank} (${profit:,.0f} PnL)"
-            
+
             candidates.append({
                 "rank": rank,
                 "name": name,
@@ -136,7 +136,7 @@ def harvest_solana_nansen_grade(api_key: str, min_winrate: float = 60.0, max_win
             })
         except Exception:
             continue
-            
+
     # Sort by Multi-bagger count first, then win rate, then realized profit
     candidates.sort(key=lambda x: (x["tokens_100x"], x["tokens_50x"], x["tokens_10x"], x["win_rate_pct"], x["pnl_24h_usd"]), reverse=True)
     return candidates
@@ -162,19 +162,19 @@ def main():
         min_pnl=args.min_pnl
     )
     print(f"\n[+] Total candidates passing 5-Pillar Confluence: {len(candidates)}")
-    
+
     # Check existing wallets in SQLite
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT lower(address) FROM wallets")
     existing_wallets = {r[0].lower() for r in cursor.fetchall()}
-    
+
     new_candidates = [c for c in candidates if c["address"].lower() not in existing_wallets]
     print(f"[+] New unindexed candidates: {len(new_candidates)}")
-    
+
     selected = new_candidates[:args.limit]
     print(f"[+] Selected top {len(selected)} verified smart money snipers.")
-    
+
     print("\n" + "="*95)
     print(f"{'Rank':<8} {'Handle':<22} {'Tier':<8} {'WinRate':<9} {'PnL (Realized)':<18} {'100x/50x/10x':<14} {'Address'}")
     print("="*95)
@@ -183,7 +183,7 @@ def main():
     if len(selected) > 20:
         print(f"... and {len(selected)-20} more high-conviction wallets.")
     print("="*95)
-    
+
     if args.execute:
         print("\n[*] Ingesting into SQLite database...")
         inserted = 0
@@ -205,7 +205,7 @@ def main():
         print(f"[SUCCESS] Successfully indexed {inserted} new Solana Nansen-Grade Smart Wallets into SQLite.")
     else:
         print("\n[DRY-RUN] Verification complete. Run with --execute to commit to database.")
-    
+
     conn.close()
 
 if __name__ == "__main__":

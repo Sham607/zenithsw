@@ -28,13 +28,13 @@ for t in lb:
     handle = t.get("userHandle") or "unknown"
     pnl_7d = float(t.get("totalPnL") or 0.0)
     top_holdings = t.get("topHoldings", [])
-    
+
     for h in top_holdings:
         token_addr = h.get("tokenAddress")
         val = float(h.get("value") or 0.0)
         pnl = float(h.get("pnl") or 0.0)
         net_id = h.get("networkId")
-        
+
         if token_addr and val > 10000.0: # Filter holdings > $10k
             if token_addr not in token_whale_map:
                 token_whale_map[token_addr] = []
@@ -58,11 +58,11 @@ ranked_tokens = sorted(
 for token_addr, holders in ranked_tokens[:15]:
     total_val = sum(x["holding_value"] for x in holders)
     whales_list = ", ".join([f"@{x['whale']} (${x['holding_value']:,.0f})" for x in holders[:3]])
-    
+
     # Query DexScreener for Market Structure (Bottom vs Pucuk)
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}"
     dex_req = urllib.request.Request(dex_url, headers={"User-Agent": "Mozilla/5.0"})
-    
+
     sym = "UNKNOWN"
     price = 0.0
     liq = 0.0
@@ -71,7 +71,7 @@ for token_addr, holders in ranked_tokens[:15]:
     chg_6h = 0.0
     chg_1h = 0.0
     status_tag = "UNKNOWN"
-    
+
     try:
         with urllib.request.urlopen(dex_req, timeout=5) as dresp:
             ddata = json.loads(dresp.read().decode())
@@ -85,7 +85,7 @@ for token_addr, holders in ranked_tokens[:15]:
                 chg_24h = float(p.get("priceChange", {}).get("h24") or 0.0)
                 chg_6h = float(p.get("priceChange", {}).get("h6") or 0.0)
                 chg_1h = float(p.get("priceChange", {}).get("h1") or 0.0)
-                
+
                 # Bottom vs Pucuk Decision Engine
                 if chg_24h > 150.0 or chg_6h > 50.0:
                     status_tag = "🔴 LOCAL_TOP / PUCUK (Wait for Pullback)"
@@ -97,7 +97,7 @@ for token_addr, holders in ranked_tokens[:15]:
                     status_tag = "⚪ NEUTRAL_EXPANSION"
     except Exception as e:
         status_tag = f"API_ERROR ({e})"
-        
+
     print(f"Token: {sym} ({token_addr[:10]}...{token_addr[-6:]})")
     print(f"  • Whales ({len(holders)} holders): {whales_list} | Total USD: ${total_val:,.0f}")
     print(f"  • Price: ${price:.6f} | Liq: ${liq:,.0f} | MCap: ${mcap:,.0f}")

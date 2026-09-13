@@ -39,15 +39,15 @@ for tf in timeframes:
                 evm_addr = item.get("evmAddress") or ""
                 pnl = item.get("totalPnL") or 0.0
                 rank = idx + 1
-                
+
                 chain = "SOLANA" if sol_addr else "ROBINHOOD"
                 address = sol_addr if sol_addr else evm_addr
                 if not address:
                     continue
-                
+
                 tier = "TierS" if rank <= 5 else ("TierA" if rank <= 20 else "TierB")
                 win_rate = max(65.0, min(95.0, 92.0 - (rank * 0.3)))
-                
+
                 key = f"{chain}:{address.lower()}"
                 if key not in unique_wallets or pnl > unique_wallets[key]["pnl"]:
                     unique_wallets[key] = {

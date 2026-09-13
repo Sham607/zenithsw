@@ -14,8 +14,8 @@ conn = sqlite3.connect(QUARANTINE_DB)
 cur = conn.cursor()
 # Fetch wallets quarantined today with DEAD_EMPTY_BALANCE
 cur.execute("""
-    SELECT id, handle, address, original_tier, source 
-    FROM quarantined_wallets 
+    SELECT id, handle, address, original_tier, source
+    FROM quarantined_wallets
     WHERE quarantined_at LIKE '2026-09-12%' AND quarantine_reason LIKE 'DEAD_EMPTY_BALANCE%'
     LIMIT 60
 """)

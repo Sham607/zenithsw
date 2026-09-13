@@ -11,19 +11,27 @@ use std::sync::Mutex;
 
 pub struct SmartWalletDb {
     conn: Mutex<Connection>,
+    wallet_conn: Option<Mutex<Connection>>,
 }
 
 impl SmartWalletDb {
     pub fn new(path: &str) -> Result<Self> {
-        if let Some(parent) = Path::new(path).parent() {
+        Self::new_with_wallet_path(path, path)
+    }
+
+    pub fn new_with_wallet_path(trading_path: &str, wallet_path: &str) -> Result<Self> {
+        if let Some(parent) = Path::new(trading_path).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        if let Some(parent) = Path::new(wallet_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(trading_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 5000;
-             
+
              CREATE TABLE IF NOT EXISTS wallets (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  rank INTEGER NOT NULL,
@@ -42,7 +50,7 @@ impl SmartWalletDb {
                  updated_at TEXT NOT NULL,
                  execution_track TEXT NOT NULL DEFAULT 'FAST_LANE'
              );
-             
+
              CREATE TABLE IF NOT EXISTS wallet_activities (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  wallet_handle TEXT NOT NULL,
@@ -60,7 +68,7 @@ impl SmartWalletDb {
                  tx_signature TEXT NOT NULL,
                  timestamp TEXT NOT NULL
              );
-             
+
              CREATE TABLE IF NOT EXISTS shadow_signals (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  chain TEXT NOT NULL,
@@ -79,7 +87,7 @@ impl SmartWalletDb {
                  track TEXT NOT NULL DEFAULT 'FAST_LANE',
                  timestamp TEXT NOT NULL
              );
-             
+
              CREATE TABLE IF NOT EXISTS shadow_positions (
                  id TEXT PRIMARY KEY,
                  chain TEXT NOT NULL,
@@ -100,7 +108,7 @@ impl SmartWalletDb {
                  last_update TEXT NOT NULL,
                  status TEXT NOT NULL
              );
-             
+
              CREATE TABLE IF NOT EXISTS trade_history (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  timestamp TEXT NOT NULL,
@@ -136,15 +144,49 @@ impl SmartWalletDb {
                  upside_tier TEXT NOT NULL,
                  last_scanned_at TEXT NOT NULL
              );
-             
+
              CREATE INDEX IF NOT EXISTS idx_wallets_handle ON wallets(handle);
              CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
              CREATE INDEX IF NOT EXISTS idx_activities_mint ON wallet_activities(token_mint);
              CREATE INDEX IF NOT EXISTS idx_signals_mint ON shadow_signals(token_mint);
              CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON shadow_signals(timestamp);",
         )?;
+
+        let wallet_conn = if trading_path == wallet_path {
+            None
+        } else {
+            let wallet_conn = Connection::open(wallet_path)?;
+            wallet_conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = NORMAL;
+                 PRAGMA busy_timeout = 5000;
+                 CREATE TABLE IF NOT EXISTS wallets (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     rank INTEGER NOT NULL,
+                     name TEXT NOT NULL,
+                     handle TEXT NOT NULL UNIQUE,
+                     chain TEXT NOT NULL,
+                     address TEXT NOT NULL,
+                     tier TEXT NOT NULL,
+                     pnl_24h_usd REAL NOT NULL,
+                     win_rate_pct REAL NOT NULL,
+                     total_trades INTEGER NOT NULL,
+                     source TEXT NOT NULL DEFAULT 'FOMO',
+                     reputation_score REAL NOT NULL DEFAULT 80.0,
+                     is_active INTEGER NOT NULL DEFAULT 1,
+                     last_seen_at TEXT,
+                     updated_at TEXT NOT NULL,
+                     execution_track TEXT NOT NULL DEFAULT 'FAST_LANE'
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_wallets_handle ON wallets(handle);
+                 CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);",
+            )?;
+            Some(Mutex::new(wallet_conn))
+        };
+
         Ok(Self {
             conn: Mutex::new(conn),
+            wallet_conn,
         })
     }
 
@@ -264,7 +306,16 @@ impl SmartWalletDb {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            wallet_conn: None,
         })
+    }
+
+    fn wallet_db(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.wallet_conn
+            .as_ref()
+            .unwrap_or(&self.conn)
+            .lock()
+            .unwrap()
     }
 
     pub fn upsert_wallet(&self, wallet: &SmartWallet) -> Result<()> {
@@ -274,7 +325,7 @@ impl SmartWalletDb {
         let tier_str = wallet.tier.to_string();
         let track_str = wallet.execution_track.to_string();
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.wallet_db();
         conn.execute(
             "INSERT INTO wallets (
                 rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at, execution_track
@@ -316,7 +367,7 @@ impl SmartWalletDb {
     }
 
     pub fn get_active_wallets(&self) -> Result<Vec<SmartWallet>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.wallet_db();
         let mut stmt = conn.prepare(
             "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at, execution_track
              FROM wallets WHERE is_active = 1 ORDER BY pnl_24h_usd DESC, rank ASC",
@@ -379,7 +430,7 @@ impl SmartWalletDb {
     }
 
     pub fn get_wallets_by_tier(&self, tier: WalletTier) -> Result<Vec<SmartWallet>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.wallet_db();
         let tier_str1 = tier.to_string();
         let tier_str2 = format!("Tier{}", tier_str1.trim_start_matches("TIER-"));
         let mut stmt = conn.prepare(
@@ -445,7 +496,7 @@ impl SmartWalletDb {
     }
 
     pub fn get_qualified_wallets(&self) -> Result<Vec<SmartWallet>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.wallet_db();
         let mut stmt = conn.prepare(
             "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at, execution_track
              FROM wallets WHERE is_active = 1 AND tier IN ('TIER-S', 'TIER-A') ORDER BY pnl_24h_usd DESC, reputation_score DESC",
@@ -508,7 +559,7 @@ impl SmartWalletDb {
     }
 
     pub fn get_wallet_by_address(&self, address: &str) -> Result<Option<SmartWallet>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.wallet_db();
         let mut stmt = conn.prepare(
             "SELECT id, rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct, total_trades, source, reputation_score, is_active, last_seen_at, updated_at, execution_track
              FROM wallets WHERE address = ?1 LIMIT 1",
@@ -576,6 +627,17 @@ impl SmartWalletDb {
         let act_str = act.activity_type.to_string();
 
         let conn = self.conn.lock().unwrap();
+        let already_exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM wallet_activities
+                WHERE chain = ?1 AND wallet_address = ?2 AND tx_signature = ?3
+            )",
+            params![chain_str, act.wallet_address, act.tx_signature],
+            |row| row.get(0),
+        )?;
+        if already_exists {
+            return Ok(());
+        }
         conn.execute(
             "INSERT INTO wallet_activities (
                 wallet_handle, wallet_address, chain, activity_type, token_symbol, token_mint, amount_usd, token_amount, execution_price_usd, whale_balance_before, whale_balance_after, sell_ratio_pct, tx_signature, timestamp
@@ -869,9 +931,22 @@ impl SmartWalletDb {
         exit_reason: &str,
         exit_price: f64,
     ) -> Result<()> {
-        let portion_clamped = portion_pct.clamp(1.0, 100.0);
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT entry_price, amount_usd, remaining_portion_pct, realized_pnl_usd, entry_time, chain, token_symbol, token_mint, target_whale_handle, track FROM shadow_positions WHERE id = ?1")?;
+        if !portion_pct.is_finite()
+            || portion_pct <= 0.0
+            || portion_pct > 100.0
+            || !exit_price.is_finite()
+            || exit_price <= 0.0
+        {
+            return Err(anyhow::anyhow!(
+                "invalid exit parameters: portion_pct={}, exit_price={}",
+                portion_pct,
+                exit_price
+            ));
+        }
+        let portion_clamped = portion_pct;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare("SELECT entry_price, amount_usd, remaining_portion_pct, realized_pnl_usd, entry_time, chain, token_symbol, token_mint, target_whale_handle, track FROM shadow_positions WHERE id = ?1")?;
         let pos_opt = stmt
             .query_row(params![id], |row| {
                 let entry_price: f64 = row.get(0)?;
@@ -930,7 +1005,7 @@ impl SmartWalletDb {
             let new_remaining_portion = (remaining_portion_pct - actual_sold_pct).max(0.0);
             let new_realized_pnl = current_realized_pnl + pnl_usd_this_trade;
 
-            let is_full_close = new_remaining_portion <= 1.0 || actual_sold_pct >= 95.0;
+            let is_full_close = new_remaining_portion <= 1.0;
             let new_status = if is_full_close {
                 "CLOSED"
             } else {
@@ -944,7 +1019,7 @@ impl SmartWalletDb {
             let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
 
             // Record into trade_history
-            conn.execute(
+            tx.execute(
                 "INSERT INTO trade_history (
                     timestamp, chain, action, symbol, mint, target_whale, exit_reason, portion_sold_pct, entry_price, exit_price, pnl_pct, pnl_usd, duration_secs, track
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
@@ -967,11 +1042,13 @@ impl SmartWalletDb {
             )?;
 
             // Update shadow_positions
-            conn.execute(
+            tx.execute(
                 "UPDATE shadow_positions SET status = ?1, remaining_portion_pct = ?2, realized_pnl_usd = ?3, last_update = ?4 WHERE id = ?5",
                 params![new_status, new_remaining_portion, new_realized_pnl, now.to_rfc3339(), id],
             )?;
         }
+        drop(stmt);
+        tx.commit()?;
 
         Ok(())
     }
@@ -1138,11 +1215,11 @@ impl SmartWalletDb {
     ) -> Result<Vec<(String, String, String, u32, f64, Vec<String>)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT token_mint, 
-                    MAX(token_symbol) as token_symbol, 
-                    MAX(chain) as chain, 
-                    COUNT(DISTINCT wallet_handle) as whale_count, 
-                    SUM(amount_usd) as total_usd, 
+            "SELECT token_mint,
+                    MAX(token_symbol) as token_symbol,
+                    MAX(chain) as chain,
+                    COUNT(DISTINCT wallet_handle) as whale_count,
+                    SUM(amount_usd) as total_usd,
                     GROUP_CONCAT(DISTINCT wallet_handle) as handles
              FROM wallet_activities
              WHERE amount_usd > 0.0 AND amount_usd <= 100000.0 AND token_mint != '' AND token_mint != 'NATIVE'
@@ -1183,16 +1260,16 @@ impl SmartWalletDb {
                     top_whale_handles, status, upside_tier, last_scanned_at
              FROM tracked_tokens
              WHERE market_cap_usd >= 50000.0 AND market_cap_usd <= 20000000.0 AND liquidity_usd >= 30000.0 AND last_scanned_at >= ?1
-             ORDER BY 
-                CASE 
+             ORDER BY
+                CASE
                     WHEN market_cap_usd > 0.0 AND market_cap_usd < 1000000.0 THEN 1
                     WHEN market_cap_usd >= 1000000.0 AND market_cap_usd < 3000000.0 THEN 2
                     WHEN market_cap_usd >= 3000000.0 AND market_cap_usd < 15000000.0 THEN 3
                     WHEN market_cap_usd >= 15000000.0 AND market_cap_usd < 20000000.0 THEN 4
-                    ELSE 5 
+                    ELSE 5
                 END ASC,
-                whale_count DESC, 
-                total_whale_usd DESC 
+                whale_count DESC,
+                total_whale_usd DESC
              LIMIT ?2",
         )?;
 

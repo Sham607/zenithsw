@@ -10,8 +10,8 @@ c = conn.cursor()
 
 # Query Top Tier-S and Tier-A wallets
 c.execute("""
-    SELECT address, name, handle, chain, tier, rank, pnl_24h_usd, win_rate_pct 
-    FROM wallets 
+    SELECT address, name, handle, chain, tier, rank, pnl_24h_usd, win_rate_pct
+    FROM wallets
     WHERE tier IN ('TierS', 'TierA', 'TIER-S', 'TIER-A') AND is_active = 1
     ORDER BY pnl_24h_usd DESC LIMIT 25;
 """)
@@ -43,7 +43,7 @@ now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 for w in top_wallets:
     addr, name, handle, chain, tier, rank, pnl, win_rate = w
     clean_handle = handle.lstrip("@")
-    
+
     if chain == "ROBINHOOD" or chain == "ARBITRUM":
         # Alchemy asset transfers query for outgoing transfers
         req_body = {
@@ -61,30 +61,30 @@ for w in top_wallets:
         }
         try:
             req = urllib.request.Request(
-                arbitrum_rpc, 
-                data=json.dumps(req_body).encode(), 
+                arbitrum_rpc,
+                data=json.dumps(req_body).encode(),
                 headers={"Content-Type": "application/json"}
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 res = json.loads(resp.read().decode())
                 transfers = res.get("result", {}).get("transfers", [])
-                
+
                 sub_count = 0
                 for tx in transfers:
                     to_addr = tx.get("to")
                     if not to_addr or to_addr.lower() in EXCLUDED_CONTRACTS or to_addr.lower() == addr.lower():
                         continue
-                    
+
                     val = tx.get("value") or 0.0
                     asset = tx.get("asset") or "ETH"
-                    
+
                     # Criteria: Outgoing transfer >= 0.05 ETH or >= $500 USDC/USDT
                     is_significant = (asset in ["ETH", "WETH"] and val >= 0.05) or (asset in ["USDC", "USDT", "USD₮0"] and val >= 500.0)
                     if is_significant:
                         sub_count += 1
                         sub_handle = f"{clean_handle}_sub_{to_addr[2:6].lower()}"
                         sub_name = f"{name} Shadow #{sub_count}"
-                        
+
                         discovered_subsidiaries.append({
                             "address": to_addr,
                             "name": sub_name,
@@ -98,7 +98,7 @@ for w in top_wallets:
                         })
         except Exception as e:
             print(f"  [!] Error querying EVM transfers for {handle}: {e}")
-            
+
     elif chain == "SOLANA":
         # Solana outgoing signatures
         req_body = {
@@ -143,7 +143,7 @@ added_count = 0
 for sub in discovered_subsidiaries:
     if sub["address"].startswith("Sub_"):
         continue # skip placeholder until full signature parsing
-        
+
     c.execute("""
         INSERT INTO wallets (
             rank, name, handle, chain, address, tier, pnl_24h_usd, win_rate_pct,

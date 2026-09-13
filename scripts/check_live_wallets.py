@@ -22,8 +22,8 @@ for w in wallets:
         "params": [w['address'], {"limit": 1}]
     }
     req = urllib.request.Request(
-        rpc_url, 
-        data=json.dumps(payload).encode('utf-8'), 
+        rpc_url,
+        data=json.dumps(payload).encode('utf-8'),
         headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}
     )
     try:

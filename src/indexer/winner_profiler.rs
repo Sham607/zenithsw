@@ -9,7 +9,7 @@ use std::time::Duration;
 
 pub struct SmartMoneyIndexer {
     solana_rpc_url: String,
-    arbitrum_rpc_url: String,
+    robinhood_rpc_url: String,
     db: Arc<SmartWalletDb>,
     client: Client,
     profiler: WinnerProfiler,
@@ -18,7 +18,7 @@ pub struct SmartMoneyIndexer {
 impl SmartMoneyIndexer {
     pub fn new(
         solana_rpc_url: &str,
-        arbitrum_rpc_url: &str,
+        robinhood_rpc_url: &str,
         db: Arc<SmartWalletDb>,
         _scan_interval_secs: u64,
     ) -> Self {
@@ -27,11 +27,11 @@ impl SmartMoneyIndexer {
             .build()
             .unwrap_or_default();
 
-        let profiler = WinnerProfiler::new(solana_rpc_url, arbitrum_rpc_url, db.clone());
+        let profiler = WinnerProfiler::new(solana_rpc_url, robinhood_rpc_url, db.clone());
 
         Self {
             solana_rpc_url: solana_rpc_url.to_string(),
-            arbitrum_rpc_url: arbitrum_rpc_url.to_string(),
+            robinhood_rpc_url: robinhood_rpc_url.to_string(),
             db,
             client,
             profiler,
@@ -52,13 +52,13 @@ impl SmartMoneyIndexer {
 
 pub struct WinnerProfiler {
     helius_rpc_url: String,
-    arbitrum_rpc_url: String,
+    robinhood_rpc_url: String,
     db: Arc<SmartWalletDb>,
     client: Client,
 }
 
 impl WinnerProfiler {
-    pub fn new(helius_rpc_url: &str, arbitrum_rpc_url: &str, db: Arc<SmartWalletDb>) -> Self {
+    pub fn new(helius_rpc_url: &str, robinhood_rpc_url: &str, db: Arc<SmartWalletDb>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(12))
             .build()
@@ -66,7 +66,7 @@ impl WinnerProfiler {
 
         Self {
             helius_rpc_url: helius_rpc_url.to_string(),
-            arbitrum_rpc_url: arbitrum_rpc_url.to_string(),
+            robinhood_rpc_url: robinhood_rpc_url.to_string(),
             db,
             client,
         }
@@ -252,7 +252,7 @@ impl WinnerProfiler {
                 };
 
                 let _ = self.db.upsert_wallet(&wallet);
-                println!("[INDEXER 🎯 EVALUATED] Added {} (@{}) on {} -> Tier: {:?} | Status: {} | WinRate: {:.1}% | Trades: {} | PnL: +${:.0}", 
+                println!("[INDEXER 🎯 EVALUATED] Added {} (@{}) on {} -> Tier: {:?} | Status: {} | WinRate: {:.1}% | Trades: {} | PnL: +${:.0}",
                     wallet.name, wallet.handle, wallet.chain, wallet.tier,
                     if wallet.tier == WalletTier::TierB { "MONITOR 🟡" } else { "EXECUTE 🟢" },
                     wallet.win_rate_pct, wallet.total_trades, wallet.pnl_24h_usd);
@@ -386,7 +386,7 @@ impl WinnerProfiler {
         let mut tx_count = 5;
         let age_days = 3.0;
 
-        if self.arbitrum_rpc_url.is_empty() {
+        if self.robinhood_rpc_url.is_empty() {
             return Ok((0.0, 5, 1.0));
         }
 
@@ -400,7 +400,7 @@ impl WinnerProfiler {
 
         if let Ok(res) = self
             .client
-            .post(&self.arbitrum_rpc_url)
+            .post(&self.robinhood_rpc_url)
             .json(&bal_payload)
             .send()
             .await
@@ -426,7 +426,7 @@ impl WinnerProfiler {
 
         if let Ok(res) = self
             .client
-            .post(&self.arbitrum_rpc_url)
+            .post(&self.robinhood_rpc_url)
             .json(&tx_payload)
             .send()
             .await
@@ -492,7 +492,7 @@ impl WinnerProfiler {
 
     /// Extract early buyers for Arbitrum/Robinhood EVM token via Alchemy RPC
     async fn extract_early_buyers_evm(&self, token_address: &str) -> Result<Vec<String>> {
-        if self.arbitrum_rpc_url.is_empty() {
+        if self.robinhood_rpc_url.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -512,7 +512,7 @@ impl WinnerProfiler {
 
         let res = match self
             .client
-            .post(&self.arbitrum_rpc_url)
+            .post(&self.robinhood_rpc_url)
             .json(&payload)
             .send()
             .await

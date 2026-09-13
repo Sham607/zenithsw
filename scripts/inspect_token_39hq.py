@@ -1,0 +1,19 @@
+import urllib.request, json
+
+rpc_url = "https://rpc.solanatracker.io/public?advanced=true"
+mint = "39HqgQ18g9R33sUfKq1TjX4sbKrgTb4YntnBCFhURJvy"
+
+payload = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "getAccountInfo",
+    "params": [mint, {"encoding": "jsonParsed"}]
+}
+
+req = urllib.request.Request(rpc_url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+try:
+    with urllib.request.urlopen(req) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        print(json.dumps(data, indent=2))
+except Exception as e:
+    print("Err:", e)

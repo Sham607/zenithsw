@@ -73,10 +73,9 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         solana_rpc_url: "http://127.0.0.1:8899".to_string(),
         solana_ws_url: "ws://127.0.0.1:8900".to_string(),
         solana_private_key: None,
-        arbitrum_rpc_url: "http://127.0.0.1:8545".to_string(),
-        arbitrum_ws_url: "ws://127.0.0.1:8546".to_string(),
-        base_rpc_url: "http://127.0.0.1:8545".to_string(),
-        base_ws_url: "ws://127.0.0.1:8546".to_string(),
+        robinhood_rpc_url: "http://127.0.0.1:8545".to_string(),
+        robinhood_ws_url: "ws://127.0.0.1:8546".to_string(),
+        robinhood_api_key: None,
         evm_private_key: None,
         fomo_auth_token: None,
         fomo_sync_interval_sec: 5,
@@ -97,7 +96,8 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         enable_solana: true,
         enable_robinhood: false,
         enable_base: false,
-        db_path: ":memory:".to_string(),
+        trading_db_path: ":memory:".to_string(),
+        wallet_db_path: ":memory:".to_string(),
         ipc_socket_path: "/tmp/zenithsw_test.sock".to_string(),
     };
 

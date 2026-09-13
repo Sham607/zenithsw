@@ -1,10 +1,54 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::Utc;
 use futures_util::stream::{self, StreamExt};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+struct InstanceLock {
+    path: PathBuf,
+}
+
+impl InstanceLock {
+    fn acquire(socket_path: &str) -> Result<Self> {
+        let path = PathBuf::from(format!("{}.lock", socket_path));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "{}", std::process::id())?;
+                file.sync_all()?;
+                Ok(Self { path })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing_pid = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                if existing_pid
+                    .filter(|pid| PathBuf::from(format!("/proc/{pid}")).exists())
+                    .is_some()
+                {
+                    bail!("another ZenithSW engine instance is already running");
+                }
+                fs::remove_file(&path)?;
+                let mut file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+                writeln!(file, "{}", std::process::id())?;
+                file.sync_all()?;
+                Ok(Self { path })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 use tokio::time::sleep;
 
+use zenithsw::chains::robinhood::RobinhoodRpc;
 use zenithsw::config::Config;
 use zenithsw::db::SmartWalletDb;
 use zenithsw::execution::evm_executor::EvmExecutor;
@@ -25,7 +69,11 @@ async fn main() -> Result<()> {
     println!("======================================================");
 
     let config = Config::load()?;
-    let db = Arc::new(SmartWalletDb::new(&config.db_path)?);
+    let _instance_lock = InstanceLock::acquire(&config.ipc_socket_path)?;
+    let db = Arc::new(SmartWalletDb::new_with_wallet_path(
+        &config.trading_db_path,
+        &config.wallet_db_path,
+    )?);
 
     // Initial seed: Only populate if database is completely empty
     if let Ok(existing) = db.get_active_wallets() {
@@ -48,11 +96,17 @@ async fn main() -> Result<()> {
     // Initialize Stream Listeners
     let sol_listener = Arc::new(SolanaStreamListener::new(&config.solana_rpc_url));
     let arb_listener = Arc::new(EvmStreamListener::new(
-        &config.arbitrum_rpc_url,
+        &config.robinhood_rpc_url,
         Chain::Robinhood,
     ));
-    let base_listener = Arc::new(EvmStreamListener::new(&config.base_rpc_url, Chain::Base));
     let fomo_listener = Arc::new(FomoApiStreamListener::new(Arc::new(config.clone())));
+    if config.enable_robinhood {
+        arb_listener.validate_robinhood_chain().await?;
+        let robinhood_rpc = RobinhoodRpc::new(&config.robinhood_rpc_url)?;
+        robinhood_rpc.chain_id().await?;
+        robinhood_rpc.validate_deployments().await?;
+        println!("[ROBINHOOD RPC ✅] Chain ID 4663 and official Uniswap V4 deployments validated");
+    }
 
     // Initialize Gating & Executors
     let confluence = Arc::new(ConfluenceEngine::new(config.clone(), db.clone()));
@@ -62,7 +116,7 @@ async fn main() -> Result<()> {
     // Task 1: Direct On-Chain DEX Graph Indexer Worker (Every 10 minutes)
     let indexer = Arc::new(SmartMoneyIndexer::new(
         &config.solana_rpc_url,
-        &config.arbitrum_rpc_url,
+        &config.robinhood_rpc_url,
         db.clone(),
         600,
     ));
@@ -100,7 +154,6 @@ async fn main() -> Result<()> {
     let config_stream = Arc::new(config.clone());
     let sol_listener_stream = sol_listener.clone();
     let arb_listener_stream = arb_listener.clone();
-    let base_listener_stream = base_listener.clone();
     let fomo_listener_stream = fomo_listener.clone();
     let confluence_stream = confluence.clone();
     let sol_exec_stream = sol_exec.clone();
@@ -115,7 +168,7 @@ async fn main() -> Result<()> {
                 // Filter only enabled chains
                 wallets.retain(|w| match w.chain {
                     Chain::Solana => config_stream.enable_solana,
-                    Chain::Robinhood | Chain::Arbitrum => config_stream.enable_robinhood,
+                    Chain::Robinhood => config_stream.enable_robinhood,
                     Chain::Base => config_stream.enable_base,
                     _ => false,
                 });
@@ -133,7 +186,6 @@ async fn main() -> Result<()> {
                         .map(|w| {
                             let sol_listener = sol_listener_stream.clone();
                             let arb_listener = arb_listener_stream.clone();
-                            let base_listener = base_listener_stream.clone();
                             let fomo_listener = fomo_listener_stream.clone();
                             let db = db_stream.clone();
                             async move {
@@ -156,11 +208,6 @@ async fn main() -> Result<()> {
                                             .ok()
                                             .flatten(),
                                         Chain::Robinhood | Chain::Arbitrum => arb_listener
-                                            .check_wallet_activity(&w.handle, &w.address, db.clone())
-                                            .await
-                                            .ok()
-                                            .flatten(),
-                                        Chain::Base => base_listener
                                             .check_wallet_activity(&w.handle, &w.address, db.clone())
                                             .await
                                             .ok()
@@ -196,15 +243,18 @@ async fn main() -> Result<()> {
                                     if pos.token_mint.eq_ignore_ascii_case(&act.token_mint)
                                         && pos.chain == act.chain
                                     {
-                                        let whale_addr_lower = act.wallet_address.to_lowercase();
+                                        let whale_addr_lower = act.wallet_address.trim().to_lowercase();
+                                        let handle_lower = act.wallet_handle.trim().trim_start_matches('@').to_lowercase();
                                         let is_participant = pos
                                             .target_whale_address
-                                            .to_lowercase()
-                                            .contains(&whale_addr_lower)
+                                            .split(',')
+                                            .map(str::trim)
+                                            .any(|address| address.to_lowercase() == whale_addr_lower)
                                             || pos
                                                 .target_whale_handle
-                                                .to_lowercase()
-                                                .contains(&act.wallet_handle.to_lowercase());
+                                                .split(',')
+                                                .map(|handle| handle.trim().trim_start_matches('@').to_lowercase())
+                                                .any(|handle| handle == handle_lower);
 
                                         if is_participant {
                                             let exit_price = if act.execution_price_usd > 0.0 {
@@ -277,10 +327,29 @@ async fn main() -> Result<()> {
                         } else if act.activity_type == ActivityType::Buy {
                             // Fetch real-time pool price, liquidity & market cap across Solana/EVM
                             let (current_price, pool_liq, live_mcap) =
-                                SolanaStreamListener::fetch_token_price(&act.token_mint)
-                                    .await
-                                    .map(|(_, p, l, m)| (p, l, m))
-                                    .unwrap_or((act.execution_price_usd, 35000.0, 0.0));
+                                match SolanaStreamListener::fetch_token_price(&act.token_mint).await {
+                                    Ok((_, price, liquidity, market_cap))
+                                        if price.is_finite()
+                                            && price > 0.0
+                                            && liquidity.is_finite()
+                                            && liquidity > 0.0
+                                            && market_cap.is_finite()
+                                            && market_cap > 0.0 => (price, liquidity, market_cap),
+                                    Ok((_, price, liquidity, market_cap)) => {
+                                        eprintln!(
+                                            "[ENTRY DATA REJECTED ⚠️] {} returned invalid market data (price={}, liquidity={}, mcap={})",
+                                            act.token_mint, price, liquidity, market_cap
+                                        );
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "[ENTRY DATA FAILED ⚠️] {} ({}) — rejecting entry",
+                                            act.token_mint, error
+                                        );
+                                        continue;
+                                    }
+                                };
 
                             let mut act_to_eval = act.clone();
                             if act_to_eval.execution_price_usd <= 0.0 && current_price > 0.0 {
@@ -357,7 +426,11 @@ async fn main() -> Result<()> {
                     let (live_price, live_liquidity) = match SolanaStreamListener::fetch_token_price(&pos.token_mint)
                         .await
                     {
-                        Ok((_, price, liquidity, _)) if price > 0.0 => (price, liquidity),
+                        Ok((_, price, liquidity, _))
+                            if price.is_finite()
+                                && price > 0.0
+                                && liquidity.is_finite()
+                                && liquidity > 0.0 => (price, liquidity),
                         Ok((symbol, price, liquidity, _)) => {
                             eprintln!(
                                 "[PRICE UPDATE SKIP ⚠️] {} returned invalid market data (price=${:.8}, liquidity=${:.2}); keeping last price with no refresh.",
@@ -386,8 +459,6 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        let prev_pnl = pos.unrealized_pnl_pct;
-                        let prev_peak = pos.peak_price;
                         pos.current_price = live_price;
                         pos.peak_price = pos.peak_price.max(live_price);
                         if pos.entry_price > 0.0 {
@@ -396,11 +467,10 @@ async fn main() -> Result<()> {
                         }
                         pos.last_update = Utc::now();
 
-                        // Database write throttling: only persist on significant price/pnl change
-                        let pnl_delta = (pos.unrealized_pnl_pct - prev_pnl).abs();
-                        if pnl_delta >= 2.0 || pos.peak_price > prev_peak {
-                            let _ = db_pos_tracker.upsert_position(pos);
-                        }
+                        // Persist every valid tick so current_price, PnL, and last_update
+                        // remain recoverable after a restart, even when the price is flat.
+                        // The TUI receives the same fresh snapshot below via IPC.
+                        let _ = db_pos_tracker.upsert_position(pos);
 
                         // Liquidity Drain Guard (Rug-pull trap protection: exit immediately if pool liquidity collapses below $10k)
                         if live_liquidity > 0.0
@@ -599,7 +669,7 @@ async fn main() -> Result<()> {
                 let _ = ipc_pos_tracker.broadcast(&IpcMessage::PositionUpdate { positions });
             }
 
-            sleep(Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(1)).await;
         }
     });
 

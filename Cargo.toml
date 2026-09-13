@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "zenithsw-engine"
 path = "src/bin/engine.rs"
 
+[[bin]]
+name = "robinhood-dry-run"
+path = "src/bin/robinhood_dry_run.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 ratatui = "0.29"

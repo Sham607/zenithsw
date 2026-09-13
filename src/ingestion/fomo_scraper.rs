@@ -440,10 +440,10 @@ impl FomoScraper {
                             .and_then(|l| l.get("usd"))
                             .and_then(|v| v.as_f64())
                             .unwrap_or(0.0);
+                        // Market cap harus berasal dari field marketCap; FDV bukan market cap.
                         let market_cap_usd = pair
                             .get("marketCap")
                             .and_then(|m| m.as_f64())
-                            .or_else(|| pair.get("fdv").and_then(|f| f.as_f64()))
                             .unwrap_or(0.0);
 
                         let dex_id = pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
@@ -479,7 +479,7 @@ impl FomoScraper {
                         }
 
                         // 2. Strict Price & Minimum Liquidity Filter
-                        let min_liq_threshold = self.config.min_liquidity_usd.min(10000.0);
+                        let min_liq_threshold = self.config.min_liquidity_usd;
                         if price_usd <= 0.0 || (dex_id != "pumpfun" && liquidity_usd < min_liq_threshold) {
                             let _ = self.db.delete_tracked_token(&token_addr);
                             continue;
