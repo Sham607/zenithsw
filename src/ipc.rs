@@ -112,7 +112,7 @@ impl IpcServer {
                                 solana_latency_ms: 35,
                                 arbitrum_latency_ms: 28,
                                 base_latency_ms: 32,
-                                tracked_wallets_count: 100,
+                                tracked_wallets_count: 0,
                                 active_positions_count: 0,
                                 wallet_sol_balance: 0.0,
                                 sol_price_usd: 100.0,
@@ -124,7 +124,7 @@ impl IpcServer {
                                 stop_loss_pct: 35.0,
                                 take_profit_pct: 100.0,
                                 min_whale_buy_usd: 150.0,
-                                is_live_mode: true,
+                                is_live_mode: false,
                                 wallet_pubkey: String::new(),
                             })
                         } else {
@@ -133,7 +133,7 @@ impl IpcServer {
                                 solana_latency_ms: 35,
                                 arbitrum_latency_ms: 28,
                                 base_latency_ms: 32,
-                                tracked_wallets_count: 100,
+                                tracked_wallets_count: 0,
                                 active_positions_count: 0,
                                 wallet_sol_balance: 0.0,
                                 sol_price_usd: 100.0,
@@ -145,7 +145,7 @@ impl IpcServer {
                                 stop_loss_pct: 35.0,
                                 take_profit_pct: 100.0,
                                 min_whale_buy_usd: 150.0,
-                                is_live_mode: true,
+                                is_live_mode: false,
                                 wallet_pubkey: String::new(),
                             }
                         }

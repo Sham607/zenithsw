@@ -42,7 +42,14 @@ async fn token_call(client: &reqwest::Client, url: &str, token_address: &str, da
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    let url = env::var("ROBINHOOD_RPC_URL")?;
+    let urls: Vec<String> = env::var("ROBINHOOD_RPC_URL")?
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if urls.is_empty() { anyhow::bail!("ROBINHOOD_RPC_URL kosong"); }
+    let url = urls.first().cloned().unwrap();
     let token = env::var("ROBINHOOD_TOKEN_ADDRESS").ok();
     if let Some(address) = token.as_deref() {
         if address.len() != ADDRESS_LEN || !address.starts_with("0x") || !address[2..].chars().all(|c| c.is_ascii_hexdigit()) {

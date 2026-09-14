@@ -1,18 +1,21 @@
+RUST_TOOLCHAIN ?= rust@1.94.1
+CARGO = mise exec $(RUST_TOOLCHAIN) -- cargo
+
 .PHONY: all build release test start engine stop restart reset clean help
 
 all: release
 
 build:
-	cargo build
+	$(CARGO) build
 
 release:
-	cargo build --release
+	$(CARGO) build --release
 
 test:
-	cargo test
+	$(CARGO) test --locked
 
 engine:
-	cargo run --release --bin zenithsw-engine
+	$(CARGO) run --release --bin zenithsw-engine
 
 start: release
 	@if systemctl --user is-active --quiet zenithsw-engine.service; then \
@@ -22,7 +25,7 @@ start: release
 		systemctl --user start zenithsw-engine.service || (nohup ./target/release/zenithsw-engine > data/engine.log 2>&1 &); \
 		sleep 1; \
 	fi
-	@cargo run --release --bin zenithsw
+	@$(CARGO) run --release --bin zenithsw
 
 stop:
 	@echo "Stopping ZenithSW Engine Daemon..."
@@ -47,7 +50,7 @@ reset:
 	@echo "[OK] State reset successfully."
 
 clean:
-	cargo clean
+	$(CARGO) clean
 	@rm -f /tmp/zenithsw.sock
 
 help:

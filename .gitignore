@@ -8,6 +8,7 @@ __pycache__/
 *.pyc
 /tmp/zenithsw.sock
 node_modules/
+docs/
 package-lock.json
 package.json
 .forgeguard/

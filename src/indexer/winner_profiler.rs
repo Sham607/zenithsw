@@ -1,4 +1,5 @@
-use crate::db::SmartWalletDb;
+use crate::chains::robinhood::RobinhoodRpc;
+use crate::db::{CandidateWalletDb, SmartWalletDb};
 use crate::models::{Chain, SmartWallet, WalletTier};
 use anyhow::Result;
 use chrono::Utc;
@@ -11,6 +12,7 @@ pub struct SmartMoneyIndexer {
     solana_rpc_url: String,
     robinhood_rpc_url: String,
     db: Arc<SmartWalletDb>,
+    candidate_db: Arc<CandidateWalletDb>,
     client: Client,
     profiler: WinnerProfiler,
 }
@@ -20,6 +22,7 @@ impl SmartMoneyIndexer {
         solana_rpc_url: &str,
         robinhood_rpc_url: &str,
         db: Arc<SmartWalletDb>,
+        candidate_db: Arc<CandidateWalletDb>,
         _scan_interval_secs: u64,
     ) -> Self {
         let client = Client::builder()
@@ -27,12 +30,18 @@ impl SmartMoneyIndexer {
             .build()
             .unwrap_or_default();
 
-        let profiler = WinnerProfiler::new(solana_rpc_url, robinhood_rpc_url, db.clone());
+        let profiler = WinnerProfiler::new(
+            solana_rpc_url,
+            robinhood_rpc_url,
+            db.clone(),
+            candidate_db.clone(),
+        );
 
         Self {
             solana_rpc_url: solana_rpc_url.to_string(),
             robinhood_rpc_url: robinhood_rpc_url.to_string(),
             db,
+            candidate_db,
             client,
             profiler,
         }
@@ -54,11 +63,12 @@ pub struct WinnerProfiler {
     helius_rpc_url: String,
     robinhood_rpc_url: String,
     db: Arc<SmartWalletDb>,
+    candidate_db: Arc<CandidateWalletDb>,
     client: Client,
 }
 
 impl WinnerProfiler {
-    pub fn new(helius_rpc_url: &str, robinhood_rpc_url: &str, db: Arc<SmartWalletDb>) -> Self {
+    pub fn new(helius_rpc_url: &str, robinhood_rpc_url: &str, db: Arc<SmartWalletDb>, candidate_db: Arc<CandidateWalletDb>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(12))
             .build()
@@ -68,6 +78,7 @@ impl WinnerProfiler {
             helius_rpc_url: helius_rpc_url.to_string(),
             robinhood_rpc_url: robinhood_rpc_url.to_string(),
             db,
+            candidate_db,
             client,
         }
     }
@@ -137,7 +148,7 @@ impl WinnerProfiler {
                             (52.0 + ((tx_count % 7) as f64 * 1.1)).clamp(50.0, 60.0)
                         };
 
-                        // Auto-discovered DEX buyers are strictly quarantined to Tier-B (Monitor Only)
+                        // Discovery is a candidate only; qualification requires independent on-chain audit.
                         let tier = WalletTier::TierB;
                         let reputation_score = (40.0 + (sol_bal * 2.0).min(15.0)).clamp(30.0, 55.0);
 
@@ -243,15 +254,23 @@ impl WinnerProfiler {
                     pnl_24h_usd: estimated_pnl_usd,
                     win_rate_pct,
                     total_trades: tx_count,
-                    source: "ONCHAIN_INDEXER".to_string(),
+                    source: "ONCHAIN_INDEXER_CANDIDATE".to_string(),
                     reputation_score,
                     execution_track: crate::models::ExecutionTrack::FastLane,
-                    is_active: true,
+                    // Discovery is monitor-only until independent on-chain qualification.
+                    is_active: false,
                     last_seen_at: Some(Utc::now()),
                     updated_at: Utc::now(),
                 };
 
-                let _ = self.db.upsert_wallet(&wallet);
+                let _ = self.candidate_db.upsert_candidate(
+                    &wallet,
+                    None,
+                    None,
+                    "INDEXER_DISCOVERY",
+                    None,
+                    None,
+                );
                 println!("[INDEXER 🎯 EVALUATED] Added {} (@{}) on {} -> Tier: {:?} | Status: {} | WinRate: {:.1}% | Trades: {} | PnL: +${:.0}",
                     wallet.name, wallet.handle, wallet.chain, wallet.tier,
                     if wallet.tier == WalletTier::TierB { "MONITOR 🟡" } else { "EXECUTE 🟢" },
@@ -380,67 +399,18 @@ impl WinnerProfiler {
         Ok((sol_bal, tx_count, age_days))
     }
 
-    /// Fetch real on-chain balance and tx count for EVM wallet via Alchemy Arbitrum RPC
+    /// Fetches basic Robinhood wallet facts through the configured RPC pool.
+    /// These are discovery hints only, never realized PnL or qualification metrics.
     async fn fetch_evm_wallet_metrics(&self, address: &str) -> Result<(f64, usize, f64)> {
-        let mut eth_bal = 0.0;
-        let mut tx_count = 5;
-        let age_days = 3.0;
-
         if self.robinhood_rpc_url.is_empty() {
-            return Ok((0.0, 5, 1.0));
+            return Ok((0.0, 0, 0.0));
         }
-
-        // 1. eth_getBalance
-        let bal_payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_getBalance",
-            "params": [address, "latest"]
-        });
-
-        if let Ok(res) = self
-            .client
-            .post(&self.robinhood_rpc_url)
-            .json(&bal_payload)
-            .send()
-            .await
-        {
-            if let Ok(json) = res.json::<Value>().await {
-                if let Some(hex_str) = json["result"].as_str() {
-                    if let Ok(val) = u128::from_str_radix(hex_str.trim_start_matches("0x"), 16) {
-                        eth_bal = (val as f64) / 1_000_000_000_000_000_000.0;
-                    }
-                }
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        // 2. eth_getTransactionCount
-        let tx_payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "eth_getTransactionCount",
-            "params": [address, "latest"]
-        });
-
-        if let Ok(res) = self
-            .client
-            .post(&self.robinhood_rpc_url)
-            .json(&tx_payload)
-            .send()
-            .await
-        {
-            if let Ok(json) = res.json::<Value>().await {
-                if let Some(hex_str) = json["result"].as_str() {
-                    if let Ok(count) = usize::from_str_radix(hex_str.trim_start_matches("0x"), 16) {
-                        tx_count = count.max(1);
-                    }
-                }
-            }
-        }
-
-        Ok((eth_bal, tx_count, age_days))
+        let rpc = RobinhoodRpc::new(&self.robinhood_rpc_url)?;
+        let balance = rpc.get_balance(address, "latest").await?;
+        let nonce = rpc.get_transaction_count(address, "latest").await?;
+        let balance_wei = u128::from_str_radix(balance.trim_start_matches("0x"), 16)?;
+        let tx_count = usize::from_str_radix(nonce.trim_start_matches("0x"), 16)?;
+        Ok((balance_wei as f64 / 1_000_000_000_000_000_000.0, tx_count, 0.0))
     }
 
     /// Extract early buyers for Solana mint via Helius RPC
@@ -490,53 +460,43 @@ impl WinnerProfiler {
         Ok(buyers)
     }
 
-    /// Extract early buyers for Arbitrum/Robinhood EVM token via Alchemy RPC
+    /// Extract candidate senders from bounded standard ERC-20 Transfer logs.
+    /// This is discovery only; it does not prove a swap or profitability.
     async fn extract_early_buyers_evm(&self, token_address: &str) -> Result<Vec<String>> {
         if self.robinhood_rpc_url.is_empty() {
             return Ok(Vec::new());
         }
-
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "alchemy_getAssetTransfers",
-            "params": [{
-                "fromBlock": "0x0",
-                "toBlock": "latest",
-                "contractAddresses": [token_address],
-                "category": ["external", "erc20"],
-                "order": "desc",
-                "maxCount": "0xa"
-            }]
-        });
-
-        let res = match self
-            .client
-            .post(&self.robinhood_rpc_url)
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => return Ok(Vec::new()),
-        };
-
-        let json: Value = match res.json().await {
-            Ok(j) => j,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let rpc = RobinhoodRpc::new(&self.robinhood_rpc_url)?;
+        let latest = rpc.block_number().await?;
+        let latest_n = u64::from_str_radix(latest.trim_start_matches("0x"), 16)?;
+        let from = latest_n.saturating_sub(2_000);
+        let logs = rpc
+            .get_token_transfer_logs(
+                &format!("0x{from:x}"),
+                &format!("0x{latest_n:x}"),
+                token_address,
+            )
+            .await?;
 
         let mut buyers = Vec::new();
-        if let Some(transfers) = json["result"]["transfers"].as_array() {
-            for t in transfers.iter().take(4) {
-                if let Some(from_addr) = t["from"].as_str() {
-                    buyers.push(from_addr.to_string());
-                } else if let Some(to_addr) = t["to"].as_str() {
-                    buyers.push(to_addr.to_string());
-                }
+        let mut seen = std::collections::HashSet::new();
+        for log in logs.into_iter().rev().take(20) {
+            let topics = match log.get("topics").and_then(Value::as_array) {
+                Some(topics) if topics.len() >= 3 => topics,
+                _ => continue,
+            };
+            let from_topic = topics[1].as_str().unwrap_or("");
+            if from_topic.len() != 66 {
+                continue;
             }
+            let sender = format!("0x{}", &from_topic[26..]);
+            if sender == "0x0000000000000000000000000000000000000000"
+                || !seen.insert(sender.to_lowercase())
+            {
+                continue;
+            }
+            buyers.push(sender);
         }
-
         Ok(buyers)
     }
 

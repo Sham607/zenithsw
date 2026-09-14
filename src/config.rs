@@ -53,8 +53,9 @@ impl Config {
     pub fn load() -> Result<Self> {
         let _ = dotenv();
 
-        let solana_rpc_url = env::var("SOLANA_RPC_URL")
-            .context("SOLANA_RPC_URL wajib diatur di .env/secret manager")?;
+        let solana_rpc_url = env::var("SOLANA_RPC_URLS")
+            .or_else(|_| env::var("SOLANA_RPC_URL"))
+            .context("SOLANA_RPC_URLS atau SOLANA_RPC_URL wajib diatur di .env/secret manager")?;
         let solana_ws_url = env::var("SOLANA_WS_URL")
             .context("SOLANA_WS_URL wajib diatur di .env/secret manager")?;
 

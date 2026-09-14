@@ -26,14 +26,23 @@ pub struct SolanaStreamListener {
 
 impl SolanaStreamListener {
     pub fn new(primary_rpc_url: &str) -> Self {
-        let mut rpc_urls = Vec::new();
-        if !primary_rpc_url.is_empty() {
-            rpc_urls.push(primary_rpc_url.to_string());
+        let mut rpc_urls: Vec<String> = primary_rpc_url
+            .split(',')
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        // Public fallbacks remain read-capable options; live broadcast uses the same
+        // pool only after signature reconciliation.
+        for fallback in [
+            "https://solana-rpc.publicnode.com",
+            "https://rpc.ankr.com/solana",
+            "https://api.mainnet-beta.solana.com",
+        ] {
+            if !rpc_urls.iter().any(|url| url == fallback) {
+                rpc_urls.push(fallback.to_string());
+            }
         }
-        // High-availability public & dedicated fallbacks
-        rpc_urls.push("https://solana-rpc.publicnode.com".to_string());
-        rpc_urls.push("https://rpc.ankr.com/solana".to_string());
-        rpc_urls.push("https://api.mainnet-beta.solana.com".to_string());
 
         Self {
             rpc_urls,

@@ -7,8 +7,9 @@ use ed25519_dalek::{Signer, SigningKey};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JupiterQuoteResponse {
@@ -37,10 +38,33 @@ pub struct SolanaExecutor {
     config: Config,
     db: Arc<SmartWalletDb>,
     client: Client,
+    rpc_index: AtomicUsize,
+    rpc_cooldowns: Mutex<Vec<Option<Instant>>>,
+    rpc_requests: AtomicU64,
+    rpc_successes: AtomicU64,
+    rpc_rate_limited: AtomicU64,
+    rpc_failures: AtomicU64,
 }
 
 impl SolanaExecutor {
     pub fn new(config: Config, db: Arc<SmartWalletDb>) -> Self {
+        let mut rpc_urls: Vec<String> = config
+            .solana_rpc_url
+            .split(',')
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        for fallback in [
+            "https://solana-rpc.publicnode.com",
+            "https://rpc.ankr.com/solana",
+            "https://api.mainnet-beta.solana.com",
+        ] {
+            if !rpc_urls.iter().any(|url| url == fallback) {
+                rpc_urls.push(fallback.to_string());
+            }
+        }
+        let rpc_count = rpc_urls.len().max(1);
         Self {
             config,
             db,
@@ -48,6 +72,12 @@ impl SolanaExecutor {
                 .timeout(Duration::from_secs(8))
                 .build()
                 .unwrap_or_default(),
+            rpc_index: AtomicUsize::new(0),
+            rpc_cooldowns: Mutex::new(vec![None; rpc_count]),
+            rpc_requests: AtomicU64::new(0),
+            rpc_successes: AtomicU64::new(0),
+            rpc_rate_limited: AtomicU64::new(0),
+            rpc_failures: AtomicU64::new(0),
         }
     }
 
@@ -75,35 +105,47 @@ impl SolanaExecutor {
         Ok((signing_key, pubkey_b58))
     }
 
-    /// Helper to send RPC requests with automatic multi-endpoint fallback
+    /// Mengirim satu request read/broadcast ke pool RPC Solana.
+    /// Broadcast tetap hanya sekali; caller wajib merekonsiliasi signature.
     pub async fn post_rpc(&self, payload: &Value) -> Result<Value> {
-        let rpcs = [
-            &self.config.solana_rpc_url,
-            "https://api.mainnet-beta.solana.com",
-            "https://solana-rpc.publicnode.com",
-        ];
-
-        let mut last_err = anyhow!("All RPC endpoints failed");
-        for rpc in rpcs {
-            if rpc.trim().is_empty() {
-                continue;
-            }
-            match self.client.post(rpc).json(payload).send().await {
-                Ok(res) => {
-                    if let Ok(json) = res.json::<Value>().await {
-                        if json.get("error").is_none() && json.get("result").is_some() {
-                            return Ok(json);
-                        } else if let Some(err) = json.get("error") {
-                            last_err = anyhow!("RPC ({}) Error: {}", rpc, err);
-                        }
+        let mut rpc_urls: Vec<String> = self.config.solana_rpc_url
+            .split(',').map(str::trim).filter(|url| !url.is_empty())
+            .map(ToOwned::to_owned).collect();
+        for fallback in ["https://solana-rpc.publicnode.com", "https://rpc.ankr.com/solana", "https://api.mainnet-beta.solana.com"] {
+            if !rpc_urls.iter().any(|url| url == fallback) { rpc_urls.push(fallback.to_string()); }
+        }
+        let count = rpc_urls.len();
+        if count == 0 { return Err(anyhow!("No Solana RPC endpoints configured")); }
+        let is_broadcast = payload.get("method").and_then(Value::as_str) == Some("sendTransaction");
+        let start = self.rpc_index.fetch_add(1, Ordering::Relaxed) % count;
+        let max_attempts = if is_broadcast { 1 } else { count };
+        let mut last_err = anyhow!("All Solana RPC endpoints failed");
+        for offset in 0..max_attempts {
+            let index = (start + offset) % count;
+            if self.rpc_cooldowns.lock().unwrap()[index].map(|until| until > Instant::now()).unwrap_or(false) { continue; }
+            self.rpc_requests.fetch_add(1, Ordering::Relaxed);
+            match self.client.post(&rpc_urls[index]).json(payload).send().await {
+                Ok(res) if res.status().as_u16() == 429 => {
+                    self.rpc_rate_limited.fetch_add(1, Ordering::Relaxed);
+                    self.rpc_cooldowns.lock().unwrap()[index] = Some(Instant::now() + Duration::from_secs(30));
+                    last_err = anyhow!("Solana RPC endpoint {index} rate-limited");
+                }
+                Ok(res) => match res.json::<Value>().await {
+                    Ok(json) if json.get("error").is_none() && json.get("result").is_some() => {
+                        self.rpc_successes.fetch_add(1, Ordering::Relaxed);
+                        return Ok(json);
                     }
-                }
-                Err(e) => {
-                    last_err = anyhow!("RPC ({}) Network Error: {}", rpc, e);
-                }
+                    Ok(json) => { self.rpc_failures.fetch_add(1, Ordering::Relaxed); last_err = anyhow!("Solana RPC endpoint {index} error: {}", json.get("error").unwrap_or(&json)); }
+                    Err(error) => { self.rpc_failures.fetch_add(1, Ordering::Relaxed); last_err = anyhow!("Solana RPC endpoint {index} invalid JSON: {error}"); }
+                },
+                Err(error) => { self.rpc_failures.fetch_add(1, Ordering::Relaxed); self.rpc_cooldowns.lock().unwrap()[index] = Some(Instant::now() + Duration::from_secs(15)); last_err = anyhow!("Solana RPC endpoint {index} transport error: {error}"); }
             }
         }
         Err(last_err)
+    }
+
+    pub fn rpc_health_snapshot(&self) -> (u64, u64, u64, u64) {
+        (self.rpc_requests.load(Ordering::Relaxed), self.rpc_successes.load(Ordering::Relaxed), self.rpc_rate_limited.load(Ordering::Relaxed), self.rpc_failures.load(Ordering::Relaxed))
     }
 
     /// Fetches native SOL balance via Solana RPC
@@ -123,21 +165,21 @@ impl SolanaExecutor {
         }
     }
 
-    /// Fetches live SOL/USD price via DexScreener or Jupiter
-    pub async fn get_sol_price(&self) -> f64 {
-        let url = "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112";
-        if let Ok(res) = self.client.get(url).send().await {
-            if let Ok(data) = res.json::<Value>().await {
-                if let Some(price_str) = data["pairs"][0]["priceUsd"].as_str() {
-                    if let Ok(p) = price_str.parse::<f64>() {
-                        if p > 10.0 {
-                            return p;
-                        }
-                    }
-                }
-            }
+    /// Fetches live SOL/USD via a fresh Jupiter SOL→USDC quote.
+    /// Failure is terminal; no guessed fallback is permitted.
+    pub async fn get_sol_price(&self) -> Result<f64> {
+        let url = "https://api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=1000000000&slippageBps=0&restrictIntermediateTokens=true";
+        let response = self.client.get(url).send().await?.error_for_status()?;
+        let data: Value = response.json().await?;
+        let out_amount = data["outAmount"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Jupiter SOL/USD quote output missing"))?
+            .parse::<u64>()?;
+        let price = out_amount as f64 / 1_000_000.0;
+        if !price.is_finite() || price <= 0.0 {
+            return Err(anyhow!("Jupiter SOL/USD quote price invalid"));
         }
-        100.0 // safe fallback
+        Ok(price)
     }
 
     /// Fetches on-chain UI token balance for an exact mint
@@ -370,16 +412,8 @@ impl SolanaExecutor {
             .ok_or_else(|| anyhow!("Invalid RPC sendTransaction response: {:?}", res_json))?
             .to_string();
 
-        // Dual Broadcast to Jito Anti-MEV Block Engine
-        let jito_url = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
-        let jito_payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendBundle",
-            "params": [[signed_base64]]
-        });
-        let _ = self.client.post(jito_url).json(&jito_payload).send().await;
-
+        // Submit exactly once through the RPC pool. Confirmation is performed
+        // separately using the returned signature; do not dual-submit to Jito.
         Ok(tx_signature)
     }
 
@@ -477,8 +511,12 @@ impl SolanaExecutor {
         };
         let position_id = format!("SOL-{}", signal.token_mint);
 
-        let sol_price = self.get_sol_price().await;
-        let amount_native_sol = amount_usd / sol_price;
+        let amount_native_sol = if self.config.dry_run {
+            0.0
+        } else {
+            let sol_price = self.get_sol_price().await?;
+            amount_usd / sol_price
+        };
         let amount_lamports = (amount_native_sol * 1_000_000_000.0) as u64;
 
         let wsol_mint = "So11111111111111111111111111111111111111112";
@@ -499,6 +537,22 @@ impl SolanaExecutor {
                     }
                 }
 
+                let intent_created = self.db.create_execution_intent(
+                    &position_id,
+                    Chain::Solana,
+                    "BUY",
+                    &signal.token_mint,
+                    &user_pubkey,
+                    amount_native_sol,
+                )?;
+                if !intent_created {
+                    let existing = self.db.get_execution_intent(&position_id)?;
+                    if existing.as_ref().and_then(|(_, _, _, signature)| signature.as_ref()).is_some() {
+                        return Err(anyhow!("Solana BUY intent sudah memiliki signature; menolak broadcast ulang"));
+                    }
+                    return Err(anyhow!("Solana BUY intent sudah ada dan belum direkonsiliasi: {}", position_id));
+                }
+
                 let mut buy_success = false;
                 let is_pump_token = signal.token_mint.ends_with("pump");
 
@@ -512,6 +566,12 @@ impl SolanaExecutor {
                         Ok(signed_pump_tx) => match self.broadcast_tx(&signed_pump_tx).await {
                             Ok(sig) => {
                                 println!("[PUMPFUN BUY CONFIRMED 🟢] TX Sig: {}", sig);
+                                self.db.update_execution_intent(
+                                    &position_id,
+                                    "BROADCASTED",
+                                    None,
+                                    Some(&sig),
+                                )?;
                                 _onchain_tx_sig = Some(sig);
                                 buy_success = true;
                             }
@@ -544,6 +604,12 @@ impl SolanaExecutor {
                                 Ok(signed_tx) => match self.broadcast_tx(&signed_tx).await {
                                     Ok(sig) => {
                                         println!("[ONCHAIN BUY CONFIRMED 🟢] TX Sig: {}", sig);
+                                        self.db.update_execution_intent(
+                                            &position_id,
+                                            "BROADCASTED",
+                                            None,
+                                            Some(&sig),
+                                        )?;
                                         _onchain_tx_sig = Some(sig);
                                         buy_success = true;
                                     }
@@ -574,12 +640,14 @@ impl SolanaExecutor {
                         .await
                         .unwrap_or(false);
                     if !confirmed {
+                        self.db.update_execution_intent(&position_id, "PENDING_RECONCILIATION", None, Some(tx_signature))?;
                         eprintln!(
                             "[ONCHAIN BUY REJECTED ❌] Transaction {} was not confirmed; no position will be persisted.",
                             tx_signature
                         );
                         return Ok(None);
                     }
+                    self.db.update_execution_intent(&position_id, "CONFIRMED", None, Some(tx_signature))?;
 
                     // Reconcile exact token balance from chain before creating OPEN position.
                     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -596,6 +664,7 @@ impl SolanaExecutor {
                     }
                     new_tokens = onchain_bal;
                     entry_price = amount_usd / onchain_bal;
+                    self.db.update_execution_intent(&position_id, "RECONCILED", None, Some(tx_signature))?;
                     println!("[ONCHAIN RECONCILED 📊] Exact Token Units: {:.4} -> Exact Real Entry Price: ${:.6}",
                         onchain_bal, entry_price);
                 }
@@ -689,7 +758,7 @@ impl SolanaExecutor {
         }
 
         let position = ShadowPosition {
-            id: position_id,
+            id: position_id.clone(),
             chain: Chain::Solana,
             token_symbol: signal.token_symbol.clone(),
             token_mint: signal.token_mint.clone(),
@@ -710,6 +779,9 @@ impl SolanaExecutor {
         };
 
         self.db.upsert_position(&position)?;
+        if !self.config.dry_run {
+            self.db.update_execution_intent(&position_id, "OPEN", None, _onchain_tx_sig.as_deref())?;
+        }
         Ok(Some(position))
     }
 

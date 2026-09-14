@@ -2,7 +2,7 @@ pub mod cluster_detective;
 pub mod scoring;
 pub mod winner_profiler;
 
-use crate::db::SmartWalletDb;
+use crate::db::{CandidateWalletDb, SmartWalletDb};
 use cluster_detective::WhaleClusterDetective;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -19,11 +19,12 @@ impl SmartMoneyIndexer {
         helius_rpc_url: &str,
         robinhood_rpc_url: &str,
         db: Arc<SmartWalletDb>,
+        candidate_db: Arc<CandidateWalletDb>,
         interval_secs: u64,
     ) -> Self {
         Self {
-            profiler: WinnerProfiler::new(helius_rpc_url, robinhood_rpc_url, db.clone()),
-            detective: WhaleClusterDetective::new(helius_rpc_url, robinhood_rpc_url, db),
+            profiler: WinnerProfiler::new(helius_rpc_url, robinhood_rpc_url, db.clone(), candidate_db.clone()),
+            detective: WhaleClusterDetective::new(helius_rpc_url, robinhood_rpc_url, db, candidate_db),
             interval_secs,
         }
     }
@@ -43,7 +44,7 @@ impl SmartMoneyIndexer {
             match self.profiler.discover_active_smart_wallets().await {
                 Ok(new_wallets) => {
                     if !new_wallets.is_empty() {
-                        println!("[INDEXER 🎯] Discovered & added {} new active smart wallet(s) directly on-chain!", new_wallets.len());
+                        println!("[INDEXER 🎯] Discovered {} on-chain wallet candidate(s); candidates remain MONITOR_ONLY pending independent audit.", new_wallets.len());
                     }
                 }
                 Err(e) => {
@@ -54,7 +55,7 @@ impl SmartMoneyIndexer {
             // Run cluster detective pass every 3 cycles
             if let Ok(shadows) = self.detective.trace_top_whale_clusters().await {
                 if !shadows.is_empty() {
-                    println!("[INDEXER 🕵️] Discovered & linked {} new subsidiary whale wallet(s) via on-chain funding trace!", shadows.len());
+                    println!("[INDEXER 🕵️] Discovered {} subsidiary wallet candidate(s) via funding trace; candidates remain MONITOR_ONLY.", shadows.len());
                 }
             }
 

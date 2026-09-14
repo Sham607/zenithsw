@@ -61,7 +61,7 @@ impl App {
             stop_loss_pct: 35.0,
             take_profit_pct: 100.0,
             min_whale_buy_usd: 150.0,
-            is_live_mode: true,
+            is_live_mode: false,
             wallet_pubkey: String::new(),
             uptime_secs: 0,
         }

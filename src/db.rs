@@ -14,6 +14,126 @@ pub struct SmartWalletDb {
     wallet_conn: Option<Mutex<Connection>>,
 }
 
+/// Registry staging untuk address hasil discovery/forensic sebelum promosi eksplisit.
+pub struct CandidateWalletDb {
+    conn: Mutex<Connection>,
+}
+
+impl CandidateWalletDb {
+    pub fn open(path: &str) -> Result<Self> {
+        if let Some(parent) = Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;
+             CREATE TABLE IF NOT EXISTS candidates (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 rank INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 handle TEXT NOT NULL,
+                 chain TEXT NOT NULL,
+                 address TEXT NOT NULL,
+                 tier TEXT NOT NULL DEFAULT 'TIER-B',
+                 pnl_24h_usd REAL NOT NULL DEFAULT 0.0,
+                 win_rate_pct REAL NOT NULL DEFAULT 0.0,
+                 total_trades INTEGER NOT NULL DEFAULT 0,
+                 source TEXT NOT NULL,
+                 qualification_status TEXT NOT NULL DEFAULT 'UNVERIFIED',
+                 execution_track TEXT NOT NULL DEFAULT 'MONITOR_ONLY',
+                 is_active INTEGER NOT NULL DEFAULT 0,
+                 discovered_at TEXT NOT NULL,
+                 last_checked_at TEXT NOT NULL,
+                 UNIQUE(chain, address)
+             );
+             CREATE TABLE IF NOT EXISTS candidate_relations (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 candidate_id INTEGER NOT NULL,
+                 parent_address TEXT,
+                 cluster_id TEXT,
+                 relation_type TEXT NOT NULL,
+                 evidence_tx_hash TEXT,
+                 evidence_block TEXT,
+                 verified INTEGER NOT NULL DEFAULT 0,
+                 created_at TEXT NOT NULL,
+                 FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_candidates_status ON candidates(qualification_status);
+             CREATE INDEX IF NOT EXISTS idx_candidates_address ON candidates(chain, address);
+             CREATE INDEX IF NOT EXISTS idx_candidate_relations_parent ON candidate_relations(parent_address);
+             CREATE TABLE IF NOT EXISTS candidate_metrics (
+                 candidate_id INTEGER PRIMARY KEY,
+                 sample_transactions INTEGER NOT NULL DEFAULT 0,
+                 verified_swaps INTEGER NOT NULL DEFAULT 0,
+                 closed_trades INTEGER NOT NULL DEFAULT 0,
+                 realized_pnl_usd REAL NOT NULL DEFAULT 0.0,
+                 win_rate_pct REAL NOT NULL DEFAULT 0.0,
+                 median_holding_secs INTEGER NOT NULL DEFAULT 0,
+                 sniper_ratio_pct REAL NOT NULL DEFAULT 0.0,
+                 mev_flag INTEGER NOT NULL DEFAULT 0,
+                 last_audit_block TEXT,
+                 evidence_source TEXT,
+                 audited_at TEXT,
+                 FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+             );
+             CREATE TABLE IF NOT EXISTS candidate_evidence (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 candidate_id INTEGER NOT NULL,
+                 evidence_type TEXT NOT NULL,
+                 tx_hash TEXT,
+                 block_number TEXT,
+                 payload TEXT NOT NULL,
+                 observed_at TEXT NOT NULL,
+                 FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_candidate_evidence_candidate ON candidate_evidence(candidate_id);",
+        )?;
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    pub fn upsert_candidate(
+        &self,
+        wallet: &SmartWallet,
+        parent_address: Option<&str>,
+        cluster_id: Option<&str>,
+        relation_type: &str,
+        evidence_tx_hash: Option<&str>,
+        evidence_block: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO candidates
+             (rank,name,handle,chain,address,tier,pnl_24h_usd,win_rate_pct,total_trades,source,
+              qualification_status,execution_track,is_active,discovered_at,last_checked_at)
+             VALUES (?1,?2,?3,?4,?5,'TIER-B',0.0,0.0,0,?6,'UNVERIFIED','MONITOR_ONLY',0,?7,?7)
+             ON CONFLICT(chain,address) DO UPDATE SET
+               name=excluded.name, handle=excluded.handle, last_checked_at=excluded.last_checked_at,
+               source=excluded.source",
+            params![wallet.rank, wallet.name, wallet.handle, wallet.chain.to_string(), wallet.address, wallet.source, now],
+        )?;
+        let candidate_id: i64 = conn.query_row(
+            "SELECT id FROM candidates WHERE chain=?1 AND address=?2",
+            params![wallet.chain.to_string(), wallet.address],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO candidate_relations
+             (candidate_id,parent_address,cluster_id,relation_type,evidence_tx_hash,evidence_block,verified,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,0,?7)",
+            params![candidate_id, parent_address, cluster_id, relation_type, evidence_tx_hash, evidence_block, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn count(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row("SELECT COUNT(*) FROM candidates", [], |row| row.get(0))?)
+    }
+}
+
 impl SmartWalletDb {
     pub fn new(path: &str) -> Result<Self> {
         Self::new_with_wallet_path(path, path)
@@ -303,6 +423,23 @@ impl SmartWalletDb {
         let _ = conn.execute("ALTER TABLE shadow_positions ADD COLUMN track TEXT NOT NULL DEFAULT 'FAST_LANE';", []);
         let _ = conn.execute("ALTER TABLE shadow_signals ADD COLUMN track TEXT NOT NULL DEFAULT 'FAST_LANE';", []);
         let _ = conn.execute("ALTER TABLE trade_history ADD COLUMN track TEXT NOT NULL DEFAULT 'FAST_LANE';", []);
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS execution_intents (
+                intent_id TEXT PRIMARY KEY,
+                chain TEXT NOT NULL,
+                action TEXT NOT NULL,
+                token_mint TEXT NOT NULL,
+                wallet_address TEXT NOT NULL,
+                amount_native REAL NOT NULL,
+                state TEXT NOT NULL,
+                tx_hash TEXT,
+                signature TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+             CREATE INDEX IF NOT EXISTS idx_execution_intents_state ON execution_intents(state);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_intents_tx_hash ON execution_intents(tx_hash) WHERE tx_hash IS NOT NULL;",
+        )?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -1380,5 +1517,98 @@ impl SmartWalletDb {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM tracked_tokens", [])?;
         Ok(())
+    }
+
+    pub fn create_execution_intent(
+        &self,
+        intent_id: &str,
+        chain: Chain,
+        action: &str,
+        token_mint: &str,
+        wallet_address: &str,
+        amount_native: f64,
+    ) -> Result<bool> {
+        if intent_id.trim().is_empty()
+            || action.trim().is_empty()
+            || token_mint.trim().is_empty()
+            || wallet_address.trim().is_empty()
+            || !amount_native.is_finite()
+            || amount_native <= 0.0
+        {
+            return Err(anyhow::anyhow!("invalid execution intent"));
+        }
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO execution_intents
+             (intent_id,chain,action,token_mint,wallet_address,amount_native,state,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,'INTENT',?7,?7)",
+            params![intent_id, chain.to_string(), action, token_mint, wallet_address, amount_native, now],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    pub fn update_execution_intent(
+        &self,
+        intent_id: &str,
+        state: &str,
+        tx_hash: Option<&str>,
+        signature: Option<&str>,
+    ) -> Result<()> {
+        if intent_id.trim().is_empty() || state.trim().is_empty() {
+            return Err(anyhow::anyhow!("invalid execution intent update"));
+        }
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE execution_intents
+             SET state=?1,tx_hash=coalesce(?2,tx_hash),signature=coalesce(?3,signature),updated_at=?4
+             WHERE intent_id=?5",
+            params![state, tx_hash, signature, Utc::now().to_rfc3339(), intent_id],
+        )?;
+        if changed != 1 {
+            return Err(anyhow::anyhow!("execution intent not found: {intent_id}"));
+        }
+        Ok(())
+    }
+
+    pub fn get_execution_intent(&self, intent_id: &str) -> Result<Option<(String, String, Option<String>, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT state,action,tx_hash,signature FROM execution_intents WHERE intent_id=?1",
+        )?;
+        Ok(stmt
+            .query_row(params![intent_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .optional()?)
+    }
+
+    pub fn get_pending_execution_intents(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, String, String, Option<String>, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT intent_id,chain,action,token_mint,wallet_address,state,tx_hash,signature
+             FROM execution_intents
+             WHERE state IN ('INTENT','BROADCASTED','PENDING_RECONCILIATION','CONFIRMED','RECONCILED')
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        })?;
+        let mut intents = Vec::new();
+        for row in rows {
+            intents.push(row?);
+        }
+        Ok(intents)
     }
 }

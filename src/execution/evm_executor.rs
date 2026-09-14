@@ -13,9 +13,10 @@
 /// DRY_RUN=true : quote → calldata → eth_call → estimateGas, tanpa sign/broadcast.
 /// Broadcast tetap fail-closed hingga canary gate diaktifkan secara eksplisit.
 use crate::chains::robinhood::{
-    RobinhoodRpc, UniversalRouterV4Swap, V4InitializedPool, V4QuoteExactInputSingle,
-    USDG, UNIVERSAL_ROUTER, V3_SWAP_ROUTER_02, WETH9,
+    RobinhoodRpc, UniversalRouterV4MultiHopSwap, UniversalRouterV4Swap, V4InitializedPool,
+    V4PathKey, V4QuoteExactInputSingle, PERMIT2, USDG, UNIVERSAL_ROUTER, V3_SWAP_ROUTER_02, WETH9,
 };
+use crate::execution::evm_tx::Eip1559Transaction;
 use crate::config::Config;
 use crate::db::SmartWalletDb;
 use crate::models::{is_blacklisted_asset, Chain, ShadowPosition, ShadowSignal};
@@ -42,6 +43,8 @@ enum RouteKind {
     V3TwoHop { token_in: String, mid: String, token_out: String, fee_a: u32, fee_b: u32, amount_out: u128 },
     /// V4 pool via Robinhood Universal Router
     V4Pool { pool: V4InitializedPool, zero_for_one: bool, amount_out: u128 },
+    /// Verified Pons V2 two-hop route: native ETH → USDG → token.
+    V4TwoHop { token: String, path: Vec<V4PathKey>, amount_out: u128 },
 }
 
 impl RouteKind {
@@ -50,6 +53,7 @@ impl RouteKind {
             Self::V3Single { amount_out, .. } => *amount_out,
             Self::V3TwoHop { amount_out, .. } => *amount_out,
             Self::V4Pool { amount_out, .. } => *amount_out,
+            Self::V4TwoHop { amount_out, .. } => *amount_out,
         }
     }
 }
@@ -88,6 +92,62 @@ impl EvmExecutor {
         let v = raw.parse::<u128>().context("ROBINHOOD_TRADE_AMOUNT_WEI bukan integer")?;
         if v == 0 { bail!("trade amount harus > 0"); }
         Ok(v)
+    }
+
+    fn evm_private_key_bytes(&self) -> Result<[u8; 32]> {
+        let raw = self
+            .config
+            .evm_private_key
+            .as_deref()
+            .context("ROBINHOOD_PRIVATE_KEY belum dikonfigurasi")?;
+        let bytes = hex::decode(raw.trim_start_matches("0x"))
+            .context("invalid EVM private key encoding")?;
+        bytes
+            .try_into()
+            .map_err(|_| anyhow!("EVM private key harus berukuran 32 byte"))
+    }
+
+    /// Builds and signs a transaction after RPC nonce/gas estimation.
+    /// It never broadcasts; the caller must perform the separate live gate.
+    async fn build_signed_transaction(
+        &self,
+        rpc: &RobinhoodRpc,
+        from: &str,
+        to: &str,
+        value: u128,
+        data: &str,
+    ) -> Result<Vec<u8>> {
+        if !is_evm_address(from) || !is_evm_address(to) {
+            bail!("invalid EVM transaction address");
+        }
+        let data_bytes = hex::decode(data.trim_start_matches("0x"))
+            .context("transaction calldata is not valid hex")?;
+        if data_bytes.is_empty() {
+            bail!("transaction calldata is empty");
+        }
+        let nonce = parse_hex_quantity(&rpc.get_transaction_count(from, "pending").await?)?;
+        let gas_price = parse_hex_quantity(&rpc.gas_price().await?)?;
+        let gas_request = json!({
+            "from": from,
+            "to": to,
+            "value": format!("0x{value:x}"),
+            "data": data,
+        });
+        let gas_limit = parse_hex_quantity(&rpc.estimate_gas(&gas_request).await?)?;
+        let gas_limit = u64::try_from(gas_limit).context("gas limit exceeds u64")?;
+        let mut to_bytes = [0u8; 20];
+        to_bytes.copy_from_slice(&hex::decode(to.trim_start_matches("0x"))?);
+        let tx = Eip1559Transaction {
+            chain_id: 4663,
+            nonce: u64::try_from(nonce).context("nonce exceeds u64")?,
+            max_priority_fee_per_gas: 0,
+            max_fee_per_gas: gas_price,
+            gas_limit,
+            to: to_bytes,
+            value,
+            data: data_bytes,
+        };
+        tx.sign(&self.evm_private_key_bytes()?)
     }
 
     // ── Route discovery ───────────────────────────────────────────────────────
@@ -140,6 +200,35 @@ impl EvmExecutor {
                         }
                     }
                 }
+            }
+        }
+
+        // — V4 Pons V2 verified route: native ETH → USDG → token —
+        // The path is only offered for the known Pons hook and token pair shape;
+        // quote must still succeed against the current deployment state.
+        let pons_path = vec![
+            V4PathKey {
+                intermediate_currency: USDG.to_lowercase(),
+                fee: 0x57,
+                tick_spacing: 1,
+                hooks: "0x0000000000000000000000000000000000000000".to_string(),
+                hook_data: Vec::new(),
+            },
+            V4PathKey {
+                intermediate_currency: tok.clone(),
+                fee: 0,
+                tick_spacing: 200,
+                hooks: "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044".to_string(),
+                hook_data: Vec::new(),
+            },
+        ];
+        if let Ok(out) = rpc.v4_quote_exact_input(
+            "0x0000000000000000000000000000000000000000",
+            &pons_path,
+            amount_in,
+        ).await {
+            if out > 0 {
+                routes.push(RouteKind::V4TwoHop { token: tok.clone(), path: pons_path, amount_out: out });
             }
         }
 
@@ -260,6 +349,38 @@ impl EvmExecutor {
         swap.encode_calldata()
     }
 
+    async fn validate_input_allowance(
+        &self,
+        rpc: &RobinhoodRpc,
+        token_in: &str,
+        owner: &str,
+        spender: &str,
+        amount_in: u128,
+    ) -> Result<()> {
+        if token_in == "0x0000000000000000000000000000000000000000" {
+            return Ok(());
+        }
+        let allowance = parse_hex_quantity(&rpc.token_allowance(token_in, owner, spender).await?)?;
+        if allowance < amount_in {
+            bail!("allowance ERC-20 tidak cukup: token={} owner={} spender={} allowance={} amount_in={}", token_in, owner, spender, allowance, amount_in);
+        }
+        Ok(())
+    }
+
+    async fn validate_permit2_route_allowance(
+        &self,
+        rpc: &RobinhoodRpc,
+        token_in: &str,
+        owner: &str,
+        amount_in: u128,
+    ) -> Result<()> {
+        self.validate_input_allowance(rpc, token_in, owner, PERMIT2, amount_in).await?;
+        let allowance = rpc.permit2_allowance(owner, token_in, UNIVERSAL_ROUTER).await?;
+        allowance.validate(amount_in, now_unix()?)
+            .context("Permit2 allowance owner/token/router gagal")?;
+        Ok(())
+    }
+
     // ── simulate_buy ──────────────────────────────────────────────────────────
 
     async fn simulate_buy(&self, signal: &ShadowSignal) -> Result<()> {
@@ -290,7 +411,6 @@ impl EvmExecutor {
         let amount_out = best.amount_out();
         let amount_out_min = amount_out.saturating_mul(10_000 - SLIPPAGE_BPS) / 10_000;
         let deadline = now_unix()?.saturating_add(DEADLINE_SECS);
-
         println!("[ROBINHOOD] best route: {:?}", best);
         println!("[ROBINHOOD] amountOut={amount_out} amountOutMin={amount_out_min}");
 
@@ -306,13 +426,49 @@ impl EvmExecutor {
             }
             RouteKind::V4Pool { pool, zero_for_one, .. } => {
                 let cd = self.build_v4_calldata(pool, *zero_for_one, amount_in, amount_out_min, deadline)?;
-                // V4 native pool: value = amount_in; non-native: 0 (perlu approve WETH terlebih dulu)
                 let is_native_in = pool.pool_key.currency0 == "0x0000000000000000000000000000000000000000"
                     && *zero_for_one;
                 let val = if is_native_in { amount_in } else { 0 };
                 (cd, UNIVERSAL_ROUTER.to_string(), val)
             }
+            RouteKind::V4TwoHop { token, path, .. } => {
+                if token != &signal.token_mint { bail!("two-hop route target mismatch"); }
+                let swap = UniversalRouterV4MultiHopSwap {
+                    currency_in: "0x0000000000000000000000000000000000000000".to_string(),
+                    recipient: wallet.clone(),
+                    path: path.clone(),
+                    amount_in,
+                    amount_out_minimum: amount_out_min,
+                    deadline,
+                };
+                (swap.encode_calldata()?, UNIVERSAL_ROUTER.to_string(), amount_in)
+            }
         };
+
+        let input_token = match &best {
+            RouteKind::V3Single { token_in, .. } => token_in.as_str(),
+            RouteKind::V3TwoHop { token_in, .. } => token_in.as_str(),
+            RouteKind::V4Pool { pool, zero_for_one, .. } => {
+                if *zero_for_one { pool.pool_key.currency0.as_str() } else { pool.pool_key.currency1.as_str() }
+            }
+            RouteKind::V4TwoHop { .. } => "0x0000000000000000000000000000000000000000",
+        };
+        let input_is_native = input_token == "0x0000000000000000000000000000000000000000";
+        if !input_is_native {
+            match &best {
+                RouteKind::V3Single { .. } | RouteKind::V3TwoHop { .. } => {
+                    self.validate_input_allowance(&rpc, input_token, &wallet, V3_SWAP_ROUTER_02, amount_in)
+                        .await
+                        .context("allowance input token ke SwapRouter02 gagal")?;
+                }
+                RouteKind::V4Pool { .. } => {
+                    self.validate_permit2_route_allowance(&rpc, input_token, &wallet, amount_in)
+                        .await
+                        .context("allowance input token ke Permit2/Universal Router gagal")?;
+                }
+                RouteKind::V4TwoHop { .. } => {}
+            }
+        }
 
         let tx = json!({
             "from": wallet,
@@ -345,7 +501,66 @@ impl EvmExecutor {
         if !self.config.live_robinhood_enabled {
             bail!("DRY_RUN=false tetapi LIVE_ROBINHOOD_ENABLED=false; live Robinhood tetap terkunci");
         }
-        bail!("live Robinhood belum siap: signer, allowance, broadcast, receipt, dan reconciliation belum lengkap")
+        self.execute_live_buy(signal).await
+    }
+
+    async fn execute_live_buy(&self, signal: &ShadowSignal) -> Result<Option<ShadowPosition>> {
+        if !self.config.live_robinhood_enabled || self.config.dry_run {
+            bail!("live Robinhood membutuhkan DRY_RUN=false dan LIVE_ROBINHOOD_ENABLED=true");
+        }
+        if signal.chain != Chain::Robinhood || !signal.is_passed {
+            return Ok(None);
+        }
+        if !is_evm_address(&signal.token_mint) || is_blacklisted_asset(&signal.token_mint, &signal.token_symbol) {
+            bail!("aset Robinhood tidak valid atau diblacklist");
+        }
+        let rpc = self.rpc()?;
+        rpc.chain_id().await.context("chain ID check gagal")?;
+        rpc.validate_deployments().await.context("venue deployment check gagal")?;
+        let wallet = self.wallet_address()?;
+        let amount_in = self.trade_amount_wei()?;
+        let balance = parse_hex_quantity(&rpc.get_balance(&wallet, "latest").await?)?;
+        if balance < amount_in.saturating_add(MIN_GAS_RESERVE_WEI) {
+            bail!("saldo ETH tidak cukup untuk live Robinhood BUY");
+        }
+        let routes = self.probe_routes(&rpc, &signal.token_mint, amount_in).await;
+        let best = routes.into_iter().max_by_key(RouteKind::amount_out)
+            .ok_or_else(|| anyhow!("tidak ada route Robinhood tervalidasi"))?;
+        let amount_out_min = best.amount_out().saturating_mul(10_000 - SLIPPAGE_BPS) / 10_000;
+        let deadline = now_unix()?.saturating_add(DEADLINE_SECS);
+        let (calldata, router, value) = match &best {
+            RouteKind::V3Single { token_in, token_out, fee, .. } =>
+                (self.build_v3_single_calldata(token_in, token_out, *fee, amount_in, amount_out_min, &wallet, deadline)?, V3_SWAP_ROUTER_02, 0),
+            RouteKind::V3TwoHop { token_in, mid, token_out, fee_a, fee_b, .. } =>
+                (self.build_v3_twohop_calldata(token_in, mid, token_out, *fee_a, *fee_b, amount_in, amount_out_min, &wallet, deadline)?, V3_SWAP_ROUTER_02, 0),
+            RouteKind::V4Pool { pool, zero_for_one, .. } => {
+                let native = pool.pool_key.currency0 == "0x0000000000000000000000000000000000000000" && *zero_for_one;
+                (self.build_v4_calldata(pool, *zero_for_one, amount_in, amount_out_min, deadline)?, UNIVERSAL_ROUTER, if native { amount_in } else { 0 })
+            }
+            RouteKind::V4TwoHop { token, path, .. } => {
+                if token != &signal.token_mint { bail!("two-hop route target mismatch"); }
+                let swap = UniversalRouterV4MultiHopSwap {
+                    currency_in: "0x0000000000000000000000000000000000000000".to_string(),
+                    recipient: wallet.clone(),
+                    path: path.clone(),
+                    amount_in,
+                    amount_out_minimum: amount_out_min,
+                    deadline,
+                };
+                (swap.encode_calldata()?, UNIVERSAL_ROUTER, amount_in)
+            }
+        };
+        let tx_request = json!({"from": wallet, "to": router, "value": format!("0x{value:x}"), "data": calldata});
+        rpc.eth_call(&tx_request).await.context("live BUY eth_call gagal")?;
+        let _gas = rpc.estimate_gas(&tx_request).await.context("live BUY estimateGas gagal")?;
+        let intent_id = format!("RH-BUY-{}", signal.token_mint);
+        if !self.db.create_execution_intent(&intent_id, Chain::Robinhood, "BUY", &signal.token_mint, &wallet, amount_in as f64)? {
+            bail!("Robinhood BUY intent sudah ada; menolak broadcast ulang");
+        }
+        let signed = self.build_signed_transaction(&rpc, &wallet, router, value, &calldata).await?;
+        let signed_len = signed.len();
+        self.db.update_execution_intent(&intent_id, "SIGNED", None, None)?;
+        bail!("Robinhood BUY prepared and signed ({} bytes); broadcast remains a separate canary operation", signed_len)
     }
 
     pub async fn execute_partial_shadow_sell(&self, _id: &str, _ratio: f64, _reason: &str, _price: f64) -> Result<()> {

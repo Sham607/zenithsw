@@ -5,7 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct InstanceLock {
     path: PathBuf,
@@ -69,10 +69,22 @@ async fn main() -> Result<()> {
     println!("======================================================");
 
     let config = Config::load()?;
+    let robinhood_primary_rpc = config
+        .robinhood_rpc_url
+        .split(',')
+        .map(str::trim)
+        .find(|url| !url.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("ROBINHOOD_RPC_URL tidak memiliki endpoint valid"))?
+        .to_string();
+    let mut single_rpc_config = config.clone();
+    single_rpc_config.robinhood_rpc_url = robinhood_primary_rpc.clone();
     let _instance_lock = InstanceLock::acquire(&config.ipc_socket_path)?;
     let db = Arc::new(SmartWalletDb::new_with_wallet_path(
         &config.trading_db_path,
         &config.wallet_db_path,
+    )?);
+    let candidate_db = Arc::new(zenithsw::db::CandidateWalletDb::open(
+        "data/candidate_wallet_registry.db",
     )?);
 
     // Initial seed: Only populate if database is completely empty
@@ -102,7 +114,7 @@ async fn main() -> Result<()> {
     let fomo_listener = Arc::new(FomoApiStreamListener::new(Arc::new(config.clone())));
     if config.enable_robinhood {
         arb_listener.validate_robinhood_chain().await?;
-        let robinhood_rpc = RobinhoodRpc::new(&config.robinhood_rpc_url)?;
+        let robinhood_rpc = RobinhoodRpc::new(&robinhood_primary_rpc)?;
         robinhood_rpc.chain_id().await?;
         robinhood_rpc.validate_deployments().await?;
         println!("[ROBINHOOD RPC ✅] Chain ID 4663 and official Uniswap V4 deployments validated");
@@ -113,11 +125,54 @@ async fn main() -> Result<()> {
     let sol_exec = Arc::new(SolanaExecutor::new(config.clone(), db.clone()));
     let evm_exec = Arc::new(EvmExecutor::new(config.clone(), db.clone()));
 
+    // Recover only existing transaction hashes/signatures; never rebroadcast after restart.
+    for (intent_id, chain, _action, _token_mint, _wallet, state, tx_hash, signature) in
+        db.get_pending_execution_intents().unwrap_or_default()
+    {
+        match chain.as_str() {
+            "SOLANA" => {
+                if let Some(signature) = signature {
+                    let confirmed = sol_exec
+                        .confirm_transaction_signature(&signature, 5)
+                        .await
+                        .unwrap_or(false);
+                    let next_state = if confirmed { "CONFIRMED" } else { "PENDING_RECONCILIATION" };
+                    let _ = db.update_execution_intent(&intent_id, next_state, None, Some(&signature));
+                    println!("[INTENT RECOVERY] chain=SOLANA state={} previous_state={}", next_state, state);
+                } else {
+                    let _ = db.update_execution_intent(&intent_id, "FAILED", None, None);
+                    println!("[INTENT RECOVERY] chain=SOLANA state=FAILED reason=missing_signature");
+                }
+            }
+            "ROBINHOOD" => {
+                if let Some(tx_hash) = tx_hash {
+                    let rpc = RobinhoodRpc::new(&config.robinhood_rpc_url)?;
+                    let receipt = rpc.transaction_receipt(&tx_hash).await?;
+                    let next_state = match receipt {
+                        Some(receipt) if receipt.get("status").and_then(serde_json::Value::as_str) == Some("0x1") => "CONFIRMED",
+                        Some(_) => "FAILED",
+                        None => "PENDING_RECONCILIATION",
+                    };
+                    let _ = db.update_execution_intent(&intent_id, next_state, Some(&tx_hash), None);
+                    println!("[INTENT RECOVERY] chain=ROBINHOOD state={} previous_state={}", next_state, state);
+                } else {
+                    let _ = db.update_execution_intent(&intent_id, "FAILED", None, None);
+                    println!("[INTENT RECOVERY] chain=ROBINHOOD state=FAILED reason=missing_tx_hash");
+                }
+            }
+            _ => {
+                let _ = db.update_execution_intent(&intent_id, "FAILED", None, None);
+                println!("[INTENT RECOVERY] state=FAILED reason=unsupported_chain");
+            }
+        }
+    }
+
     // Task 1: Direct On-Chain DEX Graph Indexer Worker (Every 10 minutes)
     let indexer = Arc::new(SmartMoneyIndexer::new(
         &config.solana_rpc_url,
-        &config.robinhood_rpc_url,
+        &robinhood_primary_rpc,
         db.clone(),
+        candidate_db.clone(),
         600,
     ));
     let indexer_worker = indexer.clone();
@@ -163,15 +218,55 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         println!("[STREAM WORKER] Paced Multi-Chain Streamer online (Solana: {}, Robinhood: {}, Base: {})",
             config_stream.enable_solana, config_stream.enable_robinhood, config_stream.enable_base);
+        let mut last_robinhood_scan = Instant::now() - Duration::from_secs(30);
         loop {
             if let Ok(mut wallets) = db_stream.get_active_wallets() {
                 // Filter only enabled chains
-                wallets.retain(|w| match w.chain {
-                    Chain::Solana => config_stream.enable_solana,
-                    Chain::Robinhood => config_stream.enable_robinhood,
-                    Chain::Base => config_stream.enable_base,
-                    _ => false,
+                wallets.retain(|w| {
+                    let chain_enabled = match w.chain {
+                        Chain::Solana => config_stream.enable_solana,
+                        Chain::Robinhood => config_stream.enable_robinhood,
+                        Chain::Base => config_stream.enable_base,
+                        _ => false,
+                    };
+                    // Kandidat discovery/monitor-only tidak boleh menghabiskan kuota RPC.
+                    let qualified = matches!(w.tier, WalletTier::TierS | WalletTier::TierA)
+                        && !matches!(
+                            w.source.as_str(),
+                            "ONCHAIN_INDEXER_CANDIDATE" | "CLUSTER_FORENSIC_CANDIDATE"
+                        );
+                    chain_enabled && qualified && w.chain != Chain::Robinhood
                 });
+
+                // Robinhood uses one bounded global log scan, not one eth_getLogs per wallet.
+                let robinhood_global_results = if last_robinhood_scan.elapsed() >= Duration::from_secs(15) {
+                    last_robinhood_scan = Instant::now();
+                    let robinhood_lookup: std::collections::HashMap<String, SmartWallet> = db_stream
+                        .get_active_wallets()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|w| w.chain == Chain::Robinhood && w.is_active && matches!(w.tier, WalletTier::TierS | WalletTier::TierA))
+                        .map(|w| (w.address.to_lowercase(), w))
+                        .collect();
+                    let robinhood_pairs: Vec<(String, String)> = robinhood_lookup
+                        .values()
+                        .map(|w| (w.handle.clone(), w.address.clone()))
+                        .collect();
+                    arb_listener_stream
+                        .scan_global_wallet_activity(&robinhood_pairs, db_stream.clone())
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|activity| {
+                            robinhood_lookup
+                                .get(&activity.wallet_address.to_lowercase())
+                                .cloned()
+                                .map(|wallet| (activity, wallet))
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
 
                 // Prioritize Qualified Execution Wallets (Tier-S & Tier-A) first
                 wallets.sort_by_key(|w| match w.tier {
@@ -181,7 +276,7 @@ async fn main() -> Result<()> {
                 });
 
                 // Concurrently poll wallet activities across high-speed RPC (8 concurrent workers)
-                let activity_results: Vec<(WalletActivity, SmartWallet)> =
+                let mut activity_results: Vec<(WalletActivity, SmartWallet)> =
                     stream::iter(wallets.into_iter())
                         .map(|w| {
                             let sol_listener = sol_listener_stream.clone();
@@ -207,11 +302,8 @@ async fn main() -> Result<()> {
                                             .await
                                             .ok()
                                             .flatten(),
-                                        Chain::Robinhood | Chain::Arbitrum => arb_listener
-                                            .check_wallet_activity(&w.handle, &w.address, db.clone())
-                                            .await
-                                            .ok()
-                                            .flatten(),
+                                        // Robinhood diproses oleh global scanner di atas.
+                                        Chain::Robinhood | Chain::Arbitrum => None,
                                         _ => None,
                                     };
                                 }
@@ -222,6 +314,7 @@ async fn main() -> Result<()> {
                         .filter_map(|res| async move { res })
                         .collect()
                         .await;
+                activity_results.extend(robinhood_global_results);
 
                 for (act, w) in activity_results {
                     println!(
@@ -326,30 +419,35 @@ async fn main() -> Result<()> {
                             }
                         } else if act.activity_type == ActivityType::Buy {
                             // Fetch real-time pool price, liquidity & market cap across Solana/EVM
-                            let (current_price, pool_liq, live_mcap) =
-                                match SolanaStreamListener::fetch_token_price(&act.token_mint).await {
-                                    Ok((_, price, liquidity, market_cap))
-                                        if price.is_finite()
-                                            && price > 0.0
-                                            && liquidity.is_finite()
-                                            && liquidity > 0.0
-                                            && market_cap.is_finite()
-                                            && market_cap > 0.0 => (price, liquidity, market_cap),
-                                    Ok((_, price, liquidity, market_cap)) => {
-                                        eprintln!(
-                                            "[ENTRY DATA REJECTED ⚠️] {} returned invalid market data (price={}, liquidity={}, mcap={})",
-                                            act.token_mint, price, liquidity, market_cap
-                                        );
-                                        continue;
-                                    }
-                                    Err(error) => {
-                                        eprintln!(
-                                            "[ENTRY DATA FAILED ⚠️] {} ({}) — rejecting entry",
-                                            act.token_mint, error
-                                        );
-                                        continue;
-                                    }
-                                };
+                            let market_data = match act.chain {
+                                Chain::Solana => SolanaStreamListener::fetch_token_price(&act.token_mint).await,
+                                Chain::Robinhood => Err(anyhow::anyhow!("Robinhood market data requires a verified on-chain quote; Solana price resolver is not permitted")),
+                                _ => Err(anyhow::anyhow!("unsupported chain market data source")),
+                            };
+                            let (current_price, pool_liq, live_mcap) = match market_data {
+                                Ok((symbol, price, liquidity, market_cap))
+                                    if !symbol.is_empty()
+                                        && price.is_finite()
+                                        && price > 0.0
+                                        && liquidity.is_finite()
+                                        && liquidity > 0.0
+                                        && market_cap.is_finite()
+                                        && market_cap > 0.0 => (price, liquidity, market_cap),
+                                Ok((symbol, price, liquidity, market_cap)) => {
+                                    eprintln!(
+                                        "[ENTRY DATA REJECTED ⚠️] {} returned invalid market data (symbol={}, price={}, liquidity={}, mcap={})",
+                                        act.token_mint, symbol, price, liquidity, market_cap
+                                    );
+                                    continue;
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "[ENTRY DATA FAILED ⚠️] {} ({}) — rejecting entry",
+                                        act.token_mint, error
+                                    );
+                                    continue;
+                                }
+                            };
 
                             let mut act_to_eval = act.clone();
                             if act_to_eval.execution_price_usd <= 0.0 && current_price > 0.0 {
@@ -423,9 +521,12 @@ async fn main() -> Result<()> {
                     );
 
                     // Fetch latest live price & pool liquidity; never relabel stale price as fresh.
-                    let (live_price, live_liquidity) = match SolanaStreamListener::fetch_token_price(&pos.token_mint)
-                        .await
-                    {
+                    let price_result = match pos.chain {
+                        Chain::Solana => SolanaStreamListener::fetch_token_price(&pos.token_mint).await,
+                        Chain::Robinhood => Err(anyhow::anyhow!("Robinhood position price requires a verified on-chain quote; Solana resolver is not permitted")),
+                        _ => Err(anyhow::anyhow!("unsupported chain position price source")),
+                    };
+                    let (live_price, live_liquidity) = match price_result {
                         Ok((_, price, liquidity, _))
                             if price.is_finite()
                                 && price > 0.0
@@ -677,6 +778,7 @@ async fn main() -> Result<()> {
     let db_heartbeat = db.clone();
     let ipc_heartbeat = ipc_server.clone();
     let sol_exec_hb = sol_exec.clone();
+    let arb_listener_hb = arb_listener.clone();
     let config_hb = config.clone();
     let start_time = Utc::now();
     tokio::spawn(async move {
@@ -700,7 +802,7 @@ async fn main() -> Result<()> {
                 (String::new(), 0.0)
             };
 
-            let sol_price_usd = sol_exec_hb.get_sol_price().await;
+            let sol_price_usd = sol_exec_hb.get_sol_price().await.unwrap_or(0.0);
             let sol_usd_val = wallet_sol_balance * sol_price_usd;
 
             // Physical On-Chain Token Valuation across ALL tokens in the wallet
@@ -734,6 +836,15 @@ async fn main() -> Result<()> {
                 .get_recent_trades(500)
                 .map(|trades| trades.iter().map(|t| t.pnl_usd).sum())
                 .unwrap_or(0.0);
+
+            let (rpc_requests, rpc_successes, rpc_rate_limited, rpc_failures) =
+                arb_listener_hb.health_snapshot();
+            if sync_tick % 10 == 0 {
+                println!(
+                    "[RPC HEALTH] chain=ROBINHOOD requests={} successes={} rate_limited={} failures={}",
+                    rpc_requests, rpc_successes, rpc_rate_limited, rpc_failures
+                );
+            }
 
             let hb = IpcMessage::Heartbeat {
                 uptime_secs,

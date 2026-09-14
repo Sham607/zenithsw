@@ -323,14 +323,14 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![
                 Span::raw("   ├─ Status: "),
                 Span::styled(
-                    "Listening to 135 Multi-Hour Smart Money Wallets",
+                    "Listening to qualified wallets; monitor-only candidates excluded",
                     Style::default().fg(Color::Cyan),
                 ),
             ]),
             Line::from(vec![
                 Span::raw("   ├─ Pipeline: "),
                 Span::styled(
-                    "Paced Zero-429 Engine Polling RPC via Alchemy (68ms / 42ms)",
+                    "Paced RPC polling with cooldown and fail-closed errors",
                     Style::default().fg(Color::Green),
                 ),
             ]),

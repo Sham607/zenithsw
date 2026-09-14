@@ -43,7 +43,9 @@ TUI juga melakukan refresh database berkala. Status IPC harus dibedakan dari sna
 
 - Chain ID: `4663` (`0x1237`).
 - RPC aktif dikonfigurasi melalui `ROBINHOOD_RPC_URL`; chain ID wajib `4663` (`0x1237`).
-- Discovery V4 memakai `PoolManager.Initialize` dan filter token.
+- Pool discovery memakai `PoolManager.Initialize` dan filter token.
+- Indexer discovery baru dikarantina sebagai kandidat: `TIER-B`, `is_active=false`, dan source `ONCHAIN_INDEXER_CANDIDATE`; metriknya belum merupakan realized PnL.
+- Cluster detective hanya mengembalikan kandidat `CLUSTER_FORENSIC_CANDIDATE` inactive dan tidak melakukan ingestion registry.
 - Route probing read-only mencakup Uniswap V3 (direct dan two-hop melalui USDG), V4, serta deployment Pons yang sudah dikenal.
 - Native-currency route mengenali `address(0)` secara eksplisit; token/WETH tidak boleh ditebak.
 - V3 quote memakai QuoterV2 melalui `eth_call`; V4 quote memakai `quoteExactInputSingle` melalui `eth_call`.

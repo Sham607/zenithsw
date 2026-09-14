@@ -1,9 +1,10 @@
-use crate::db::SmartWalletDb;
+use crate::chains::robinhood::RobinhoodRpc;
+use crate::db::{CandidateWalletDb, SmartWalletDb};
 use crate::models::{Chain, SmartWallet, WalletTier};
 use anyhow::Result;
 use chrono::Utc;
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,12 +13,13 @@ pub struct WhaleClusterDetective {
     solana_rpc_url: String,
     robinhood_rpc_url: String,
     db: Arc<SmartWalletDb>,
+    candidate_db: Arc<CandidateWalletDb>,
     client: Client,
     excluded_contracts: HashSet<String>,
 }
 
 impl WhaleClusterDetective {
-    pub fn new(solana_rpc_url: &str, robinhood_rpc_url: &str, db: Arc<SmartWalletDb>) -> Self {
+    pub fn new(solana_rpc_url: &str, robinhood_rpc_url: &str, db: Arc<SmartWalletDb>, candidate_db: Arc<CandidateWalletDb>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(12))
             .build()
@@ -41,6 +43,7 @@ impl WhaleClusterDetective {
             solana_rpc_url: solana_rpc_url.to_string(),
             robinhood_rpc_url: robinhood_rpc_url.to_string(),
             db,
+            candidate_db,
             client,
             excluded_contracts: excluded,
         }
@@ -89,100 +92,74 @@ impl WhaleClusterDetective {
     }
 
     async fn trace_evm_subsidiaries(&self, parent: &SmartWallet) -> Result<Vec<SmartWallet>> {
-        let mut subsidiaries = Vec::new();
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "alchemy_getAssetTransfers",
-            "params": [{
-                "fromBlock": "0x0",
-                "toBlock": "latest",
-                "fromAddress": parent.address,
-                "category": ["external", "erc20"],
-                "maxCount": "0x14",
-                "order": "desc"
-            }]
-        });
-
-        let resp = self
-            .client
-            .post(&self.robinhood_rpc_url)
-            .json(&payload)
-            .send()
+        let rpc = RobinhoodRpc::new(&self.robinhood_rpc_url)?;
+        let latest = rpc.block_number().await?;
+        let latest_n = u64::from_str_radix(latest.trim_start_matches("0x"), 16)?;
+        let from = latest_n.saturating_sub(2_000);
+        let logs = rpc
+            .get_wallet_transfer_logs(
+                &format!("0x{from:x}"),
+                &format!("0x{latest_n:x}"),
+                &parent.address,
+            )
             .await?;
 
-        if !resp.status().is_success() {
-            return Ok(subsidiaries);
-        }
-
-        let json: Value = resp.json().await?;
-        let transfers = match json
-            .get("result")
-            .and_then(|r| r.get("transfers"))
-            .and_then(|t| t.as_array())
-        {
-            Some(arr) => arr,
-            None => return Ok(subsidiaries),
-        };
-
-        let mut sub_idx = 0;
-        for tx in transfers {
-            let to_addr = match tx.get("to").and_then(|t| t.as_str()) {
-                Some(a) => a.to_string(),
-                None => continue,
+        let mut subsidiaries = Vec::new();
+        let mut seen = HashSet::new();
+        for log in logs {
+            let topics = match log.get("topics").and_then(Value::as_array) {
+                Some(topics) if topics.len() >= 3 => topics,
+                _ => continue,
             };
-
-            if to_addr.eq_ignore_ascii_case(&parent.address)
-                || self.excluded_contracts.contains(&to_addr.to_lowercase())
+            let from_topic = topics[1].as_str().unwrap_or("");
+            let to_topic = topics[2].as_str().unwrap_or("");
+            if from_topic.len() != 66 || to_topic.len() != 66 {
+                continue;
+            }
+            let sender = format!("0x{}", &from_topic[26..]);
+            let recipient = format!("0x{}", &to_topic[26..]);
+            if !sender.eq_ignore_ascii_case(&parent.address)
+                || recipient.eq_ignore_ascii_case(&parent.address)
+                || self.excluded_contracts.contains(&recipient.to_lowercase())
+                || !seen.insert(recipient.to_lowercase())
             {
                 continue;
             }
-
-            // Check if already in DB
-            if let Ok(Some(_)) = self.db.get_wallet_by_address(&to_addr) {
+            if let Ok(Some(_)) = self.db.get_wallet_by_address(&recipient) {
                 continue;
             }
-
-            let val = tx.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let asset = tx.get("asset").and_then(|a| a.as_str()).unwrap_or("ETH");
-
-            let is_significant = (matches!(asset, "ETH" | "WETH") && val >= 0.05)
-                || (matches!(asset, "USDC" | "USDT" | "USD₮0") && val >= 500.0);
-
-            if is_significant {
-                sub_idx += 1;
-                let clean_handle = parent.handle.trim_start_matches('@');
-                let suffix = if to_addr.len() > 6 {
-                    to_addr[2..6].to_lowercase()
-                } else {
-                    "sub".to_string()
-                };
-                let sub_handle = format!("{}_sub_{}", clean_handle, suffix);
-                let sub_name = format!("{} Shadow #{}", parent.name, sub_idx);
-                let now = Utc::now();
-
-                let shadow_wallet = SmartWallet {
-                    id: None,
-                    rank: parent.rank + 50,
-                    name: sub_name,
-                    handle: sub_handle,
-                    chain: parent.chain,
-                    address: to_addr,
-                    tier: WalletTier::TierB,
-                    pnl_24h_usd: 0.0,
-                    win_rate_pct: 0.0,
-                    total_trades: 0,
-                    source: "CLUSTER_FORENSIC_CANDIDATE".to_string(),
-                    reputation_score: 0.0,
-                    execution_track: crate::models::ExecutionTrack::FastLane,
-                    is_active: false,
-                    last_seen_at: Some(now),
-                    updated_at: now,
-                };
-                subsidiaries.push(shadow_wallet);
-            }
+            let tx_hash = log.get("transactionHash").and_then(Value::as_str);
+            let block = log.get("blockNumber").and_then(Value::as_str);
+            let suffix = recipient[2..6].to_lowercase();
+            let now = Utc::now();
+            let shadow_wallet = SmartWallet {
+                id: None,
+                rank: parent.rank + 50,
+                name: format!("{} Shadow #{}", parent.name, subsidiaries.len() + 1),
+                handle: format!("{}_sub_{}", parent.handle.trim_start_matches('@'), suffix),
+                chain: parent.chain,
+                address: recipient,
+                tier: WalletTier::TierB,
+                pnl_24h_usd: 0.0,
+                win_rate_pct: 0.0,
+                total_trades: 0,
+                source: "CLUSTER_FORENSIC_CANDIDATE".to_string(),
+                reputation_score: 0.0,
+                execution_track: crate::models::ExecutionTrack::FastLane,
+                is_active: false,
+                last_seen_at: Some(now),
+                updated_at: now,
+            };
+            self.candidate_db.upsert_candidate(
+                &shadow_wallet,
+                Some(&parent.address),
+                None,
+                "ERC20_TRANSFER_LINK",
+                tx_hash,
+                block,
+            )?;
+            subsidiaries.push(shadow_wallet);
         }
-
         Ok(subsidiaries)
     }
 
