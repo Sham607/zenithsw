@@ -84,7 +84,7 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
             &app.wallet_pubkey[app.wallet_pubkey.len() - 4..]
         )
     } else {
-        "bLiH...vvdk".to_string()
+        "N/A".to_string()
     };
     let mode_str = if app.is_live_mode {
         "LIVE ON-CHAIN 🟢"
@@ -92,17 +92,34 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         "DRY RUN 🟡"
     };
 
-    let calculated_total_equity = (app.wallet_sol_balance * app.sol_price_usd) + total_pos_usd;
+    let price_ready = app.sol_price_usd > 0.0 && app.sol_price_usd.is_finite();
+    let calculated_total_equity = if price_ready {
+        Some((app.wallet_sol_balance * app.sol_price_usd) + total_pos_usd)
+    } else {
+        None
+    };
+    let sol_value = calculated_total_equity
+        .map(|equity| equity - total_pos_usd)
+        .map(|value| format!("${value:.2}"))
+        .unwrap_or_else(|| "N/A".to_string());
+    let total_equity = calculated_total_equity
+        .map(|value| format!("${value:.2}"))
+        .unwrap_or_else(|| "N/A".to_string());
+    let realized = if app.is_connected_ipc {
+        format!("${:+.2}", app.total_realized_pnl_usd)
+    } else {
+        "N/A".to_string()
+    };
 
     let header_title = format!(
-        " ZENITHSW • {} • [{}] • SOL: {:.4} (${:.2}) • POS: ${:.2} • TOTAL EQUITY: ${:.2} • REALIZED: ${:+.2} ",
+        " ZENITHSW • {} • [{}] • SOL: {:.4} ({}) • POS: ${:.2} • TOTAL EQUITY: {} • REALIZED: {} ",
         mode_str,
         pubkey_short,
         app.wallet_sol_balance,
-        app.wallet_sol_balance * app.sol_price_usd,
+        sol_value,
         total_pos_usd,
-        calculated_total_equity,
-        app.total_realized_pnl_usd
+        total_equity,
+        realized
     );
 
     let tabs = Tabs::new(tab_titles)
@@ -189,7 +206,7 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         Span::styled(qualified_str, Style::default().fg(Color::Yellow)),
         Span::raw(" | Real Equity: "),
         Span::styled(
-            format!("${:.2}", calculated_total_equity),
+            total_equity.clone(),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),

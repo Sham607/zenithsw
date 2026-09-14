@@ -9,23 +9,6 @@ async fn test_ipc_broadcast_and_client_roundtrip() {
     let server = Arc::new(IpcServer::new(socket_path));
     server.start().await.unwrap();
 
-    let client = IpcClient::new(socket_path);
-    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-
-    tokio::spawn(async move {
-        let _ = client
-            .connect_and_listen(
-                || {},
-                move |msg| {
-                    let tx = tx.clone();
-                    let _ = tx.try_send(msg);
-                },
-            )
-            .await;
-    });
-
-    sleep(Duration::from_millis(50)).await;
-
     let test_hb = IpcMessage::Heartbeat {
         uptime_secs: 100,
         solana_latency_ms: 25,
@@ -48,6 +31,20 @@ async fn test_ipc_broadcast_and_client_roundtrip() {
     };
 
     server.broadcast(&test_hb).unwrap();
+
+    let client = IpcClient::new(socket_path);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    tokio::spawn(async move {
+        let _ = client
+            .connect_and_listen(
+                || {},
+                move |msg| {
+                    let tx = tx.clone();
+                    let _ = tx.try_send(msg);
+                },
+            )
+            .await;
+    });
 
     let received = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
     assert!(received.is_ok());

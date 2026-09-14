@@ -104,51 +104,12 @@ impl IpcServer {
                 tokio::spawn(async move {
                     let (_, mut write_half) = stream.into_split();
 
-                    // Send current heartbeat or initial handshake line immediately
-                    let initial_hb = {
-                        if let Ok(guard) = latest_hb_inner.lock() {
-                            guard.clone().unwrap_or(IpcMessage::Heartbeat {
-                                uptime_secs: 1,
-                                solana_latency_ms: 35,
-                                arbitrum_latency_ms: 28,
-                                base_latency_ms: 32,
-                                tracked_wallets_count: 0,
-                                active_positions_count: 0,
-                                wallet_sol_balance: 0.0,
-                                sol_price_usd: 100.0,
-                                wallet_equity_usd: 0.0,
-                                total_realized_pnl_usd: 0.0,
-                                min_liquidity_usd: 30000.0,
-                                max_price_delta_pct: 5.0,
-                                position_size_usd: 5.0,
-                                stop_loss_pct: 35.0,
-                                take_profit_pct: 100.0,
-                                min_whale_buy_usd: 150.0,
-                                is_live_mode: false,
-                                wallet_pubkey: String::new(),
-                            })
-                        } else {
-                            IpcMessage::Heartbeat {
-                                uptime_secs: 1,
-                                solana_latency_ms: 35,
-                                arbitrum_latency_ms: 28,
-                                base_latency_ms: 32,
-                                tracked_wallets_count: 0,
-                                active_positions_count: 0,
-                                wallet_sol_balance: 0.0,
-                                sol_price_usd: 100.0,
-                                wallet_equity_usd: 0.0,
-                                total_realized_pnl_usd: 0.0,
-                                min_liquidity_usd: 30000.0,
-                                max_price_delta_pct: 5.0,
-                                position_size_usd: 5.0,
-                                stop_loss_pct: 35.0,
-                                take_profit_pct: 100.0,
-                                min_whale_buy_usd: 150.0,
-                                is_live_mode: false,
-                                wallet_pubkey: String::new(),
-                            }
-                        }
+                    // Jangan mengirim heartbeat sintetis. TUI harus menunggu
+                    // heartbeat engine aktual agar tidak menampilkan data palsu.
+                    let initial_hb = latest_hb_inner.lock().ok().and_then(|guard| guard.clone());
+
+                    let Some(initial_hb) = initial_hb else {
+                        return;
                     };
 
                     if let Ok(json) = serde_json::to_string(&initial_hb) {
