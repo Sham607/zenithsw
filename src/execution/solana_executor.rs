@@ -751,7 +751,11 @@ impl SolanaExecutor {
                         )
                         .await
                     {
-                        Ok((unsigned_pump_tx, transaction_blockhash)) => {
+                        Ok((_unsigned_pump_tx, transaction_blockhash)) => {
+                            // PumpPortal does not provide lastValidBlockHeight. Fail
+                            // closed: without an authoritative expiry the intent can
+                            // neither be timed out safely nor signed with a fresh
+                            // replacement — mark it FAILED and never broadcast it.
                             self.db.update_execution_intent_metadata(
                                 &position_id,
                                 &ExecutionIntentMetadata {
@@ -763,42 +767,13 @@ impl SolanaExecutor {
                                     expiry: None,
                                 },
                             )?;
-                            self.db.update_execution_intent(
-                                &position_id,
-                                "SIMULATED",
-                                None,
-                                None,
-                            )?;
-                            let signed_pump_tx =
-                                Self::sign_transaction_base64(&unsigned_pump_tx, &signing_key)?;
-                            let signed_blockhash =
-                                Self::extract_recent_blockhash(&base64::Engine::decode(
-                                    &base64::engine::general_purpose::STANDARD,
-                                    &signed_pump_tx,
-                                )?)?;
-                            if signed_blockhash != transaction_blockhash {
-                                return Err(anyhow!(
-                                    "PumpPortal signed transaction blockhash changed"
-                                ));
-                            }
+                            eprintln!(
+                                "[PUMPFUN EXPIRY MISSING 🛑] PumpPortal tidak menyediakan lastValidBlockHeight; intent {} ditolak fail-closed.",
+                                position_id
+                            );
                             self.db
-                                .update_execution_intent(&position_id, "SIGNED", None, None)?;
-                            match self.broadcast_tx(&signed_pump_tx).await {
-                                Ok(sig) => {
-                                    println!("[PUMPFUN BUY CONFIRMED 🟢] TX Sig: {}", sig);
-                                    self.db.update_execution_intent(
-                                        &position_id,
-                                        "BROADCASTED",
-                                        None,
-                                        Some(&sig),
-                                    )?;
-                                    _onchain_tx_sig = Some(sig);
-                                    buy_success = true;
-                                }
-                                Err(e) => {
-                                    eprintln!("[PUMPFUN BROADCAST FAILED ⚠️] {}. Falling back to Jupiter...", e);
-                                }
-                            }
+                                .update_execution_intent(&position_id, "FAILED", None, None)?;
+                            return Ok(None);
                         }
                         Err(e) => {
                             eprintln!(

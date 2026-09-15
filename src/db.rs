@@ -1421,6 +1421,35 @@ impl SmartWalletDb {
         Ok(removed)
     }
 
+    pub fn record_trade(&self, trade: &TradeRecord) -> Result<String> {
+        let now = Utc::now();
+        let chain_str = trade.chain.to_string();
+        let track_str = trade.track.to_string();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO trade_history (
+                timestamp, chain, action, symbol, mint, target_whale, exit_reason, portion_sold_pct, entry_price, exit_price, pnl_pct, pnl_usd, duration_secs, track
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )?;
+        stmt.execute(params![
+            now.to_rfc3339(),
+            chain_str,
+            trade.action,
+            trade.symbol,
+            trade.mint,
+            trade.target_whale,
+            trade.exit_reason,
+            trade.portion_sold_pct,
+            trade.entry_price,
+            trade.exit_price,
+            trade.pnl_pct,
+            trade.pnl_usd,
+            trade.duration_secs as i64,
+            track_str,
+        ])?;
+        Ok(now.to_rfc3339())
+    }
+
     pub fn upsert_tracked_token(&self, token: &TrackedToken) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

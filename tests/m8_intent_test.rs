@@ -97,3 +97,112 @@ fn execution_intent_signature_and_tx_hash_are_unique() {
         .update_execution_intent("a", "BROADCASTED", Some("same-tx"), None)
         .is_err());
 }
+
+#[test]
+fn execution_intent_timeout_reconciliation_follows_receipt_evidence() {
+    let db = SmartWalletDb::new_in_memory().expect("in-memory DB harus dibuat");
+    db.create_execution_intent(
+        "timeout-1",
+        Chain::Robinhood,
+        "BUY",
+        "0xtoken",
+        "0xwallet",
+        1.0,
+    )
+    .expect("intent harus tersimpan");
+
+    // Broadcast path: stepwise states, then BROADCASTED with tx hash evidence.
+    let tx_hash = format!("0x{}", "ab".repeat(32));
+    db.update_execution_intent("timeout-1", "QUOTED", None, None)
+        .expect("INTENT -> QUOTED harus valid");
+    db.update_execution_intent("timeout-1", "SIMULATED", None, None)
+        .expect("QUOTED -> SIMULATED harus valid");
+    db.update_execution_intent("timeout-1", "SIGNED", None, None)
+        .expect("SIMULATED -> SIGNED harus valid");
+    db.update_execution_intent("timeout-1", "BROADCASTED", Some(&tx_hash), None)
+        .expect("SIGNED -> BROADCASTED dengan bukti hash harus valid");
+
+    // Timeout policy lives in the engine's receipt-validated reconciliation
+    // (validate_receipt_transaction_hash); the state machine (db.rs) reserves
+    // BROADCASTED -> CONFIRMED for that receipt path and offers
+    // PENDING_RECONCILIATION as the safe demotion while unresolved. The
+    // terminal terminal jump PENDING_RECONCILIATION -> RECONCILED is allowed
+    // only because CONFIRMED semantics are enforced by the receipt validator,
+    // never by silent promotion.
+    db.update_execution_intent("timeout-1", "PENDING_RECONCILIATION", None, None)
+        .expect("BROADCASTED -> PENDING_RECONCILIATION harus valid saat timeout");
+    db.update_execution_intent("timeout-1", "CONFIRMED", None, None)
+        .expect("PENDING_RECONCILIATION -> CONFIRMED valid dengan bukti receipt");
+    db.update_execution_intent("timeout-1", "RECONCILED", None, None)
+        .expect("CONFIRMED -> RECONCILED valid setelah balance reconciliation");
+    // Terminal: RECONCILED cannot restart or be re-confirmed (no virtual fills).
+    assert!(db
+        .update_execution_intent("timeout-1", "CONFIRMED", None, None)
+        .is_err());
+}
+
+#[test]
+fn execution_intent_stepwise_timeout_paths_are_enforced() {
+    let db = SmartWalletDb::new_in_memory().expect("in-memory DB harus dibuat");
+
+    // Timeout with no broadcast evidence: QUOTED -> UNKNOWN is legal (ambiguity),
+    // but never directly to CONFIRMED/RECONCILED.
+    db.create_execution_intent("t-quoted", Chain::Robinhood, "BUY", "0xt", "0xw", 1.0)
+        .unwrap();
+    db.update_execution_intent("t-quoted", "QUOTED", None, None)
+        .unwrap();
+    db.update_execution_intent("t-quoted", "UNKNOWN", None, None)
+        .expect("QUOTED -> UNKNOWN harus valid");
+    assert!(db
+        .update_execution_intent("t-quoted", "CONFIRMED", None, None)
+        .is_err());
+
+    // Timeout after broadcast with hash: BROADCASTED -> PENDING_RECONCILIATION,
+    // then only receipt evidence may promote or demote the state.
+    db.create_execution_intent("t-broadcast", Chain::Robinhood, "BUY", "0xt", "0xw", 1.0)
+        .unwrap();
+    let tx_hash = format!("0x{}", "cd".repeat(32));
+    db.update_execution_intent("t-broadcast", "QUOTED", None, None)
+        .unwrap();
+    db.update_execution_intent("t-broadcast", "SIMULATED", None, None)
+        .unwrap();
+    db.update_execution_intent("t-broadcast", "SIGNED", None, None)
+        .unwrap();
+    db.update_execution_intent("t-broadcast", "BROADCASTED", Some(&tx_hash), None)
+        .unwrap();
+    db.update_execution_intent("t-broadcast", "PENDING_RECONCILIATION", None, None)
+        .expect("BROADCASTED -> PENDING_RECONCILIATION harus valid");
+    // PENDING_RECONCILIATION cannot silently become BROADCASTED again (no rebroadcast).
+    assert!(db
+        .update_execution_intent("t-broadcast", "BROADCASTED", None, None)
+        .is_err());
+    db.update_execution_intent("t-broadcast", "CONFIRMED", None, None)
+        .expect("PENDING_RECONCILIATION -> CONFIRMED valid saat receipt sukses");
+    db.update_execution_intent("t-broadcast", "RECONCILED", None, None)
+        .expect("CONFIRMED -> RECONCILED valid setelah balance reconciliation");
+}
+
+#[test]
+fn execution_intent_replacement_signature_is_rejected_after_restart() {
+    let db = SmartWalletDb::new_in_memory().expect("in-memory DB harus dibuat");
+    db.create_execution_intent("replace-1", Chain::Solana, "BUY", "mint", "wallet", 1.0)
+        .unwrap();
+    let original_sig = "sig-original";
+    db.update_execution_intent("replace-1", "QUOTED", None, None)
+        .unwrap();
+    db.update_execution_intent("replace-1", "SIMULATED", None, None)
+        .unwrap();
+    db.update_execution_intent("replace-1", "SIGNED", None, Some(original_sig))
+        .unwrap();
+    db.update_execution_intent("replace-1", "BROADCASTED", None, None)
+        .unwrap();
+
+    // Restart recovery has only ambiguous evidence: it may go UNKNOWN, but a
+    // different signature (a replacement transaction) must never be attached
+    // to the same intent.
+    db.update_execution_intent("replace-1", "UNKNOWN", None, None)
+        .expect("BROADCASTED -> UNKNOWN valid untuk evidence ambigu");
+    assert!(db
+        .update_execution_intent("replace-1", "SIGNED", None, Some("sig-replacement"))
+        .is_err());
+}

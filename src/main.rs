@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use zenithsw::config::Config;
 use zenithsw::db::SmartWalletDb;
-use zenithsw::ipc::{IpcClient, IpcMessage};
+use zenithsw::ipc::IpcClient;
 use zenithsw::models::Chain;
 use zenithsw::tui::{render_ui, App};
 
@@ -180,11 +180,13 @@ async fn main() -> Result<()> {
     // Task 2: Connect to Unix Domain Socket IPC Daemon
     let app_ipc = app.clone();
     let socket_path = config.ipc_socket_path.clone();
+    let config_ipc = std::sync::Arc::new(config.clone());
     tokio::spawn(async move {
         let client = IpcClient::new(&socket_path);
         loop {
             let app_cb = app_ipc.clone();
             let app_conn = app_ipc.clone();
+            let config_cb = std::sync::Arc::clone(&config_ipc);
             let res = client
                 .connect_and_listen(
                     move || {
@@ -195,160 +197,7 @@ async fn main() -> Result<()> {
                     },
                     move |msg| {
                         if let Ok(mut state) = app_cb.lock() {
-                            match msg {
-                                IpcMessage::Heartbeat {
-                                    uptime_secs,
-                                    heartbeat_seq,
-                                    solana_latency_ms,
-                                    arbitrum_latency_ms,
-                                    base_latency_ms,
-                                    wallet_sol_balance,
-                                    sol_price_usd,
-                                    wallet_equity_usd,
-                                    total_realized_pnl_usd,
-                                    min_liquidity_usd,
-                                    max_price_delta_pct,
-                                    position_size_usd,
-                                    stop_loss_pct,
-                                    take_profit_pct,
-                                    min_whale_buy_usd,
-                                    is_live_mode,
-                                    wallet_pubkey,
-                                    heartbeat_timestamp_unix,
-                                    solana_rpc_requests,
-                                    solana_rpc_successes,
-                                    solana_rpc_rate_limited,
-                                    solana_rpc_failures,
-                                    robinhood_rpc_requests,
-                                    robinhood_rpc_successes,
-                                    robinhood_rpc_rate_limited,
-                                    robinhood_rpc_failures,
-                                    qualified_wallets_count,
-                                    polled_wallets_count,
-                                    global_scanned_wallets_count,
-                                    candidate_wallets_count,
-                                    ..
-                                } => {
-                                    state.is_connected_ipc = true;
-                                    state.heartbeat_received_at = Some(std::time::Instant::now());
-                                    state.heartbeat_timestamp_unix = heartbeat_timestamp_unix;
-                                    state.heartbeat_seq = heartbeat_seq;
-                                    state.uptime_secs = uptime_secs;
-                                    state.solana_latency_ms = solana_latency_ms;
-                                    state.arbitrum_latency_ms = arbitrum_latency_ms;
-                                    state.base_latency_ms = base_latency_ms;
-                                    state.wallet_sol_balance = wallet_sol_balance;
-                                    state.sol_price_usd = sol_price_usd;
-                                    state.wallet_equity_usd = wallet_equity_usd;
-                                    state.total_realized_pnl_usd = total_realized_pnl_usd;
-                                    state.min_liquidity_usd = min_liquidity_usd;
-                                    state.max_price_delta_pct = max_price_delta_pct;
-                                    state.position_size_usd = position_size_usd;
-                                    state.stop_loss_pct = stop_loss_pct;
-                                    state.take_profit_pct = take_profit_pct;
-                                    state.min_whale_buy_usd = min_whale_buy_usd;
-                                    state.is_live_mode = is_live_mode;
-                                    state.wallet_pubkey = wallet_pubkey;
-                                    state.solana_rpc_requests = solana_rpc_requests;
-                                    state.solana_rpc_successes = solana_rpc_successes;
-                                    state.solana_rpc_rate_limited = solana_rpc_rate_limited;
-                                    state.solana_rpc_failures = solana_rpc_failures;
-                                    state.robinhood_rpc_requests = robinhood_rpc_requests;
-                                    state.robinhood_rpc_successes = robinhood_rpc_successes;
-                                    state.robinhood_rpc_rate_limited = robinhood_rpc_rate_limited;
-                                    state.robinhood_rpc_failures = robinhood_rpc_failures;
-                                    state.qualified_wallets_count = qualified_wallets_count;
-                                    state.polled_wallets_count = polled_wallets_count;
-                                    state.global_scanned_wallets_count =
-                                        global_scanned_wallets_count;
-                                    state.candidate_wallets_count = candidate_wallets_count;
-                                }
-                                IpcMessage::WalletSync { mut wallets } => {
-                                    wallets.retain(|wallet| match wallet.chain {
-                                        Chain::Solana => enable_sol,
-                                        Chain::Robinhood => enable_rh,
-                                        Chain::Base => enable_base,
-                                        _ => false,
-                                    });
-                                    state.wallets = wallets;
-                                }
-                                IpcMessage::TrackedTokensUpdate { mut tokens } => {
-                                    tokens.retain(|token| match token.chain {
-                                        Chain::Solana => enable_sol,
-                                        Chain::Robinhood => enable_rh,
-                                        Chain::Base => enable_base,
-                                        _ => false,
-                                    });
-                                    state.tracked_tokens = tokens;
-                                }
-                                IpcMessage::ActivityBroadcast { activity } => {
-                                    let enabled = match activity.chain {
-                                        Chain::Solana => enable_sol,
-                                        Chain::Robinhood => enable_rh,
-                                        Chain::Base => enable_base,
-                                        _ => false,
-                                    };
-                                    if enabled {
-                                        state.activities.push(activity);
-                                        if state.activities.len() > 100 {
-                                            state.activities.remove(0);
-                                        }
-                                    }
-                                }
-                                IpcMessage::ActivitySync { mut activities } => {
-                                    activities.retain(|activity| match activity.chain {
-                                        Chain::Solana => enable_sol,
-                                        Chain::Robinhood => enable_rh,
-                                        Chain::Base => enable_base,
-                                        _ => false,
-                                    });
-                                    state.activities = activities;
-                                }
-                                IpcMessage::SignalBroadcast { signal } => {
-                                    let enabled = match signal.chain {
-                                        Chain::Solana => enable_sol,
-                                        Chain::Robinhood => enable_rh,
-                                        Chain::Base => enable_base,
-                                        _ => false,
-                                    };
-                                    if enabled {
-                                        state.signals.push(signal);
-                                        if state.signals.len() > 100 {
-                                            state.signals.remove(0);
-                                        }
-                                    }
-                                }
-                                IpcMessage::SignalSync { mut signals } => {
-                                    signals.retain(|signal| match signal.chain {
-                                        Chain::Solana => enable_sol,
-                                        Chain::Robinhood => enable_rh,
-                                        Chain::Base => enable_base,
-                                        _ => false,
-                                    });
-                                    state.signals = signals;
-                                }
-                                IpcMessage::PositionUpdate { mut positions } => {
-                                    positions.retain(|position| match position.chain {
-                                        Chain::Solana => enable_sol,
-                                        Chain::Robinhood => enable_rh,
-                                        Chain::Base => enable_base,
-                                        _ => false,
-                                    });
-                                    state.positions = positions;
-                                }
-                                IpcMessage::TradeSync { mut trades } => {
-                                    trades.retain(|trade| match trade.chain {
-                                        Chain::Solana => enable_sol,
-                                        Chain::Robinhood => enable_rh,
-                                        Chain::Base => enable_base,
-                                        _ => false,
-                                    });
-                                    state.trades = trades;
-                                }
-                                IpcMessage::EngineLog { message, .. } => {
-                                    state.add_log(message);
-                                }
-                            }
+                            zenithsw::tui::apply_ipc_message(&mut state, msg, &config_cb);
                         }
                     },
                 )

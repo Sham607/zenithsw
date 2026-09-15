@@ -1175,6 +1175,20 @@ async fn main() -> Result<()> {
                         eprintln!("[HEARTBEAT DB ERROR] Recent signals unavailable: {error}");
                     }
                 }
+                // Tracked tokens are also a DB-backed replacement snapshot so the
+                // TUI never depends on radar-harvest events to refresh this domain.
+                match db_heartbeat.get_tracked_tokens(50) {
+                    Ok(tokens) => {
+                        if let Err(error) =
+                            ipc_heartbeat.broadcast(&IpcMessage::TrackedTokensUpdate { tokens })
+                        {
+                            eprintln!("[IPC ERROR] TrackedTokensSync gagal: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[HEARTBEAT DB ERROR] Tracked tokens unavailable: {error}");
+                    }
+                }
             }
 
             sleep(Duration::from_secs(2)).await;
