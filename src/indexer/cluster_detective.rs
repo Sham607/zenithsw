@@ -3,28 +3,24 @@ use crate::db::{CandidateWalletDb, SmartWalletDb};
 use crate::models::{Chain, SmartWallet, WalletTier};
 use anyhow::Result;
 use chrono::Utc;
-use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub struct WhaleClusterDetective {
-    solana_rpc_url: String,
     robinhood_rpc_url: String,
     db: Arc<SmartWalletDb>,
     candidate_db: Arc<CandidateWalletDb>,
-    client: Client,
     excluded_contracts: HashSet<String>,
 }
 
 impl WhaleClusterDetective {
-    pub fn new(solana_rpc_url: &str, robinhood_rpc_url: &str, db: Arc<SmartWalletDb>, candidate_db: Arc<CandidateWalletDb>) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(12))
-            .build()
-            .unwrap_or_default();
-
+    pub fn new(
+        _solana_rpc_url: &str,
+        robinhood_rpc_url: &str,
+        db: Arc<SmartWalletDb>,
+        candidate_db: Arc<CandidateWalletDb>,
+    ) -> Self {
         let mut excluded = HashSet::new();
         // Common DEX Routers, bridges, & protocols on Arbitrum
         excluded.insert("0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45".to_lowercase()); // Uniswap SwapRouter02
@@ -40,11 +36,9 @@ impl WhaleClusterDetective {
         excluded.insert("0x5954ab967bc958940b7eb73ee84797dc8a2be580".to_lowercase()); // Aave
 
         Self {
-            solana_rpc_url: solana_rpc_url.to_string(),
             robinhood_rpc_url: robinhood_rpc_url.to_string(),
             db,
             candidate_db,
-            client,
             excluded_contracts: excluded,
         }
     }

@@ -9,10 +9,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-static PRICE_CACHE: OnceLock<RwLock<HashMap<String, (String, f64, f64, f64, Instant)>>> =
-    OnceLock::new();
+type PriceCacheEntry = (String, f64, f64, f64, Instant);
+type PriceCache = RwLock<HashMap<String, PriceCacheEntry>>;
 
-fn get_price_cache() -> &'static RwLock<HashMap<String, (String, f64, f64, f64, Instant)>> {
+static PRICE_CACHE: OnceLock<PriceCache> = OnceLock::new();
+
+fn get_price_cache() -> &'static PriceCache {
     PRICE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -359,129 +361,128 @@ impl SolanaStreamListener {
         if let Ok(res) = client.get(&url).send().await {
             if res.status().is_success() {
                 if let Ok(json) = res.json::<Value>().await {
-                if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
-                    if !pairs.is_empty() {
-                        let mut max_liq = 0.0;
-                        let mut total_liq = 0.0;
-                        let mut best_symbol = "TOKEN".to_string();
-                        let mut best_price = 0.0;
-                        let mut best_mcap = 0.0;
+                    if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
+                        if !pairs.is_empty() {
+                            let mut max_liq = 0.0;
+                            let mut total_liq = 0.0;
+                            let mut best_symbol = "TOKEN".to_string();
+                            let mut best_price = 0.0;
+                            let mut best_mcap = 0.0;
 
-                        for pair in pairs {
-                            let base_addr = pair
-                                .get("baseToken")
-                                .and_then(|b| b.get("address"))
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("");
+                            for pair in pairs {
+                                let base_addr = pair
+                                    .get("baseToken")
+                                    .and_then(|b| b.get("address"))
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("");
 
-                            // STRICT: Base token address MUST match query mint (case-insensitive)
-                            if !base_addr.eq_ignore_ascii_case(mint) {
-                                continue;
-                            }
-
-                            let dex_id = pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
-                            let sym = pair
-                                .get("baseToken")
-                                .and_then(|b| b.get("symbol"))
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("");
-                            let price: f64 = pair
-                                .get("priceUsd")
-                                .and_then(|p| p.as_str())
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0.0);
-
-                            let mut liq: f64 = pair
-                                .get("liquidity")
-                                .and_then(|l| l.get("usd"))
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0);
-
-                            // Market cap harus berasal dari field marketCap; FDV bukan market cap.
-                            let mcap: f64 = pair
-                                .get("marketCap")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0);
-
-                            let quote_sym = pair
-                                .get("quoteToken")
-                                .and_then(|q| q.get("symbol"))
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("")
-                                .to_uppercase();
-                            let quote_amt = pair
-                                .get("liquidity")
-                                .and_then(|l| l.get("quote"))
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0);
-
-                            let real_quote_usd = match quote_sym.as_str() {
-                                "USDC" | "USDT" | "USD" | "USDG" | "DAI" | "USDS" | "PYUSD" => {
-                                    quote_amt
+                                // STRICT: Base token address MUST match query mint (case-insensitive)
+                                if !base_addr.eq_ignore_ascii_case(mint) {
+                                    continue;
                                 }
-                                "SOL" | "WSOL" => quote_amt * 102.0,
-                                "ETH" | "WETH" => quote_amt * 2500.0,
-                                _ => quote_amt.min(liq * 0.5),
-                            };
 
-                            // Anti-CLMM Spoof: If single-sided fake liquidity has < $10k real quote collateral, clamp liquidity to real quote
-                            if dex_id != "pumpfun" {
-                                if liq > 100_000.0 && (real_quote_usd / liq) < 0.10 {
-                                    liq = real_quote_usd * 2.0;
-                                } else if real_quote_usd < 10_000.0 {
-                                    liq = real_quote_usd;
+                                let dex_id =
+                                    pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
+                                let sym = pair
+                                    .get("baseToken")
+                                    .and_then(|b| b.get("symbol"))
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("");
+                                let price: f64 = pair
+                                    .get("priceUsd")
+                                    .and_then(|p| p.as_str())
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0.0);
+
+                                let mut liq: f64 = pair
+                                    .get("liquidity")
+                                    .and_then(|l| l.get("usd"))
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+
+                                // Market cap harus berasal dari field marketCap; FDV bukan market cap.
+                                let mcap: f64 = pair
+                                    .get("marketCap")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+
+                                let quote_sym = pair
+                                    .get("quoteToken")
+                                    .and_then(|q| q.get("symbol"))
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("")
+                                    .to_uppercase();
+                                let quote_amt = pair
+                                    .get("liquidity")
+                                    .and_then(|l| l.get("quote"))
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+
+                                let real_quote_usd = match quote_sym.as_str() {
+                                    "USDC" | "USDT" | "USD" | "USDG" | "DAI" | "USDS" | "PYUSD" => {
+                                        quote_amt
+                                    }
+                                    "SOL" | "WSOL" => quote_amt * 102.0,
+                                    "ETH" | "WETH" => quote_amt * 2500.0,
+                                    _ => quote_amt.min(liq * 0.5),
+                                };
+
+                                // Anti-CLMM Spoof: If single-sided fake liquidity has < $10k real quote collateral, clamp liquidity to real quote
+                                if dex_id != "pumpfun" {
+                                    if liq > 100_000.0 && (real_quote_usd / liq) < 0.10 {
+                                        liq = real_quote_usd * 2.0;
+                                    } else if real_quote_usd < 10_000.0 {
+                                        liq = real_quote_usd;
+                                    }
                                 }
-                            }
 
-                            // For Pump.fun bonding curves where liquidity object is null/0, derive virtual liquidity from marketCap / fdv
-                            if dex_id == "pumpfun" && liq <= 0.0 {
-                                if mcap > 0.0 {
+                                // For Pump.fun bonding curves where liquidity object is null/0, derive virtual liquidity from marketCap / fdv
+                                if dex_id == "pumpfun" && liq <= 0.0 && mcap > 0.0 {
                                     liq = mcap * 0.50; // Pump.fun virtual pool reserve ~ 50% of MC
                                 }
+
+                                total_liq += liq;
+
+                                if liq >= max_liq && price > 0.0 {
+                                    max_liq = liq;
+                                    best_price = price;
+                                    if mcap > 0.0 {
+                                        best_mcap = mcap;
+                                    }
+                                    if !sym.is_empty() {
+                                        best_symbol = sym.to_string();
+                                    }
+                                } else if best_price <= 0.0 && price > 0.0 {
+                                    best_price = price;
+                                    if mcap > 0.0 && best_mcap <= 0.0 {
+                                        best_mcap = mcap;
+                                    }
+                                    if !sym.is_empty() {
+                                        best_symbol = sym.to_string();
+                                    }
+                                }
                             }
 
-                            total_liq += liq;
-
-                            if liq >= max_liq && price > 0.0 {
-                                max_liq = liq;
-                                best_price = price;
-                                if mcap > 0.0 {
-                                    best_mcap = mcap;
+                            let effective_liq = max_liq.max(total_liq);
+                            if best_price > 0.0 {
+                                if let Ok(mut cache) = get_price_cache().write() {
+                                    cache.insert(
+                                        mint.to_string(),
+                                        (
+                                            best_symbol.clone(),
+                                            best_price,
+                                            effective_liq,
+                                            best_mcap,
+                                            Instant::now(),
+                                        ),
+                                    );
                                 }
-                                if !sym.is_empty() {
-                                    best_symbol = sym.to_string();
-                                }
-                            } else if best_price <= 0.0 && price > 0.0 {
-                                best_price = price;
-                                if mcap > 0.0 && best_mcap <= 0.0 {
-                                    best_mcap = mcap;
-                                }
-                                if !sym.is_empty() {
-                                    best_symbol = sym.to_string();
-                                }
+                                return Ok((best_symbol, best_price, effective_liq, best_mcap));
                             }
-                        }
-
-                        let effective_liq = max_liq.max(total_liq);
-                        if best_price > 0.0 {
-                            if let Ok(mut cache) = get_price_cache().write() {
-                                cache.insert(
-                                    mint.to_string(),
-                                    (
-                                        best_symbol.clone(),
-                                        best_price,
-                                        effective_liq,
-                                        best_mcap,
-                                        Instant::now(),
-                                    ),
-                                );
-                            }
-                            return Ok((best_symbol, best_price, effective_liq, best_mcap));
                         }
                     }
                 }
             }
-        }
         }
 
         // Source 2: DexScreener Search Endpoint Fallback with strict baseToken matching
@@ -521,7 +522,13 @@ impl SolanaStreamListener {
                             if let Ok(mut cache) = get_price_cache().write() {
                                 cache.insert(
                                     mint.to_string(),
-                                    (symbol.clone(), price_usd, liquidity_usd, mcap, Instant::now()),
+                                    (
+                                        symbol.clone(),
+                                        price_usd,
+                                        liquidity_usd,
+                                        mcap,
+                                        Instant::now(),
+                                    ),
                                 );
                             }
                             return Ok((symbol, price_usd, liquidity_usd, mcap));

@@ -1,6 +1,7 @@
 use crate::models::{
     ShadowPosition, ShadowSignal, SmartWallet, TrackedToken, TradeRecord, WalletActivity,
 };
+use std::time::Instant;
 
 pub struct App {
     pub current_tab: usize,
@@ -33,9 +34,38 @@ pub struct App {
     pub is_live_mode: bool,
     pub wallet_pubkey: String,
     pub uptime_secs: u64,
+    pub heartbeat_timestamp_unix: i64,
+    pub heartbeat_received_at: Option<Instant>,
+    pub heartbeat_seq: u64,
+    pub solana_rpc_requests: u64,
+    pub solana_rpc_successes: u64,
+    pub solana_rpc_rate_limited: u64,
+    pub solana_rpc_failures: u64,
+    pub robinhood_rpc_requests: u64,
+    pub robinhood_rpc_successes: u64,
+    pub robinhood_rpc_rate_limited: u64,
+    pub robinhood_rpc_failures: u64,
+    pub qualified_wallets_count: usize,
+    pub polled_wallets_count: usize,
+    pub global_scanned_wallets_count: usize,
+    pub candidate_wallets_count: usize,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl App {
+    pub fn heartbeat_is_fresh(&self) -> bool {
+        self.is_connected_ipc
+            && self
+                .heartbeat_received_at
+                .map(|received| received.elapsed().as_secs() <= 6)
+                .unwrap_or(false)
+    }
+
     pub fn new() -> Self {
         Self {
             current_tab: 0,
@@ -46,9 +76,9 @@ impl App {
             positions: Vec::new(),
             trades: Vec::new(),
             logs: Vec::new(),
-            solana_latency_ms: 45,
-            arbitrum_latency_ms: 38,
-            base_latency_ms: 42,
+            solana_latency_ms: 0,
+            arbitrum_latency_ms: 0,
+            base_latency_ms: 0,
             is_connected_ipc: false,
             should_quit: false,
             wallet_sol_balance: 0.0,
@@ -64,6 +94,21 @@ impl App {
             is_live_mode: false,
             wallet_pubkey: String::new(),
             uptime_secs: 0,
+            heartbeat_timestamp_unix: 0,
+            heartbeat_received_at: None,
+            heartbeat_seq: 0,
+            solana_rpc_requests: 0,
+            solana_rpc_successes: 0,
+            solana_rpc_rate_limited: 0,
+            solana_rpc_failures: 0,
+            robinhood_rpc_requests: 0,
+            robinhood_rpc_successes: 0,
+            robinhood_rpc_rate_limited: 0,
+            robinhood_rpc_failures: 0,
+            qualified_wallets_count: 0,
+            polled_wallets_count: 0,
+            global_scanned_wallets_count: 0,
+            candidate_wallets_count: 0,
         }
     }
 

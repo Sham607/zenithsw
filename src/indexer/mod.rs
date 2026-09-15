@@ -23,8 +23,18 @@ impl SmartMoneyIndexer {
         interval_secs: u64,
     ) -> Self {
         Self {
-            profiler: WinnerProfiler::new(helius_rpc_url, robinhood_rpc_url, db.clone(), candidate_db.clone()),
-            detective: WhaleClusterDetective::new(helius_rpc_url, robinhood_rpc_url, db, candidate_db),
+            profiler: WinnerProfiler::new(
+                helius_rpc_url,
+                robinhood_rpc_url,
+                db.clone(),
+                candidate_db.clone(),
+            ),
+            detective: WhaleClusterDetective::new(
+                helius_rpc_url,
+                robinhood_rpc_url,
+                db,
+                candidate_db,
+            ),
             interval_secs,
         }
     }

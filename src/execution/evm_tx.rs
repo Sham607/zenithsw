@@ -18,11 +18,15 @@ pub struct Eip1559Transaction {
 
 impl Eip1559Transaction {
     pub fn validate(&self) -> Result<()> {
-        if self.chain_id != ROBINHOOD_CHAIN_ID { bail!("unexpected Robinhood chain id"); }
+        if self.chain_id != ROBINHOOD_CHAIN_ID {
+            bail!("unexpected Robinhood chain id");
+        }
         if self.max_priority_fee_per_gas > self.max_fee_per_gas {
             bail!("priority fee exceeds max fee");
         }
-        if self.gas_limit == 0 { bail!("gas limit must be non-zero"); }
+        if self.gas_limit == 0 {
+            bail!("gas limit must be non-zero");
+        }
         Ok(())
     }
 
@@ -83,14 +87,18 @@ fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn rlp_bytes(value: &[u8]) -> Vec<u8> {
-    if value.len() == 1 && value[0] < 0x80 { return value.to_vec(); }
+    if value.len() == 1 && value[0] < 0x80 {
+        return value.to_vec();
+    }
     let mut out = rlp_prefix(0x80, value.len());
     out.extend(value);
     out
 }
 
 fn rlp_prefix(short_prefix: u8, length: usize) -> Vec<u8> {
-    if length < 56 { return vec![short_prefix + length as u8]; }
+    if length < 56 {
+        return vec![short_prefix + length as u8];
+    }
     let raw = uint(length as u128);
     let mut out = vec![short_prefix + 55 + raw.len() as u8];
     out.extend(raw);
@@ -99,7 +107,9 @@ fn rlp_prefix(short_prefix: u8, length: usize) -> Vec<u8> {
 
 fn uint(value: impl Into<u128>) -> Vec<u8> {
     let mut bytes = value.into().to_be_bytes().to_vec();
-    while bytes.first() == Some(&0) { bytes.remove(0); }
+    while bytes.first() == Some(&0) {
+        bytes.remove(0);
+    }
     bytes
 }
 
@@ -108,15 +118,24 @@ mod tests {
     use super::*;
 
     fn tx() -> Eip1559Transaction {
-        Eip1559Transaction { chain_id: ROBINHOOD_CHAIN_ID, nonce: 0,
-            max_priority_fee_per_gas: 1, max_fee_per_gas: 2, gas_limit: 21_000,
-            to: [0u8; 20], value: 0, data: Vec::new() }
+        Eip1559Transaction {
+            chain_id: ROBINHOOD_CHAIN_ID,
+            nonce: 0,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 2,
+            gas_limit: 21_000,
+            to: [0u8; 20],
+            value: 0,
+            data: Vec::new(),
+        }
     }
 
     #[test]
     fn unsigned_robinhood_vector_is_deterministic() {
-        assert_eq!(hex::encode(tx().signing_payload().unwrap()),
-            "02e18212378001028252089400000000000000000000000000000000000000008080c0");
+        assert_eq!(
+            hex::encode(tx().signing_payload().unwrap()),
+            "02e18212378001028252089400000000000000000000000000000000000000008080c0"
+        );
     }
 
     #[test]

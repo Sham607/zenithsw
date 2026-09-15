@@ -13,6 +13,8 @@ use tokio::sync::broadcast;
 pub enum IpcMessage {
     Heartbeat {
         uptime_secs: u64,
+        #[serde(default)]
+        heartbeat_seq: u64,
         solana_latency_ms: u64,
         arbitrum_latency_ms: u64,
         base_latency_ms: u64,
@@ -42,6 +44,32 @@ pub enum IpcMessage {
         is_live_mode: bool,
         #[serde(default)]
         wallet_pubkey: String,
+        #[serde(default)]
+        heartbeat_timestamp_unix: i64,
+        #[serde(default)]
+        solana_rpc_requests: u64,
+        #[serde(default)]
+        solana_rpc_successes: u64,
+        #[serde(default)]
+        solana_rpc_rate_limited: u64,
+        #[serde(default)]
+        solana_rpc_failures: u64,
+        #[serde(default)]
+        robinhood_rpc_requests: u64,
+        #[serde(default)]
+        robinhood_rpc_successes: u64,
+        #[serde(default)]
+        robinhood_rpc_rate_limited: u64,
+        #[serde(default)]
+        robinhood_rpc_failures: u64,
+        #[serde(default)]
+        qualified_wallets_count: usize,
+        #[serde(default)]
+        polled_wallets_count: usize,
+        #[serde(default)]
+        global_scanned_wallets_count: usize,
+        #[serde(default)]
+        candidate_wallets_count: usize,
     },
     WalletSync {
         wallets: Vec<SmartWallet>,
@@ -52,8 +80,14 @@ pub enum IpcMessage {
     ActivityBroadcast {
         activity: WalletActivity,
     },
+    ActivitySync {
+        activities: Vec<WalletActivity>,
+    },
     SignalBroadcast {
         signal: ShadowSignal,
+    },
+    SignalSync {
+        signals: Vec<ShadowSignal>,
     },
     PositionUpdate {
         positions: Vec<ShadowPosition>,

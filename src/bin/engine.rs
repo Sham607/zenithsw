@@ -4,6 +4,7 @@ use futures_util::stream::{self, StreamExt};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,10 @@ impl InstanceLock {
                     bail!("another ZenithSW engine instance is already running");
                 }
                 fs::remove_file(&path)?;
-                let mut file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
                 writeln!(file, "{}", std::process::id())?;
                 file.sync_all()?;
                 Ok(Self { path })
@@ -48,7 +52,7 @@ impl Drop for InstanceLock {
 }
 use tokio::time::sleep;
 
-use zenithsw::chains::robinhood::RobinhoodRpc;
+use zenithsw::chains::robinhood::{validate_receipt_transaction_hash, RobinhoodRpc};
 use zenithsw::config::Config;
 use zenithsw::db::SmartWalletDb;
 use zenithsw::execution::evm_executor::EvmExecutor;
@@ -69,6 +73,8 @@ async fn main() -> Result<()> {
     println!("======================================================");
 
     let config = Config::load()?;
+    let polled_wallets_count = Arc::new(AtomicUsize::new(0));
+    let global_scanned_wallets_count = Arc::new(AtomicUsize::new(0));
     let robinhood_primary_rpc = config
         .robinhood_rpc_url
         .split(',')
@@ -84,20 +90,19 @@ async fn main() -> Result<()> {
         &config.wallet_db_path,
     )?);
     let candidate_db = Arc::new(zenithsw::db::CandidateWalletDb::open(
-        "data/candidate_wallet_registry.db",
+        &config.candidate_db_path,
     )?);
 
-    // Initial seed: Only populate if database is completely empty
-    if let Ok(existing) = db.get_active_wallets() {
-        if existing.is_empty() {
-            let default_seeds = FomoScraper::get_default_seed_traders();
-            println!(
-                "[INIT] Database is empty. Syncing {} initial verified smart wallets...",
-                default_seeds.len()
-            );
-            for s in &default_seeds {
-                let _ = db.upsert_wallet(s);
-            }
+    // Initial seed: Only populate if database is completely empty.
+    let existing_wallets = db.get_active_wallets()?;
+    if existing_wallets.is_empty() {
+        let default_seeds = FomoScraper::get_default_seed_traders();
+        println!(
+            "[INIT] Database is empty. Syncing {} initial verified smart wallets...",
+            default_seeds.len()
+        );
+        for seed in &default_seeds {
+            db.upsert_wallet(seed)?;
         }
     }
 
@@ -126,8 +131,9 @@ async fn main() -> Result<()> {
     let evm_exec = Arc::new(EvmExecutor::new(config.clone(), db.clone()));
 
     // Recover only existing transaction hashes/signatures; never rebroadcast after restart.
+    let pending_intents = db.get_pending_execution_intents()?;
     for (intent_id, chain, _action, _token_mint, _wallet, state, tx_hash, signature) in
-        db.get_pending_execution_intents().unwrap_or_default()
+        pending_intents
     {
         match chain.as_str() {
             "SOLANA" => {
@@ -136,12 +142,31 @@ async fn main() -> Result<()> {
                         .confirm_transaction_signature(&signature, 5)
                         .await
                         .unwrap_or(false);
-                    let next_state = if confirmed { "CONFIRMED" } else { "PENDING_RECONCILIATION" };
-                    let _ = db.update_execution_intent(&intent_id, next_state, None, Some(&signature));
-                    println!("[INTENT RECOVERY] chain=SOLANA state={} previous_state={}", next_state, state);
+                    let next_state = if confirmed {
+                        "CONFIRMED"
+                    } else {
+                        "PENDING_RECONCILIATION"
+                    };
+                    if let Err(error) =
+                        db.update_execution_intent(&intent_id, next_state, None, Some(&signature))
+                    {
+                        eprintln!("[INTENT RECOVERY ERROR] update SOLANA intent gagal: {error}");
+                    }
+                    println!(
+                        "[INTENT RECOVERY] chain=SOLANA state={} previous_state={}",
+                        next_state, state
+                    );
                 } else {
-                    let _ = db.update_execution_intent(&intent_id, "FAILED", None, None);
-                    println!("[INTENT RECOVERY] chain=SOLANA state=FAILED reason=missing_signature");
+                    if let Err(error) =
+                        db.update_execution_intent(&intent_id, "UNKNOWN", None, None)
+                    {
+                        eprintln!(
+                            "[INTENT RECOVERY ERROR] update SOLANA failed intent gagal: {error}"
+                        );
+                    }
+                    println!(
+                        "[INTENT RECOVERY] chain=SOLANA state=FAILED reason=missing_signature"
+                    );
                 }
             }
             "ROBINHOOD" => {
@@ -149,19 +174,50 @@ async fn main() -> Result<()> {
                     let rpc = RobinhoodRpc::new(&config.robinhood_rpc_url)?;
                     let receipt = rpc.transaction_receipt(&tx_hash).await?;
                     let next_state = match receipt {
-                        Some(receipt) if receipt.get("status").and_then(serde_json::Value::as_str) == Some("0x1") => "CONFIRMED",
-                        Some(_) => "FAILED",
+                        Some(receipt) => {
+                            if let Err(error) =
+                                validate_receipt_transaction_hash(&tx_hash, &receipt)
+                            {
+                                eprintln!("[INTENT RECOVERY] receipt mismatch: {error}");
+                                "UNKNOWN"
+                            } else if receipt.get("status").and_then(serde_json::Value::as_str)
+                                == Some("0x1")
+                            {
+                                "CONFIRMED"
+                            } else {
+                                "FAILED"
+                            }
+                        }
                         None => "PENDING_RECONCILIATION",
                     };
-                    let _ = db.update_execution_intent(&intent_id, next_state, Some(&tx_hash), None);
-                    println!("[INTENT RECOVERY] chain=ROBINHOOD state={} previous_state={}", next_state, state);
+                    if let Err(error) =
+                        db.update_execution_intent(&intent_id, next_state, Some(&tx_hash), None)
+                    {
+                        eprintln!("[INTENT RECOVERY ERROR] update ROBINHOOD intent gagal: {error}");
+                    }
+                    println!(
+                        "[INTENT RECOVERY] chain=ROBINHOOD state={} previous_state={}",
+                        next_state, state
+                    );
                 } else {
-                    let _ = db.update_execution_intent(&intent_id, "FAILED", None, None);
-                    println!("[INTENT RECOVERY] chain=ROBINHOOD state=FAILED reason=missing_tx_hash");
+                    if let Err(error) =
+                        db.update_execution_intent(&intent_id, "UNKNOWN", None, None)
+                    {
+                        eprintln!(
+                            "[INTENT RECOVERY ERROR] update ROBINHOOD failed intent gagal: {error}"
+                        );
+                    }
+                    println!(
+                        "[INTENT RECOVERY] chain=ROBINHOOD state=FAILED reason=missing_tx_hash"
+                    );
                 }
             }
             _ => {
-                let _ = db.update_execution_intent(&intent_id, "FAILED", None, None);
+                if let Err(error) = db.update_execution_intent(&intent_id, "UNKNOWN", None, None) {
+                    eprintln!(
+                        "[INTENT RECOVERY ERROR] update unsupported-chain intent gagal: {error}"
+                    );
+                }
                 println!("[INTENT RECOVERY] state=FAILED reason=unsupported_chain");
             }
         }
@@ -194,7 +250,11 @@ async fn main() -> Result<()> {
             {
                 Ok(tokens) => {
                     println!("[RADAR HARVEST 💎] Successfully analyzed and tracked {} whale conviction tokens", tokens.len());
-                    let _ = ipc_radar.broadcast(&IpcMessage::TrackedTokensUpdate { tokens });
+                    if let Err(error) =
+                        ipc_radar.broadcast(&IpcMessage::TrackedTokensUpdate { tokens })
+                    {
+                        eprintln!("[IPC ERROR] TrackedTokensUpdate gagal: {error}");
+                    }
                 }
                 Err(e) => {
                     eprintln!("[RADAR HARVEST ⚠️] Error harvesting whale holdings: {}", e);
@@ -214,6 +274,8 @@ async fn main() -> Result<()> {
     let sol_exec_stream = sol_exec.clone();
     let evm_exec_stream = evm_exec.clone();
     let ipc_stream = ipc_server.clone();
+    let polled_counter = polled_wallets_count.clone();
+    let global_scanned_counter = global_scanned_wallets_count.clone();
 
     tokio::spawn(async move {
         println!("[STREAM WORKER] Paced Multi-Chain Streamer online (Solana: {}, Robinhood: {}, Base: {})",
@@ -239,23 +301,39 @@ async fn main() -> Result<()> {
                 });
 
                 // Robinhood uses one bounded global log scan, not one eth_getLogs per wallet.
-                let robinhood_global_results = if last_robinhood_scan.elapsed() >= Duration::from_secs(15) {
+                let robinhood_global_results = if last_robinhood_scan.elapsed()
+                    >= Duration::from_secs(15)
+                {
                     last_robinhood_scan = Instant::now();
-                    let robinhood_lookup: std::collections::HashMap<String, SmartWallet> = db_stream
-                        .get_active_wallets()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|w| w.chain == Chain::Robinhood && w.is_active && matches!(w.tier, WalletTier::TierS | WalletTier::TierA))
-                        .map(|w| (w.address.to_lowercase(), w))
-                        .collect();
+                    let robinhood_lookup: std::collections::HashMap<String, SmartWallet> =
+                        match db_stream.get_active_wallets() {
+                            Ok(wallets) => wallets
+                                .into_iter()
+                                .filter(|w| {
+                                    w.chain == Chain::Robinhood
+                                        && w.is_active
+                                        && matches!(w.tier, WalletTier::TierS | WalletTier::TierA)
+                                })
+                                .map(|w| (w.address.to_lowercase(), w))
+                                .collect(),
+                            Err(error) => {
+                                eprintln!("[SCANNER DB ERROR] Robinhood wallet scope unavailable: {error}");
+                                std::collections::HashMap::new()
+                            }
+                        };
+                    global_scanned_counter.store(robinhood_lookup.len(), Ordering::Relaxed);
                     let robinhood_pairs: Vec<(String, String)> = robinhood_lookup
                         .values()
                         .map(|w| (w.handle.clone(), w.address.clone()))
                         .collect();
-                    arb_listener_stream
+                    let scan_result = arb_listener_stream
                         .scan_global_wallet_activity(&robinhood_pairs, db_stream.clone())
-                        .await
-                        .unwrap_or_default()
+                        .await;
+                    if let Err(error) = &scan_result {
+                        eprintln!("[SCANNER RPC ERROR] Robinhood global scan failed: {error}");
+                    }
+                    scan_result
+                        .unwrap_or_else(|_| Vec::new())
                         .into_iter()
                         .filter_map(|activity| {
                             robinhood_lookup
@@ -276,32 +354,42 @@ async fn main() -> Result<()> {
                 });
 
                 // Concurrently poll wallet activities across high-speed RPC (8 concurrent workers)
+                polled_counter.store(wallets.len(), Ordering::Relaxed);
                 let mut activity_results: Vec<(WalletActivity, SmartWallet)> =
                     stream::iter(wallets.into_iter())
                         .map(|w| {
                             let sol_listener = sol_listener_stream.clone();
-                            let arb_listener = arb_listener_stream.clone();
                             let fomo_listener = fomo_listener_stream.clone();
                             let db = db_stream.clone();
                             async move {
                                 let mut activity_opt =
                                     if w.source == "FOMO" && w.tier == WalletTier::TierS {
-                                        fomo_listener
+                                        match fomo_listener
                                             .check_trader_swaps(&w.handle, &w.address, db.clone())
                                             .await
-                                            .ok()
-                                            .flatten()
+                                        {
+                                            Ok(activity) => activity,
+                                            Err(error) => {
+                                                eprintln!("[POLL ERROR] FOMO wallet={} address={} error={error}", w.handle, w.address);
+                                                None
+                                            }
+                                        }
                                     } else {
                                         None
                                     };
 
                                 if activity_opt.is_none() {
                                     activity_opt = match w.chain {
-                                        Chain::Solana => sol_listener
+                                        Chain::Solana => match sol_listener
                                             .check_recent_txs(&w.handle, &w.address, db.clone())
                                             .await
-                                            .ok()
-                                            .flatten(),
+                                        {
+                                            Ok(activity) => activity,
+                                            Err(error) => {
+                                                eprintln!("[POLL ERROR] Solana wallet={} address={} error={error}", w.handle, w.address);
+                                                None
+                                            }
+                                        },
                                         // Robinhood diproses oleh global scanner di atas.
                                         Chain::Robinhood | Chain::Arbitrum => None,
                                         _ => None,
@@ -325,28 +413,41 @@ async fn main() -> Result<()> {
                         act.token_symbol,
                         act.amount_usd
                     );
-                        let _ = ipc_stream.broadcast(&IpcMessage::ActivityBroadcast {
-                            activity: act.clone(),
-                        });
+                    if let Err(error) = ipc_stream.broadcast(&IpcMessage::ActivityBroadcast {
+                        activity: act.clone(),
+                    }) {
+                        eprintln!("[IPC ERROR] ActivityBroadcast gagal: {error}");
+                    }
 
-                        // Handle Pure Shadow Mirror Exit (Proportional / Full per whale contribution)
-                        if act.activity_type == ActivityType::Sell {
-                            if let Ok(positions) = db_stream.get_active_positions() {
+                    // Handle Pure Shadow Mirror Exit (Proportional / Full per whale contribution)
+                    if act.activity_type == ActivityType::Sell {
+                        match db_stream.get_active_positions() {
+                            Ok(positions) => {
                                 for pos in positions {
                                     if pos.token_mint.eq_ignore_ascii_case(&act.token_mint)
                                         && pos.chain == act.chain
                                     {
-                                        let whale_addr_lower = act.wallet_address.trim().to_lowercase();
-                                        let handle_lower = act.wallet_handle.trim().trim_start_matches('@').to_lowercase();
-                                        let is_participant = pos
-                                            .target_whale_address
-                                            .split(',')
-                                            .map(str::trim)
-                                            .any(|address| address.to_lowercase() == whale_addr_lower)
-                                            || pos
+                                        let whale_addr_lower =
+                                            act.wallet_address.trim().to_lowercase();
+                                        let handle_lower = act
+                                            .wallet_handle
+                                            .trim()
+                                            .trim_start_matches('@')
+                                            .to_lowercase();
+                                        let is_participant =
+                                            pos.target_whale_address.split(',').map(str::trim).any(
+                                                |address| {
+                                                    address.to_lowercase() == whale_addr_lower
+                                                },
+                                            ) || pos
                                                 .target_whale_handle
                                                 .split(',')
-                                                .map(|handle| handle.trim().trim_start_matches('@').to_lowercase())
+                                                .map(|handle| {
+                                                    handle
+                                                        .trim()
+                                                        .trim_start_matches('@')
+                                                        .to_lowercase()
+                                                })
                                                 .any(|handle| handle == handle_lower);
 
                                         if is_participant {
@@ -370,46 +471,58 @@ async fn main() -> Result<()> {
                                                 println!("[SHADOW FULL EXIT 🔴] Target @{} sold 100% of {} -> Closing position completely!", act.wallet_handle, pos.token_symbol);
                                                 match pos.chain {
                                                     Chain::Solana => {
-                                                        let _ = sol_exec_stream
+                                                        if let Err(error) = sol_exec_stream
                                                             .execute_shadow_sell(
                                                                 &pos.id,
                                                                 "WHALE_FULL_DUMP",
                                                                 exit_price,
                                                             )
-                                                            .await;
+                                                            .await
+                                                        {
+                                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=WHALE_FULL_DUMP error={error}", pos.id);
+                                                        }
                                                     }
                                                     _ => {
-                                                        let _ = evm_exec_stream
+                                                        if let Err(error) = evm_exec_stream
                                                             .execute_shadow_sell(
                                                                 &pos.id,
                                                                 "WHALE_FULL_DUMP",
                                                                 exit_price,
                                                             )
-                                                            .await;
+                                                            .await
+                                                        {
+                                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=WHALE_FULL_DUMP error={error}", pos.id);
+                                                        }
                                                     }
                                                 }
                                             } else {
                                                 println!("[SHADOW PROPORTIONAL EXIT 🟡] Target @{} sold {:.1}% of {} (Weighted: {:.1}%, {} whales in pos) -> Partial exit!", act.wallet_handle, raw_sell_ratio, pos.token_symbol, effective_sell_ratio, whale_count);
                                                 match pos.chain {
                                                     Chain::Solana => {
-                                                        let _ = sol_exec_stream
+                                                        if let Err(error) = sol_exec_stream
                                                             .execute_partial_shadow_sell(
                                                                 &pos.id,
                                                                 effective_sell_ratio,
                                                                 "WHALE_PARTIAL_DUMP",
                                                                 exit_price,
                                                             )
-                                                            .await;
+                                                            .await
+                                                        {
+                                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=WHALE_PARTIAL_DUMP error={error}", pos.id);
+                                                        }
                                                     }
                                                     _ => {
-                                                        let _ = evm_exec_stream
+                                                        if let Err(error) = evm_exec_stream
                                                             .execute_partial_shadow_sell(
                                                                 &pos.id,
                                                                 effective_sell_ratio,
                                                                 "WHALE_PARTIAL_DUMP",
                                                                 exit_price,
                                                             )
-                                                            .await;
+                                                            .await
+                                                        {
+                                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=WHALE_PARTIAL_DUMP error={error}", pos.id);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -417,83 +530,98 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                        } else if act.activity_type == ActivityType::Buy {
-                            // Fetch real-time pool price, liquidity & market cap across Solana/EVM
-                            let market_data = match act.chain {
+                            Err(error) => {
+                                eprintln!("[MIRROR DB ERROR] Active positions unavailable for sell activity: {error}");
+                            }
+                        }
+                    } else if act.activity_type == ActivityType::Buy {
+                        // Fetch real-time pool price, liquidity & market cap across Solana/EVM
+                        let market_data = match act.chain {
                                 Chain::Solana => SolanaStreamListener::fetch_token_price(&act.token_mint).await,
                                 Chain::Robinhood => Err(anyhow::anyhow!("Robinhood market data requires a verified on-chain quote; Solana price resolver is not permitted")),
                                 _ => Err(anyhow::anyhow!("unsupported chain market data source")),
                             };
-                            let (current_price, pool_liq, live_mcap) = match market_data {
-                                Ok((symbol, price, liquidity, market_cap))
-                                    if !symbol.is_empty()
-                                        && price.is_finite()
-                                        && price > 0.0
-                                        && liquidity.is_finite()
-                                        && liquidity > 0.0
-                                        && market_cap.is_finite()
-                                        && market_cap > 0.0 => (price, liquidity, market_cap),
-                                Ok((symbol, price, liquidity, market_cap)) => {
-                                    eprintln!(
+                        let (current_price, pool_liq, live_mcap) = match market_data {
+                            Ok((symbol, price, liquidity, market_cap))
+                                if !symbol.is_empty()
+                                    && price.is_finite()
+                                    && price > 0.0
+                                    && liquidity.is_finite()
+                                    && liquidity > 0.0
+                                    && market_cap.is_finite()
+                                    && market_cap > 0.0 =>
+                            {
+                                (price, liquidity, market_cap)
+                            }
+                            Ok((symbol, price, liquidity, market_cap)) => {
+                                eprintln!(
                                         "[ENTRY DATA REJECTED ⚠️] {} returned invalid market data (symbol={}, price={}, liquidity={}, mcap={})",
                                         act.token_mint, symbol, price, liquidity, market_cap
                                     );
-                                    continue;
-                                }
-                                Err(error) => {
-                                    eprintln!(
-                                        "[ENTRY DATA FAILED ⚠️] {} ({}) — rejecting entry",
-                                        act.token_mint, error
-                                    );
-                                    continue;
-                                }
-                            };
+                                continue;
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "[ENTRY DATA FAILED ⚠️] {} ({}) — rejecting entry",
+                                    act.token_mint, error
+                                );
+                                continue;
+                            }
+                        };
 
-                            let mut act_to_eval = act.clone();
-                            if act_to_eval.execution_price_usd <= 0.0 && current_price > 0.0 {
-                                act_to_eval.execution_price_usd = current_price;
+                        let mut act_to_eval = act.clone();
+                        if act_to_eval.execution_price_usd <= 0.0 && current_price > 0.0 {
+                            act_to_eval.execution_price_usd = current_price;
+                        }
+
+                        // Strict Gating & Confluence Evaluation with Live Market Cap
+                        if let Ok(sig) = confluence_stream.evaluate_activity_with_mcap(
+                            &act_to_eval,
+                            &w,
+                            current_price,
+                            pool_liq,
+                            live_mcap,
+                        ) {
+                            if let Err(error) = ipc_stream.broadcast(&IpcMessage::SignalBroadcast {
+                                signal: sig.clone(),
+                            }) {
+                                eprintln!("[IPC ERROR] SignalBroadcast gagal: {error}");
                             }
 
-                            // Strict Gating & Confluence Evaluation with Live Market Cap
-                            if let Ok(sig) = confluence_stream.evaluate_activity_with_mcap(
-                                &act_to_eval,
-                                &w,
-                                current_price,
-                                pool_liq,
-                                live_mcap,
-                            ) {
-                                let _ = ipc_stream.broadcast(&IpcMessage::SignalBroadcast {
-                                    signal: sig.clone(),
-                                });
-
-                                if sig.is_passed {
-                                    println!("[EXECUTE 🚀] Passed strict gating! Executing shadow buy for {}", sig.token_symbol);
-                                    let pos_opt = match sig.chain {
-                                        Chain::Solana => sol_exec_stream
-                                            .execute_shadow_buy(&sig)
-                                            .await
-                                            .ok()
-                                            .flatten(),
-                                        _ => evm_exec_stream
-                                            .execute_shadow_buy(&sig)
-                                            .await
-                                            .ok()
-                                            .flatten(),
-                                    };
-
-                                    if let Some(new_pos) = pos_opt {
-                                        println!("[POSITION OPENED ✅] ID: {}, Token: {}, Entry: ${:.6}, Amount: ${:.2}", new_pos.id, new_pos.token_symbol, new_pos.entry_price, new_pos.amount_usd);
+                            if sig.is_passed {
+                                println!("[EXECUTE 🚀] Passed strict gating! Executing shadow buy for {}", sig.token_symbol);
+                                let pos_opt = match sig.chain {
+                                    Chain::Solana => {
+                                        match sol_exec_stream.execute_shadow_buy(&sig).await {
+                                            Ok(position) => position,
+                                            Err(error) => {
+                                                eprintln!("[EXECUTION ERROR] Solana shadow buy token={} error={error}", sig.token_mint);
+                                                None
+                                            }
+                                        }
                                     }
-                                } else {
-                                    println!(
-                                        "[GATING REJECT ❌] Token: {} rejected: {:?}",
-                                        sig.token_symbol, sig.rejection_reason
-                                    );
+                                    _ => match evm_exec_stream.execute_shadow_buy(&sig).await {
+                                        Ok(position) => position,
+                                        Err(error) => {
+                                            eprintln!("[EXECUTION ERROR] EVM shadow buy token={} error={error}", sig.token_mint);
+                                            None
+                                        }
+                                    },
+                                };
+
+                                if let Some(new_pos) = pos_opt {
+                                    println!("[POSITION OPENED ✅] ID: {}, Token: {}, Entry: ${:.6}, Amount: ${:.2}", new_pos.id, new_pos.token_symbol, new_pos.entry_price, new_pos.amount_usd);
                                 }
+                            } else {
+                                println!(
+                                    "[GATING REJECT ❌] Token: {} rejected: {:?}",
+                                    sig.token_symbol, sig.rejection_reason
+                                );
                             }
                         }
                     }
                 }
+            }
 
             sleep(Duration::from_millis(500)).await;
         }
@@ -507,18 +635,19 @@ async fn main() -> Result<()> {
     let config_pos = config.clone();
 
     tokio::spawn(async move {
-        println!("[POSITION TRACKER] Position & Floating PnL Tracker online (SL: -{:.1}%, TP: +{:.1}%)",
-            config_pos.stop_loss_pct, config_pos.take_profit_pct);
+        println!(
+            "[POSITION TRACKER] Position & Floating PnL Tracker online (SL: -{:.1}%, TP: +{:.1}%)",
+            config_pos.stop_loss_pct, config_pos.take_profit_pct
+        );
         loop {
             if let Ok(mut positions) = db_pos_tracker.get_active_positions() {
                 for pos in &mut positions {
                     if pos.status == "CLOSED" {
                         continue;
                     }
-                    let track_policy = pos.track.policy(
-                        config_pos.stop_loss_pct,
-                        config_pos.take_profit_pct,
-                    );
+                    let track_policy = pos
+                        .track
+                        .policy(config_pos.stop_loss_pct, config_pos.take_profit_pct);
 
                     // Fetch latest live price & pool liquidity; never relabel stale price as fresh.
                     let price_result = match pos.chain {
@@ -531,7 +660,10 @@ async fn main() -> Result<()> {
                             if price.is_finite()
                                 && price > 0.0
                                 && liquidity.is_finite()
-                                && liquidity > 0.0 => (price, liquidity),
+                                && liquidity > 0.0 =>
+                        {
+                            (price, liquidity)
+                        }
                         Ok((symbol, price, liquidity, _)) => {
                             eprintln!(
                                 "[PRICE UPDATE SKIP ⚠️] {} returned invalid market data (price=${:.8}, liquidity=${:.2}); keeping last price with no refresh.",
@@ -571,7 +703,13 @@ async fn main() -> Result<()> {
                         // Persist every valid tick so current_price, PnL, and last_update
                         // remain recoverable after a restart, even when the price is flat.
                         // The TUI receives the same fresh snapshot below via IPC.
-                        let _ = db_pos_tracker.upsert_position(pos);
+                        if let Err(error) = db_pos_tracker.upsert_position(pos) {
+                            eprintln!(
+                                "[POSITION DB ERROR] Gagal menyimpan posisi {}: {error}",
+                                pos.id
+                            );
+                            continue;
+                        }
 
                         // Liquidity Drain Guard (Rug-pull trap protection: exit immediately if pool liquidity collapses below $10k)
                         if live_liquidity > 0.0
@@ -584,22 +722,28 @@ async fn main() -> Result<()> {
                             );
                             match pos.chain {
                                 Chain::Solana => {
-                                    let _ = sol_exec_pos
+                                    if let Err(error) = sol_exec_pos
                                         .execute_shadow_sell(
                                             &pos.id,
                                             "LIQUIDITY_DRAIN_EXIT",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=LIQUIDITY_DRAIN_EXIT error={error}", pos.id);
+                                    }
                                 }
                                 _ => {
-                                    let _ = evm_exec_pos
+                                    if let Err(error) = evm_exec_pos
                                         .execute_shadow_sell(
                                             &pos.id,
                                             "LIQUIDITY_DRAIN_EXIT",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=LIQUIDITY_DRAIN_EXIT error={error}", pos.id);
+                                    }
                                 }
                             }
                             continue;
@@ -614,24 +758,30 @@ async fn main() -> Result<()> {
                                 config_pos.take_profit_pct, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.take_profit_pct);
                             match pos.chain {
                                 Chain::Solana => {
-                                    let _ = sol_exec_pos
+                                    if let Err(error) = sol_exec_pos
                                         .execute_partial_shadow_sell(
                                             &pos.id,
                                             50.0,
                                             "AUTO_TP_50_FREE_ROLL",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=AUTO_TP_50_FREE_ROLL error={error}", pos.id);
+                                    }
                                 }
                                 _ => {
-                                    let _ = evm_exec_pos
+                                    if let Err(error) = evm_exec_pos
                                         .execute_partial_shadow_sell(
                                             &pos.id,
                                             50.0,
                                             "AUTO_TP_50_FREE_ROLL",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=AUTO_TP_50_FREE_ROLL error={error}", pos.id);
+                                    }
                                 }
                             }
                         }
@@ -647,24 +797,30 @@ async fn main() -> Result<()> {
                                 tp2_target_pnl, pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
                             match pos.chain {
                                 Chain::Solana => {
-                                    let _ = sol_exec_pos
+                                    if let Err(error) = sol_exec_pos
                                         .execute_partial_shadow_sell(
                                             &pos.id,
                                             25.0,
                                             "AUTO_TP_25_RUNNER_LOCK",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=AUTO_TP_25_RUNNER_LOCK error={error}", pos.id);
+                                    }
                                 }
                                 _ => {
-                                    let _ = evm_exec_pos
+                                    if let Err(error) = evm_exec_pos
                                         .execute_partial_shadow_sell(
                                             &pos.id,
                                             25.0,
                                             "AUTO_TP_25_RUNNER_LOCK",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=AUTO_TP_25_RUNNER_LOCK error={error}", pos.id);
+                                    }
                                 }
                             }
                         }
@@ -680,22 +836,28 @@ async fn main() -> Result<()> {
                                 pos.id, pos.token_symbol, pos.peak_price, pos.current_price, pos.remaining_portion_pct);
                             match pos.chain {
                                 Chain::Solana => {
-                                    let _ = sol_exec_pos
+                                    if let Err(error) = sol_exec_pos
                                         .execute_shadow_sell(
                                             &pos.id,
                                             "PEAK_DRAWDOWN_GUARD_EXIT",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=PEAK_DRAWDOWN_GUARD_EXIT error={error}", pos.id);
+                                    }
                                 }
                                 _ => {
-                                    let _ = evm_exec_pos
+                                    if let Err(error) = evm_exec_pos
                                         .execute_shadow_sell(
                                             &pos.id,
                                             "PEAK_DRAWDOWN_GUARD_EXIT",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=PEAK_DRAWDOWN_GUARD_EXIT error={error}", pos.id);
+                                    }
                                 }
                             }
                         }
@@ -712,22 +874,28 @@ async fn main() -> Result<()> {
                                 pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
                             match pos.chain {
                                 Chain::Solana => {
-                                    let _ = sol_exec_pos
+                                    if let Err(error) = sol_exec_pos
                                         .execute_shadow_sell(
                                             &pos.id,
                                             "PROFIT_LOCK_FLOOR_EXIT",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=PROFIT_LOCK_FLOOR_EXIT error={error}", pos.id);
+                                    }
                                 }
                                 _ => {
-                                    let _ = evm_exec_pos
+                                    if let Err(error) = evm_exec_pos
                                         .execute_shadow_sell(
                                             &pos.id,
                                             "PROFIT_LOCK_FLOOR_EXIT",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=PROFIT_LOCK_FLOOR_EXIT error={error}", pos.id);
+                                    }
                                 }
                             }
                         }
@@ -742,22 +910,28 @@ async fn main() -> Result<()> {
                                 pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct);
                             match pos.chain {
                                 Chain::Solana => {
-                                    let _ = sol_exec_pos
+                                    if let Err(error) = sol_exec_pos
                                         .execute_shadow_sell(
                                             &pos.id,
                                             "EMERGENCY_HARD_SL_CUTLOSS",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=EMERGENCY_HARD_SL_CUTLOSS error={error}", pos.id);
+                                    }
                                 }
                                 _ => {
-                                    let _ = evm_exec_pos
+                                    if let Err(error) = evm_exec_pos
                                         .execute_shadow_sell(
                                             &pos.id,
                                             "EMERGENCY_HARD_SL_CUTLOSS",
                                             live_price,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=EMERGENCY_HARD_SL_CUTLOSS error={error}", pos.id);
+                                    }
                                 }
                             }
                         }
@@ -767,7 +941,11 @@ async fn main() -> Result<()> {
                 }
 
                 // Broadcast refreshed positions to IPC socket
-                let _ = ipc_pos_tracker.broadcast(&IpcMessage::PositionUpdate { positions });
+                if let Err(error) =
+                    ipc_pos_tracker.broadcast(&IpcMessage::PositionUpdate { positions })
+                {
+                    eprintln!("[IPC ERROR] PositionUpdate gagal: {error}");
+                }
             }
 
             sleep(Duration::from_secs(1)).await;
@@ -780,43 +958,107 @@ async fn main() -> Result<()> {
     let sol_exec_hb = sol_exec.clone();
     let arb_listener_hb = arb_listener.clone();
     let config_hb = config.clone();
+    let polled_counter_hb = polled_wallets_count.clone();
+    let global_scanned_counter_hb = global_scanned_wallets_count.clone();
+    let candidate_counter = Arc::new(AtomicUsize::new(0));
+    let candidate_counter_hb = candidate_counter.clone();
+    let candidate_db_hb = candidate_db.clone();
+    let robinhood_rpc_hb = if config.enable_robinhood {
+        Some(RobinhoodRpc::new(&robinhood_primary_rpc)?)
+    } else {
+        None
+    };
     let start_time = Utc::now();
+    tokio::spawn(async move {
+        loop {
+            if let Ok(count) = candidate_db_hb.count() {
+                if let Ok(count) = usize::try_from(count) {
+                    candidate_counter.store(count, Ordering::Relaxed);
+                }
+            }
+            sleep(Duration::from_secs(5)).await;
+        }
+    });
     tokio::spawn(async move {
         let mut sync_tick = 0u64;
         loop {
             sync_tick += 1;
             let uptime_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-            let total_tracked_count = db_heartbeat
-                .get_active_wallets()
-                .map(|w| w.len())
-                .unwrap_or(0);
-            let qualified_wallets = db_heartbeat.get_qualified_wallets().unwrap_or_default();
-            let active_positions = db_heartbeat.get_active_positions().unwrap_or_default();
+            let total_tracked_count = match db_heartbeat.get_active_wallets() {
+                Ok(wallets) => wallets.len(),
+                Err(error) => {
+                    eprintln!("[HEARTBEAT DB ERROR] Active wallet count unavailable: {error}");
+                    0
+                }
+            };
+            let qualified_wallets = match db_heartbeat.get_qualified_wallets() {
+                Ok(wallets) => wallets,
+                Err(error) => {
+                    eprintln!("[HEARTBEAT DB ERROR] Qualified wallet scope unavailable: {error}");
+                    Vec::new()
+                }
+            };
+            let active_positions = match db_heartbeat.get_active_positions() {
+                Ok(positions) => positions,
+                Err(error) => {
+                    eprintln!("[HEARTBEAT DB ERROR] Active positions unavailable: {error}");
+                    Vec::new()
+                }
+            };
             let active_positions_count = active_positions.len();
 
             // Calculate real on-chain wallet balances & portfolio USD
-            let (wallet_pubkey, wallet_sol_balance) = if let Ok((_, pubkey)) = sol_exec_hb.get_keypair() {
-                let bal = sol_exec_hb.get_native_balance(&pubkey).await.unwrap_or(0.0);
-                (pubkey, bal)
-            } else {
-                (String::new(), 0.0)
-            };
+            let (wallet_pubkey, wallet_sol_balance) =
+                if let Ok((_, pubkey)) = sol_exec_hb.get_keypair() {
+                    let bal = sol_exec_hb.get_native_balance(&pubkey).await.unwrap_or(0.0);
+                    (pubkey, bal)
+                } else {
+                    (String::new(), 0.0)
+                };
 
             let sol_price_usd = sol_exec_hb.get_sol_price().await.unwrap_or(0.0);
             let sol_usd_val = wallet_sol_balance * sol_price_usd;
 
-            // Physical On-Chain Token Valuation across ALL tokens in the wallet
+            // Measure actual Solana request latency and refresh on-chain token valuation
+            // from the same live wallet balance request (0 = unavailable).
+            let solana_latency_start = Instant::now();
+            let onchain_tokens = if wallet_pubkey.is_empty() {
+                Vec::new()
+            } else {
+                sol_exec_hb
+                    .get_all_wallet_token_balances(&wallet_pubkey)
+                    .await
+            };
+            let solana_latency_ms =
+                u64::try_from(solana_latency_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
             let mut total_tokens_usd = 0.0;
-            if !wallet_pubkey.is_empty() {
-                let onchain_tokens = sol_exec_hb.get_all_wallet_token_balances(&wallet_pubkey).await;
-                for (mint, amt) in onchain_tokens {
-                    if let Ok((_, price, _, _)) = SolanaStreamListener::fetch_token_price(&mint).await {
-                        if price > 0.0 {
-                            total_tokens_usd += amt * price;
-                        }
+            for (mint, amt) in onchain_tokens {
+                match SolanaStreamListener::fetch_token_price(&mint).await {
+                    Ok((_, price, _, _)) if price > 0.0 => {
+                        total_tokens_usd += amt * price;
+                    }
+                    Ok((_, price, _, _)) => {
+                        eprintln!("[HEARTBEAT PRICE SKIP] mint={mint} price={price} — tidak dihitung ke equity");
+                    }
+                    Err(error) => {
+                        eprintln!("[HEARTBEAT PRICE FAILED] mint={mint} error={error}");
                     }
                 }
             }
+
+            // Measure actual Robinhood request latency from a live chain id request (0 = unavailable).
+            let robinhood_latency_start = Instant::now();
+            let robinhood_latency_result = match robinhood_rpc_hb.as_ref() {
+                Some(rpc) => Some(rpc.chain_id().await),
+                None => None,
+            };
+            let robinhood_latency_ms = match robinhood_latency_result {
+                Some(Ok(_)) => {
+                    u64::try_from(robinhood_latency_start.elapsed().as_millis()).unwrap_or(u64::MAX)
+                }
+                _ => 0,
+            };
 
             let open_positions_usd: f64 = if total_tokens_usd > 0.0 {
                 total_tokens_usd
@@ -832,14 +1074,17 @@ async fn main() -> Result<()> {
 
             let wallet_equity_usd = sol_usd_val + open_positions_usd;
 
-            let total_realized_pnl_usd: f64 = db_heartbeat
-                .get_recent_trades(500)
-                .map(|trades| trades.iter().map(|t| t.pnl_usd).sum())
-                .unwrap_or(0.0);
+            let total_realized_pnl_usd: f64 = match db_heartbeat.get_recent_trades(500) {
+                Ok(trades) => trades.iter().map(|t| t.pnl_usd).sum(),
+                Err(error) => {
+                    eprintln!("[HEARTBEAT DB ERROR] Realized PnL unavailable: {error}");
+                    0.0
+                }
+            };
 
             let (rpc_requests, rpc_successes, rpc_rate_limited, rpc_failures) =
                 arb_listener_hb.health_snapshot();
-            if sync_tick % 10 == 0 {
+            if sync_tick.is_multiple_of(10) {
                 println!(
                     "[RPC HEALTH] chain=ROBINHOOD requests={} successes={} rate_limited={} failures={}",
                     rpc_requests, rpc_successes, rpc_rate_limited, rpc_failures
@@ -848,9 +1093,11 @@ async fn main() -> Result<()> {
 
             let hb = IpcMessage::Heartbeat {
                 uptime_secs,
-                solana_latency_ms: 68,
-                arbitrum_latency_ms: 42,
-                base_latency_ms: 45,
+                heartbeat_seq: sync_tick,
+                // Latensi diukur dari request Solana/Robinhood aktual; 0 berarti unavailable.
+                solana_latency_ms,
+                arbitrum_latency_ms: robinhood_latency_ms,
+                base_latency_ms: 0,
                 tracked_wallets_count: total_tracked_count,
                 active_positions_count,
                 wallet_sol_balance,
@@ -865,18 +1112,68 @@ async fn main() -> Result<()> {
                 min_whale_buy_usd: config_hb.min_whale_buy_usd,
                 is_live_mode: !config_hb.dry_run,
                 wallet_pubkey,
+                heartbeat_timestamp_unix: Utc::now().timestamp(),
+                solana_rpc_requests: sol_exec_hb.rpc_health_snapshot().0,
+                solana_rpc_successes: sol_exec_hb.rpc_health_snapshot().1,
+                solana_rpc_rate_limited: sol_exec_hb.rpc_health_snapshot().2,
+                solana_rpc_failures: sol_exec_hb.rpc_health_snapshot().3,
+                robinhood_rpc_requests: rpc_requests,
+                robinhood_rpc_successes: rpc_successes,
+                robinhood_rpc_rate_limited: rpc_rate_limited,
+                robinhood_rpc_failures: rpc_failures,
+                qualified_wallets_count: qualified_wallets.len(),
+                polled_wallets_count: polled_counter_hb.load(Ordering::Relaxed),
+                global_scanned_wallets_count: global_scanned_counter_hb.load(Ordering::Relaxed),
+                candidate_wallets_count: candidate_counter_hb.load(Ordering::Relaxed),
             };
-            let _ = ipc_heartbeat.broadcast(&hb);
+            if let Err(error) = ipc_heartbeat.broadcast(&hb) {
+                eprintln!("[IPC ERROR] Heartbeat gagal: {error}");
+            }
 
             // Sync qualified elite target wallets (Tier-S & Tier-A only) and trade executions audit log every 4 seconds
-            if sync_tick % 2 == 0 {
+            if sync_tick.is_multiple_of(2) {
                 if !qualified_wallets.is_empty() {
-                    let _ = ipc_heartbeat.broadcast(&IpcMessage::WalletSync {
+                    if let Err(error) = ipc_heartbeat.broadcast(&IpcMessage::WalletSync {
                         wallets: qualified_wallets,
-                    });
+                    }) {
+                        eprintln!("[IPC ERROR] WalletSync gagal: {error}");
+                    }
                 }
-                if let Ok(trades) = db_heartbeat.get_recent_trades(50) {
-                    let _ = ipc_heartbeat.broadcast(&IpcMessage::TradeSync { trades });
+                match db_heartbeat.get_recent_trades(50) {
+                    Ok(trades) => {
+                        if let Err(error) =
+                            ipc_heartbeat.broadcast(&IpcMessage::TradeSync { trades })
+                        {
+                            eprintln!("[IPC ERROR] TradeSync gagal: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[HEARTBEAT DB ERROR] Recent trades unavailable: {error}");
+                    }
+                }
+                match db_heartbeat.get_recent_activities(50) {
+                    Ok(activities) => {
+                        if let Err(error) =
+                            ipc_heartbeat.broadcast(&IpcMessage::ActivitySync { activities })
+                        {
+                            eprintln!("[IPC ERROR] ActivitySync gagal: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[HEARTBEAT DB ERROR] Recent activities unavailable: {error}");
+                    }
+                }
+                match db_heartbeat.get_recent_signals(50) {
+                    Ok(signals) => {
+                        if let Err(error) =
+                            ipc_heartbeat.broadcast(&IpcMessage::SignalSync { signals })
+                        {
+                            eprintln!("[IPC ERROR] SignalSync gagal: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[HEARTBEAT DB ERROR] Recent signals unavailable: {error}");
+                    }
                 }
             }
 

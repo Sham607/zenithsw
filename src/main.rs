@@ -17,38 +17,7 @@ use zenithsw::tui::{render_ui, App};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::load().unwrap_or_else(|_| Config {
-        solana_rpc_url: "".to_string(),
-        solana_ws_url: "".to_string(),
-        solana_private_key: None,
-        robinhood_rpc_url: "".to_string(),
-        robinhood_ws_url: "".to_string(),
-        robinhood_api_key: None,
-        evm_private_key: None,
-        fomo_auth_token: None,
-        fomo_sync_interval_sec: 60,
-        stream_poll_interval_ms: 500,
-        max_price_delta_pct: 5.0,
-        min_liquidity_usd: 30000.0,
-        position_size_usd: 15.0,
-        min_whale_buy_usd: 250.0,
-        max_price_impact_pct: 15.0,
-        min_market_cap_usd: 50000.0,
-        max_market_cap_usd: 20000000.0,
-        trailing_stop_pct: 10.0,
-        stop_loss_pct: 15.0,
-        take_profit_pct: 50.0,
-        shadow_exit_enabled: true,
-        confluence_mode: "TIER_S_OR_DUAL_A".to_string(),
-        dry_run: true,
-        live_robinhood_enabled: false,
-        enable_solana: true,
-        enable_robinhood: false,
-        enable_base: false,
-        trading_db_path: "data/trading_state.db".to_string(),
-        wallet_db_path: "data/wallet_registry.db".to_string(),
-        ipc_socket_path: "/tmp/zenithsw.sock".to_string(),
-    });
+    let config = Config::load()?;
 
     let app = Arc::new(Mutex::new(App::new()));
     if let Ok(mut state) = app.lock() {
@@ -66,24 +35,25 @@ async fn main() -> Result<()> {
     let enable_rh = config.enable_robinhood;
     let enable_base = config.enable_base;
 
-    // Populate initial state from local SQLite database if available
-    if let Ok(db) = SmartWalletDb::new_with_wallet_path(
-        &config.trading_db_path,
-        &config.wallet_db_path,
-    ) {
-        if let Ok(mut state) = app.lock() {
-            if let Ok(mut wallets) = db.get_qualified_wallets() {
+    // Populate initial state from the authoritative local SQLite database.
+    // A failed open is fatal; rendering a partial/default state would break
+    // Engine/TUI synchronization.
+    let db = SmartWalletDb::new_with_wallet_path(&config.trading_db_path, &config.wallet_db_path)?;
+    if let Ok(mut state) = app.lock() {
+        match db.get_qualified_wallets() {
+            Ok(mut wallets) => {
                 wallets.retain(|w| match w.chain {
                     Chain::Solana => enable_sol,
                     Chain::Robinhood => enable_rh,
                     Chain::Base => enable_base,
                     _ => false,
                 });
-                if !wallets.is_empty() {
-                    state.wallets = wallets;
-                }
+                state.wallets = wallets;
             }
-            if let Ok(mut tokens) = db.get_tracked_tokens(50) {
+            Err(error) => state.add_log(format!("TUI DB wallets stale: {error}")),
+        }
+        match db.get_tracked_tokens(50) {
+            Ok(mut tokens) => {
                 tokens.retain(|t| match t.chain {
                     Chain::Solana => enable_sol,
                     Chain::Robinhood => enable_rh,
@@ -92,7 +62,10 @@ async fn main() -> Result<()> {
                 });
                 state.tracked_tokens = tokens;
             }
-            if let Ok(mut positions) = db.get_active_positions() {
+            Err(error) => state.add_log(format!("TUI DB tracked_tokens stale: {error}")),
+        }
+        match db.get_active_positions() {
+            Ok(mut positions) => {
                 positions.retain(|p| match p.chain {
                     Chain::Solana => enable_sol,
                     Chain::Robinhood => enable_rh,
@@ -101,7 +74,10 @@ async fn main() -> Result<()> {
                 });
                 state.positions = positions;
             }
-            if let Ok(mut trades) = db.get_recent_trades(50) {
+            Err(error) => state.add_log(format!("TUI DB positions stale: {error}")),
+        }
+        match db.get_recent_trades(50) {
+            Ok(mut trades) => {
                 trades.retain(|t| match t.chain {
                     Chain::Solana => enable_sol,
                     Chain::Robinhood => enable_rh,
@@ -110,6 +86,7 @@ async fn main() -> Result<()> {
                 });
                 state.trades = trades;
             }
+            Err(error) => state.add_log(format!("TUI DB trades stale: {error}")),
         }
     }
 
@@ -118,10 +95,9 @@ async fn main() -> Result<()> {
     let trading_db_path_sync = config.trading_db_path.clone();
     let wallet_db_path_sync = config.wallet_db_path.clone();
     tokio::spawn(async move {
-        if let Ok(db) = SmartWalletDb::new_with_wallet_path(
-            &trading_db_path_sync,
-            &wallet_db_path_sync,
-        ) {
+        if let Ok(db) =
+            SmartWalletDb::new_with_wallet_path(&trading_db_path_sync, &wallet_db_path_sync)
+        {
             loop {
                 if let Ok(mut state) = app_db_sync.lock() {
                     if let Ok(mut wallets) = db.get_qualified_wallets() {
@@ -131,54 +107,69 @@ async fn main() -> Result<()> {
                             Chain::Base => enable_base,
                             _ => false,
                         });
-                        if !wallets.is_empty() {
-                            state.wallets = wallets;
+                        state.wallets = wallets;
+                    }
+                    match db.get_tracked_tokens(50) {
+                        Ok(mut tokens) => {
+                            tokens.retain(|t| match t.chain {
+                                Chain::Solana => enable_sol,
+                                Chain::Robinhood => enable_rh,
+                                Chain::Base => enable_base,
+                                _ => false,
+                            });
+                            state.tracked_tokens = tokens;
+                        }
+                        Err(error) => {
+                            state.add_log(format!("TUI DB tracked_tokens stale: {error}"))
                         }
                     }
-                    if let Ok(mut tokens) = db.get_tracked_tokens(50) {
-                        tokens.retain(|t| match t.chain {
-                            Chain::Solana => enable_sol,
-                            Chain::Robinhood => enable_rh,
-                            Chain::Base => enable_base,
-                            _ => false,
-                        });
-                        state.tracked_tokens = tokens;
+                    match db.get_active_positions() {
+                        Ok(mut positions) => {
+                            positions.retain(|p| match p.chain {
+                                Chain::Solana => enable_sol,
+                                Chain::Robinhood => enable_rh,
+                                Chain::Base => enable_base,
+                                _ => false,
+                            });
+                            state.positions = positions;
+                        }
+                        Err(error) => state.add_log(format!("TUI DB positions stale: {error}")),
                     }
-                    if let Ok(mut positions) = db.get_active_positions() {
-                        positions.retain(|p| match p.chain {
-                            Chain::Solana => enable_sol,
-                            Chain::Robinhood => enable_rh,
-                            Chain::Base => enable_base,
-                            _ => false,
-                        });
-                        state.positions = positions;
+                    match db.get_recent_trades(50) {
+                        Ok(mut trades) => {
+                            trades.retain(|t| match t.chain {
+                                Chain::Solana => enable_sol,
+                                Chain::Robinhood => enable_rh,
+                                Chain::Base => enable_base,
+                                _ => false,
+                            });
+                            state.trades = trades;
+                        }
+                        Err(error) => state.add_log(format!("TUI DB trades stale: {error}")),
                     }
-                    if let Ok(mut trades) = db.get_recent_trades(50) {
-                        trades.retain(|t| match t.chain {
-                            Chain::Solana => enable_sol,
-                            Chain::Robinhood => enable_rh,
-                            Chain::Base => enable_base,
-                            _ => false,
-                        });
-                        state.trades = trades;
+                    match db.get_recent_activities(50) {
+                        Ok(mut acts) => {
+                            acts.retain(|a| match a.chain {
+                                Chain::Solana => enable_sol,
+                                Chain::Robinhood => enable_rh,
+                                Chain::Base => enable_base,
+                                _ => false,
+                            });
+                            state.activities = acts;
+                        }
+                        Err(error) => state.add_log(format!("TUI DB activities stale: {error}")),
                     }
-                    if let Ok(mut acts) = db.get_recent_activities(50) {
-                        acts.retain(|a| match a.chain {
-                            Chain::Solana => enable_sol,
-                            Chain::Robinhood => enable_rh,
-                            Chain::Base => enable_base,
-                            _ => false,
-                        });
-                        state.activities = acts;
-                    }
-                    if let Ok(mut sigs) = db.get_recent_signals(50) {
-                        sigs.retain(|s| match s.chain {
-                            Chain::Solana => enable_sol,
-                            Chain::Robinhood => enable_rh,
-                            Chain::Base => enable_base,
-                            _ => false,
-                        });
-                        state.signals = sigs;
+                    match db.get_recent_signals(50) {
+                        Ok(mut sigs) => {
+                            sigs.retain(|s| match s.chain {
+                                Chain::Solana => enable_sol,
+                                Chain::Robinhood => enable_rh,
+                                Chain::Base => enable_base,
+                                _ => false,
+                            });
+                            state.signals = sigs;
+                        }
+                        Err(error) => state.add_log(format!("TUI DB signals stale: {error}")),
                     }
                 }
                 sleep(Duration::from_millis(1500)).await;
@@ -198,15 +189,16 @@ async fn main() -> Result<()> {
                 .connect_and_listen(
                     move || {
                         if let Ok(mut state) = app_conn.lock() {
-                            state.is_connected_ipc = true;
+                            // Socket connected belum membuktikan heartbeat engine valid.
+                            state.is_connected_ipc = false;
                         }
                     },
                     move |msg| {
                         if let Ok(mut state) = app_cb.lock() {
-                            state.is_connected_ipc = true;
                             match msg {
                                 IpcMessage::Heartbeat {
                                     uptime_secs,
+                                    heartbeat_seq,
                                     solana_latency_ms,
                                     arbitrum_latency_ms,
                                     base_latency_ms,
@@ -222,51 +214,135 @@ async fn main() -> Result<()> {
                                     min_whale_buy_usd,
                                     is_live_mode,
                                     wallet_pubkey,
+                                    heartbeat_timestamp_unix,
+                                    solana_rpc_requests,
+                                    solana_rpc_successes,
+                                    solana_rpc_rate_limited,
+                                    solana_rpc_failures,
+                                    robinhood_rpc_requests,
+                                    robinhood_rpc_successes,
+                                    robinhood_rpc_rate_limited,
+                                    robinhood_rpc_failures,
+                                    qualified_wallets_count,
+                                    polled_wallets_count,
+                                    global_scanned_wallets_count,
+                                    candidate_wallets_count,
                                     ..
                                 } => {
+                                    state.is_connected_ipc = true;
+                                    state.heartbeat_received_at = Some(std::time::Instant::now());
+                                    state.heartbeat_timestamp_unix = heartbeat_timestamp_unix;
+                                    state.heartbeat_seq = heartbeat_seq;
                                     state.uptime_secs = uptime_secs;
                                     state.solana_latency_ms = solana_latency_ms;
                                     state.arbitrum_latency_ms = arbitrum_latency_ms;
                                     state.base_latency_ms = base_latency_ms;
-                                    if wallet_sol_balance > 0.0 || wallet_equity_usd > 0.0 {
-                                        state.wallet_sol_balance = wallet_sol_balance;
-                                        state.sol_price_usd = sol_price_usd;
-                                        state.wallet_equity_usd = wallet_equity_usd;
-                                        state.total_realized_pnl_usd = total_realized_pnl_usd;
-                                    }
-                                    if min_liquidity_usd > 0.0 {
-                                        state.min_liquidity_usd = min_liquidity_usd;
-                                        state.max_price_delta_pct = max_price_delta_pct;
-                                        state.position_size_usd = position_size_usd;
-                                        state.stop_loss_pct = stop_loss_pct;
-                                        state.take_profit_pct = take_profit_pct;
-                                        state.min_whale_buy_usd = min_whale_buy_usd;
-                                        state.is_live_mode = is_live_mode;
-                                        state.wallet_pubkey = wallet_pubkey;
-                                    }
+                                    state.wallet_sol_balance = wallet_sol_balance;
+                                    state.sol_price_usd = sol_price_usd;
+                                    state.wallet_equity_usd = wallet_equity_usd;
+                                    state.total_realized_pnl_usd = total_realized_pnl_usd;
+                                    state.min_liquidity_usd = min_liquidity_usd;
+                                    state.max_price_delta_pct = max_price_delta_pct;
+                                    state.position_size_usd = position_size_usd;
+                                    state.stop_loss_pct = stop_loss_pct;
+                                    state.take_profit_pct = take_profit_pct;
+                                    state.min_whale_buy_usd = min_whale_buy_usd;
+                                    state.is_live_mode = is_live_mode;
+                                    state.wallet_pubkey = wallet_pubkey;
+                                    state.solana_rpc_requests = solana_rpc_requests;
+                                    state.solana_rpc_successes = solana_rpc_successes;
+                                    state.solana_rpc_rate_limited = solana_rpc_rate_limited;
+                                    state.solana_rpc_failures = solana_rpc_failures;
+                                    state.robinhood_rpc_requests = robinhood_rpc_requests;
+                                    state.robinhood_rpc_successes = robinhood_rpc_successes;
+                                    state.robinhood_rpc_rate_limited = robinhood_rpc_rate_limited;
+                                    state.robinhood_rpc_failures = robinhood_rpc_failures;
+                                    state.qualified_wallets_count = qualified_wallets_count;
+                                    state.polled_wallets_count = polled_wallets_count;
+                                    state.global_scanned_wallets_count =
+                                        global_scanned_wallets_count;
+                                    state.candidate_wallets_count = candidate_wallets_count;
                                 }
-                                IpcMessage::WalletSync { wallets } => {
+                                IpcMessage::WalletSync { mut wallets } => {
+                                    wallets.retain(|wallet| match wallet.chain {
+                                        Chain::Solana => enable_sol,
+                                        Chain::Robinhood => enable_rh,
+                                        Chain::Base => enable_base,
+                                        _ => false,
+                                    });
                                     state.wallets = wallets;
                                 }
-                                IpcMessage::TrackedTokensUpdate { tokens } => {
+                                IpcMessage::TrackedTokensUpdate { mut tokens } => {
+                                    tokens.retain(|token| match token.chain {
+                                        Chain::Solana => enable_sol,
+                                        Chain::Robinhood => enable_rh,
+                                        Chain::Base => enable_base,
+                                        _ => false,
+                                    });
                                     state.tracked_tokens = tokens;
                                 }
                                 IpcMessage::ActivityBroadcast { activity } => {
-                                    state.activities.push(activity);
-                                    if state.activities.len() > 100 {
-                                        state.activities.remove(0);
+                                    let enabled = match activity.chain {
+                                        Chain::Solana => enable_sol,
+                                        Chain::Robinhood => enable_rh,
+                                        Chain::Base => enable_base,
+                                        _ => false,
+                                    };
+                                    if enabled {
+                                        state.activities.push(activity);
+                                        if state.activities.len() > 100 {
+                                            state.activities.remove(0);
+                                        }
                                     }
+                                }
+                                IpcMessage::ActivitySync { mut activities } => {
+                                    activities.retain(|activity| match activity.chain {
+                                        Chain::Solana => enable_sol,
+                                        Chain::Robinhood => enable_rh,
+                                        Chain::Base => enable_base,
+                                        _ => false,
+                                    });
+                                    state.activities = activities;
                                 }
                                 IpcMessage::SignalBroadcast { signal } => {
-                                    state.signals.push(signal);
-                                    if state.signals.len() > 100 {
-                                        state.signals.remove(0);
+                                    let enabled = match signal.chain {
+                                        Chain::Solana => enable_sol,
+                                        Chain::Robinhood => enable_rh,
+                                        Chain::Base => enable_base,
+                                        _ => false,
+                                    };
+                                    if enabled {
+                                        state.signals.push(signal);
+                                        if state.signals.len() > 100 {
+                                            state.signals.remove(0);
+                                        }
                                     }
                                 }
-                                IpcMessage::PositionUpdate { positions } => {
+                                IpcMessage::SignalSync { mut signals } => {
+                                    signals.retain(|signal| match signal.chain {
+                                        Chain::Solana => enable_sol,
+                                        Chain::Robinhood => enable_rh,
+                                        Chain::Base => enable_base,
+                                        _ => false,
+                                    });
+                                    state.signals = signals;
+                                }
+                                IpcMessage::PositionUpdate { mut positions } => {
+                                    positions.retain(|position| match position.chain {
+                                        Chain::Solana => enable_sol,
+                                        Chain::Robinhood => enable_rh,
+                                        Chain::Base => enable_base,
+                                        _ => false,
+                                    });
                                     state.positions = positions;
                                 }
-                                IpcMessage::TradeSync { trades } => {
+                                IpcMessage::TradeSync { mut trades } => {
+                                    trades.retain(|trade| match trade.chain {
+                                        Chain::Solana => enable_sol,
+                                        Chain::Robinhood => enable_rh,
+                                        Chain::Base => enable_base,
+                                        _ => false,
+                                    });
                                     state.trades = trades;
                                 }
                                 IpcMessage::EngineLog { message, .. } => {

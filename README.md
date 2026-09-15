@@ -2,7 +2,7 @@
 
 ZenithSW adalah engine *shadow copy-trading* multi-chain dengan daemon engine terpisah dan dashboard TUI Ratatui. Fokus implementasi saat ini adalah Solana dan fondasi eksekusi read-only Robinhood Chain.
 
-> **Status penting:** Solana memiliki jalur mirror execution yang lebih lengkap. Robinhood masih dalam tahap validasi dry-run dan **belum siap untuk copy-trade live**. `send_raw_transaction` tetap fail-closed.
+> **Status penting:** fondasi lokal, konfigurasi fail-closed, database, IPC, runtime harness, dan code gates tervalidasi. Solana memiliki jalur mirror execution yang lebih lengkap. Robinhood masih dalam validasi dry-run dan **belum siap untuk copy-trade live**. Belum ada canary on-chain dengan rekonsiliasi receipt, event, saldo, dan posisi.
 
 ## Arsitektur
 
@@ -38,6 +38,7 @@ TUI juga melakukan refresh database berkala. Status IPC harus dibedakan dari sna
 - Posisi satu token digabung dengan VWAP.
 - Re-entry dari whale yang sama saat posisi masih terbuka ditolak.
 - Exit parsial mengikuti proporsi penjualan whale.
+- Transaction aggregator yang dipakai untuk BUY harus menyediakan serialized transaction; blockhash diparse dari transaction yang benar-benar akan ditandatangani, bukan dari RPC `getLatestBlockhash` yang diambil terpisah.
 
 ### Robinhood Chain
 
@@ -82,6 +83,17 @@ Aturan umum yang dipakai lintas executor:
 
 Parameter runtime dibaca dari `.env`/secret manager melalui `Config::load()`. Gunakan `.env.example` sebagai referensi nama variabel. Jangan commit `.env`, private key, API key, atau database runtime.
 
+Default konfigurasi aman yang diuji:
+
+```text
+DRY_RUN=true
+LIVE_ROBINHOOD_ENABLED=false
+ENABLE_BASE=false
+IPC_SOCKET_PATH=/tmp/zenithsw.sock
+```
+
+Loader fail-closed memvalidasi boolean, angka, URL, interval, path absolut, chain scope, konflik mode, market-cap range, dan path database duplikat. Nilai invalid tidak diganti fallback diam-diam.
+
 ## Mode dry-run Robinhood
 
 Runner dry-run eksplisit tersedia sebagai:
@@ -110,6 +122,38 @@ chain validation
 
 `ROBINHOOD_POOL_INIT_BLOCK` opsional, tetapi disarankan bila block Initialize sudah diketahui agar tidak melakukan scan log besar berulang. Nominal dry-run di atas hanya berlaku untuk proses tersebut dan bukan konfigurasi strategi permanen.
 
+## Sinkronisasi Engine–TUI
+
+TUI hanya menampilkan engine online setelah menerima heartbeat aktual yang masih fresh. Heartbeat membawa sequence monoton, timestamp, mode, equity engine, parameter runtime, wallet scope, dan RPC health counters.
+
+Snapshot periodik berikut mengganti state lama TUI setelah chain filtering:
+
+- `WalletSync`
+- `TrackedTokensUpdate`
+- `PositionUpdate`
+- `TradeSync`
+- `ActivitySync`
+- `SignalSync`
+
+`ActivityBroadcast` dan `SignalBroadcast` tetap digunakan untuk event latency rendah. Snapshot periodik mencegah state activity/signal tertinggal ketika event terlewat atau IPC reconnect. Runtime harness Engine → IPC → DB telah lulus pada DB/socket terisolasi dan `DRY_RUN=true`.
+
+## Durable execution intent
+
+Execution intent memisahkan lifecycle niat transaksi dari lifecycle posisi:
+
+```text
+INTENT
+→ QUOTED
+→ SIMULATED
+→ SIGNED
+→ BROADCASTED
+→ PENDING_RECONCILIATION
+→ CONFIRMED
+→ RECONCILED
+```
+
+Status ambigu diarahkan ke `UNKNOWN`; posisi `OPEN` tidak digunakan sebagai pengganti bukti rekonsiliasi intent. Jalur Robinhood BUY menyimpan quote block, calldata hash, expiry, dan simulation evidence sebelum signing. Jalur Solana aggregator memparse recent blockhash dari serialized transaction aktual sebelum metadata disimpan dan signing dilakukan.
+
 ## Status eksekusi Robinhood
 
 Sebelum disebut siap live, jalur berikut wajib lulus pada data on-chain aktual:
@@ -128,13 +172,14 @@ PoolKey valid
 → persist posisi
 ```
 
-Saat ini fondasi RPC, discovery, encoder, dan test sudah tersedia. BUY dry-run masih memerlukan verifikasi provider/quote yang stabil; SELL on-chain dan live reconciliation Robinhood belum selesai. Jangan mengaktifkan Robinhood untuk copy-trade produksi berdasarkan test/build saja.
+Fondasi RPC, discovery, encoder, durable intent, dan test sudah tersedia. SELL on-chain dan live reconciliation Robinhood belum selesai. Jangan mengaktifkan Robinhood untuk copy-trade produksi berdasarkan test/build saja.
 
 ## Database
 
 ```text
-data/trading_state.db   posisi, signal, activity, trade history, tracked token
+data/trading_state.db   posisi, signal, activity, trade history, tracked token, execution intents
 data/wallet_registry.db registry smart wallet
+data/candidate_wallet_registry.db kandidat belum dipromosikan
 ```
 
 Kedua database memakai SQLite WAL. Jangan menghapus atau mereset database tanpa backup dan persetujuan eksplisit. `make reset` bersifat destruktif terhadap state runtime dan tidak boleh dipakai sembarangan.
@@ -142,22 +187,11 @@ Kedua database memakai SQLite WAL. Jangan menghapus atau mereset database tanpa 
 ## Menjalankan
 
 ```bash
-# Build optimized binaries
 make release
-
-# Test suite
 make test
-
-# Jalankan engine daemon
 make engine
-
-# Jalankan engine + TUI
 make start
-
-# Hentikan engine
 make stop
-
-# Restart engine
 make restart
 ```
 
@@ -173,12 +207,15 @@ robinhood-dry-run     read-only Robinhood BUY simulation runner
 ## Verifikasi sebelum commit/release
 
 ```bash
-cargo test --locked
-cargo build --release --locked
+mise exec rust@1.94.1 -- cargo fmt --all -- --check
+mise exec rust@1.94.1 -- cargo check --locked
+mise exec rust@1.94.1 -- cargo test --locked
+mise exec rust@1.94.1 -- cargo clippy --all-targets -- -D warnings
+mise exec rust@1.94.1 -- cargo build --release --locked
 git diff --check
 ```
 
-Warnings compiler harus dipisahkan dari failure. Lulus test/build tidak sama dengan bukti transaksi live.
+Verifikasi terbaru: **76 test lulus, 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
 
 ## Credential dan keamanan
 
@@ -187,3 +224,4 @@ Warnings compiler harus dipisahkan dari failure. Lulus test/build tidak sama den
 - Credential yang pernah dikirim melalui chat harus dirotasi sebelum live.
 - Jangan menonaktifkan verifikasi TLS untuk mengatasi masalah endpoint.
 - Live broadcast memerlukan canary eksplisit: token, nominal, arah transaksi, batas gas/slippage, dan izin broadcast.
+- Jika metadata quote, expiry, price, liquidity, receipt, event, atau saldo tidak dapat diverifikasi, engine harus berhenti fail-closed.

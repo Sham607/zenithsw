@@ -7,7 +7,8 @@ use zenithsw::gating::ConfluenceEngine;
 use zenithsw::indexer::scoring::ReputationScorer;
 use zenithsw::ingestion::{FomoScraper, WalletResolver};
 use zenithsw::models::{
-    ActivityType, Chain, ExecutionTrack, ShadowPosition, ShadowSignal, SmartWallet, TrackedToken, WalletActivity, WalletTier,
+    ActivityType, Chain, ExecutionTrack, ShadowPosition, ShadowSignal, SmartWallet, TrackedToken,
+    WalletActivity, WalletTier,
 };
 
 fn seed_test_token(
@@ -68,6 +69,7 @@ fn get_mock_config() -> Config {
         enable_base: false,
         trading_db_path: ":memory:".to_string(),
         wallet_db_path: ":memory:".to_string(),
+        candidate_db_path: ":memory:".to_string(),
         ipc_socket_path: "/tmp/zenithsw_test.sock".to_string(),
     }
 }
@@ -616,7 +618,8 @@ async fn test_multi_whale_averaging_and_same_whale_reentry_accumulation() {
     );
 
     // Executor HARUS memblokir karena whale1 sudah berkontribusi ke posisi ini
-    let pos1_reentry: Option<ShadowPosition> = sol_exec.execute_shadow_buy(&sig1_repeat).await.unwrap();
+    let pos1_reentry: Option<ShadowPosition> =
+        sol_exec.execute_shadow_buy(&sig1_repeat).await.unwrap();
     assert!(
         pos1_reentry.is_none(),
         "Same-whale re-entry HARUS diblokir oleh executor — 1 whale = 1 kontribusi per posisi terbuka"
@@ -624,8 +627,14 @@ async fn test_multi_whale_averaging_and_same_whale_reentry_accumulation() {
 
     // Verifikasi posisi tidak berubah setelah attempt re-entry
     let positions_after_block = db.get_active_positions().unwrap();
-    let unchanged = positions_after_block.iter().find(|p| p.token_mint == mint).unwrap();
-    assert_eq!(unchanged.amount_usd, 10.0, "Posisi tidak boleh berubah setelah same-whale re-entry diblokir");
+    let unchanged = positions_after_block
+        .iter()
+        .find(|p| p.token_mint == mint)
+        .unwrap();
+    assert_eq!(
+        unchanged.amount_usd, 10.0,
+        "Posisi tidak boleh berubah setelah same-whale re-entry diblokir"
+    );
 
     // 3. Whale 2 (DIFFERENT WHALE) buys Token at $0.020 -> MUST BE ALLOWED & AVERAGED IN!
     let act2 = WalletActivity {

@@ -18,7 +18,8 @@ pub const V3_SWAP_ROUTER_02: &str = "0xcaf681a66d020601342297493863e78c959e5cb2"
 pub const USDG: &str = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
 pub const STATE_VIEW: &str = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b";
 pub const WETH9: &str = "0x0Bd7D308f8E1639FAb988df18A8011F41EAcAD73";
-pub const ERC20_TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+pub const ERC20_TRANSFER_TOPIC: &str =
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 pub const ERC20_APPROVE_SELECTOR: &str = "0x095ea7b3";
 pub const ERC20_BALANCE_OF_SELECTOR: &str = "0x70a08231";
 pub const CHAINLINK_LATEST_ROUND_DATA_SELECTOR: &str = "0xfeaf968c";
@@ -28,7 +29,8 @@ pub const UI_MULTIPLIER_SELECTOR: &str = "0xa60bf13d";
 pub const PERMIT2_ALLOWANCE_SELECTOR: &str = "0xcc53287f";
 pub const PERMIT2_DOMAIN_NAME: &str = "Permit2";
 pub const ROBINHOOD_ASSETS_API: &str = "https://api.robinhood.com/rhj/assets";
-pub const V4_INITIALIZE_TOPIC: &str = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
+pub const V4_INITIALIZE_TOPIC: &str =
+    "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
 pub const PONS_V2_LAUNCH_ROUTER: &str = "0xe33e9e479df8802cb0866d5d05258bec4cf62948";
 pub const PONS_V2_GRADUATION_EXECUTOR: &str = "0xc7819b64a1daecd7ec19856d026cb14efbd89046";
 
@@ -51,40 +53,107 @@ pub struct ClassifiedRobinhoodReceipt {
     pub token_contracts: Vec<String>,
 }
 
+/// Memastikan receipt yang diterima memang milik transaction hash intent.
+/// Replacement transaction harus melewati reconciliation eksplisit; tidak
+/// boleh dianggap confirmed hanya karena receipt lain berhasil.
+pub fn validate_receipt_transaction_hash(expected_tx_hash: &str, receipt: &Value) -> Result<()> {
+    if !is_tx_hash(expected_tx_hash) {
+        bail!("expected transaction hash invalid");
+    }
+    let actual = receipt
+        .get("transactionHash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("receipt transactionHash missing"))?;
+    if !is_tx_hash(actual) || !actual.eq_ignore_ascii_case(expected_tx_hash) {
+        bail!("receipt transaction hash mismatch");
+    }
+    Ok(())
+}
+
+fn is_tx_hash(value: &str) -> bool {
+    value.len() == 66
+        && value.starts_with("0x")
+        && value[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Classifies only evidence present in a successful receipt. A token transfer
 /// without a known venue remains TransferOnly and must not create a BUY signal.
-pub fn classify_robinhood_receipt(receipt: &Value, wallet: &str) -> Result<ClassifiedRobinhoodReceipt> {
-    if !is_address(wallet) { bail!("invalid wallet address"); }
+pub fn classify_robinhood_receipt(
+    receipt: &Value,
+    wallet: &str,
+) -> Result<ClassifiedRobinhoodReceipt> {
+    if !is_address(wallet) {
+        bail!("invalid wallet address");
+    }
     let success = receipt.get("status").and_then(Value::as_str) == Some("0x1");
     if !success {
-        return Ok(ClassifiedRobinhoodReceipt { venue: RobinhoodVenue::Unknown, success: false, has_transfer: false, token_contracts: Vec::new() });
+        return Ok(ClassifiedRobinhoodReceipt {
+            venue: RobinhoodVenue::Unknown,
+            success: false,
+            has_transfer: false,
+            token_contracts: Vec::new(),
+        });
     }
-    let logs = receipt.get("logs").and_then(Value::as_array).ok_or_else(|| anyhow::anyhow!("receipt logs missing"))?;
+    let logs = receipt
+        .get("logs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("receipt logs missing"))?;
     let mut has_transfer = false;
     let mut contracts = Vec::new();
     let mut venue = match receipt.get("to").and_then(Value::as_str).unwrap_or("") {
-        address if address.eq_ignore_ascii_case(PONS_V2_LAUNCH_ROUTER) => RobinhoodVenue::PonsV2Curve,
-        address if address.eq_ignore_ascii_case(PONS_V2_GRADUATION_EXECUTOR) => RobinhoodVenue::PonsV2GraduatedV4,
+        address if address.eq_ignore_ascii_case(PONS_V2_LAUNCH_ROUTER) => {
+            RobinhoodVenue::PonsV2Curve
+        }
+        address if address.eq_ignore_ascii_case(PONS_V2_GRADUATION_EXECUTOR) => {
+            RobinhoodVenue::PonsV2GraduatedV4
+        }
         address if address.eq_ignore_ascii_case(V3_SWAP_ROUTER_02) => RobinhoodVenue::UniswapV3,
-        address if address.eq_ignore_ascii_case(UNIVERSAL_ROUTER) => RobinhoodVenue::PonsV2GraduatedV4,
+        address if address.eq_ignore_ascii_case(UNIVERSAL_ROUTER) => {
+            RobinhoodVenue::PonsV2GraduatedV4
+        }
         _ => RobinhoodVenue::TransferOnly,
     };
     for log in logs {
         let address = log.get("address").and_then(Value::as_str).unwrap_or("");
-        let topics = log.get("topics").and_then(Value::as_array).cloned().unwrap_or_default();
+        let topics = log
+            .get("topics")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let topic0 = topics.first().and_then(Value::as_str).unwrap_or("");
         if topic0.eq_ignore_ascii_case(ERC20_TRANSFER_TOPIC) {
             has_transfer = true;
-            if is_address(address) && !contracts.iter().any(|v: &String| v.eq_ignore_ascii_case(address)) { contracts.push(address.to_string()); }
+            if is_address(address)
+                && !contracts
+                    .iter()
+                    .any(|v: &String| v.eq_ignore_ascii_case(address))
+            {
+                contracts.push(address.to_string());
+            }
         }
-        if address.eq_ignore_ascii_case(PONS_V2_LAUNCH_ROUTER) { venue = RobinhoodVenue::PonsV2Curve; }
-        else if address.eq_ignore_ascii_case(PONS_V2_GRADUATION_EXECUTOR) { venue = RobinhoodVenue::PonsV2GraduatedV4; }
-        else if address.eq_ignore_ascii_case(UNIVERSAL_ROUTER) && topic0.starts_with("0x40e9cecb") { venue = RobinhoodVenue::UniswapV4; }
-        else if address.eq_ignore_ascii_case(V3_SWAP_ROUTER_02) { venue = RobinhoodVenue::UniswapV3; }
-        else if address.eq_ignore_ascii_case(POOL_MANAGER_V4) && topic0.starts_with("0x40e9cecb") { venue = RobinhoodVenue::UniswapV4; }
+        if address.eq_ignore_ascii_case(PONS_V2_LAUNCH_ROUTER) {
+            venue = RobinhoodVenue::PonsV2Curve;
+        } else if address.eq_ignore_ascii_case(PONS_V2_GRADUATION_EXECUTOR) {
+            venue = RobinhoodVenue::PonsV2GraduatedV4;
+        } else if address.eq_ignore_ascii_case(UNIVERSAL_ROUTER) && topic0.starts_with("0x40e9cecb")
+        {
+            venue = RobinhoodVenue::UniswapV4;
+        } else if address.eq_ignore_ascii_case(V3_SWAP_ROUTER_02) {
+            venue = RobinhoodVenue::UniswapV3;
+        } else if address.eq_ignore_ascii_case(POOL_MANAGER_V4) && topic0.starts_with("0x40e9cecb")
+        {
+            venue = RobinhoodVenue::UniswapV4;
+        }
     }
-    if !has_transfer { venue = RobinhoodVenue::Unknown; }
-    Ok(ClassifiedRobinhoodReceipt { venue, success: true, has_transfer, token_contracts: contracts })
+    if !has_transfer {
+        venue = RobinhoodVenue::Unknown;
+    }
+    Ok(ClassifiedRobinhoodReceipt {
+        venue,
+        success: true,
+        has_transfer,
+        token_contracts: contracts,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,12 +167,16 @@ pub struct V4InitializedPool {
 impl V4PoolKey {
     pub fn validate(&self) -> Result<()> {
         for address in [&self.currency0, &self.currency1, &self.hooks] {
-            if !is_address(address) { bail!("V4 PoolKey contains an invalid address"); }
+            if !is_address(address) {
+                bail!("V4 PoolKey contains an invalid address");
+            }
         }
         if self.currency0.to_lowercase() >= self.currency1.to_lowercase() {
             bail!("V4 PoolKey currencies are not strictly ordered");
         }
-        if self.fee > 1_000_000 { bail!("V4 pool fee exceeds 1_000_000"); }
+        if self.fee > 1_000_000 {
+            bail!("V4 pool fee exceeds 1_000_000");
+        }
         if self.tick_spacing < -8_388_608 || self.tick_spacing > 8_388_607 {
             bail!("V4 tick spacing does not fit int24");
         }
@@ -121,9 +194,10 @@ impl V4InitializedPool {
 }
 
 fn is_hex_bytes32(value: &str) -> bool {
-    value.starts_with("0x") && value.len() == 66 && value[2..].chars().all(|c| c.is_ascii_hexdigit())
+    value.starts_with("0x")
+        && value.len() == 66
+        && value[2..].chars().all(|c| c.is_ascii_hexdigit())
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvmTransactionPlan {
@@ -140,13 +214,26 @@ pub struct EvmTransactionPlan {
 
 impl EvmTransactionPlan {
     pub fn validate_dry_run(&self) -> Result<()> {
-        if !is_address(&self.from) || !is_address(&self.to) { bail!("transaction address is invalid"); }
-        if !is_hex_quantity(&self.value) || !is_hex_quantity(&self.nonce)
-            || !is_hex_quantity(&self.gas_limit) || !is_hex_quantity(&self.gas_price)
-            || !is_hex_quantity(&self.chain_id) { bail!("transaction quantity is invalid"); }
-        if !self.data.starts_with("0x") || self.data.len() < 10 { bail!("transaction calldata is missing"); }
-        if self.chain_id != ROBINHOOD_CHAIN_ID_HEX { bail!("transaction chain id is not Robinhood 4663"); }
-        if self.broadcast_allowed { bail!("dry-run transaction cannot allow broadcast"); }
+        if !is_address(&self.from) || !is_address(&self.to) {
+            bail!("transaction address is invalid");
+        }
+        if !is_hex_quantity(&self.value)
+            || !is_hex_quantity(&self.nonce)
+            || !is_hex_quantity(&self.gas_limit)
+            || !is_hex_quantity(&self.gas_price)
+            || !is_hex_quantity(&self.chain_id)
+        {
+            bail!("transaction quantity is invalid");
+        }
+        if !self.data.starts_with("0x") || self.data.len() < 10 {
+            bail!("transaction calldata is missing");
+        }
+        if self.chain_id != ROBINHOOD_CHAIN_ID_HEX {
+            bail!("transaction chain id is not Robinhood 4663");
+        }
+        if self.broadcast_allowed {
+            bail!("dry-run transaction cannot allow broadcast");
+        }
         Ok(())
     }
 }
@@ -184,8 +271,15 @@ pub struct Permit2Eip712Request {
 
 impl Permit2Eip712Request {
     pub fn validate(&self, now_unix: u64) -> Result<()> {
-        for address in [&self.owner, &self.token, &self.spender, &self.verifying_contract] {
-            if !is_address(address) { bail!("Permit2 EIP-712 address invalid"); }
+        for address in [
+            &self.owner,
+            &self.token,
+            &self.spender,
+            &self.verifying_contract,
+        ] {
+            if !is_address(address) {
+                bail!("Permit2 EIP-712 address invalid");
+            }
         }
         if self.chain_id != 4663 || !self.verifying_contract.eq_ignore_ascii_case(PERMIT2) {
             bail!("Permit2 EIP-712 domain chain/verifying contract invalid");
@@ -243,25 +337,61 @@ pub struct RobinhoodAssetMetadata {
 impl RobinhoodAssetMetadata {
     pub fn from_api_value(value: &Value) -> Result<Self> {
         let uid = value.get("id").and_then(Value::as_str).unwrap_or("");
-        let symbol = value.get("tokenSymbol").and_then(Value::as_str).unwrap_or("");
-        let multiplier = value.get("currentMultiplier").and_then(Value::as_str).unwrap_or("");
+        let symbol = value
+            .get("tokenSymbol")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let multiplier = value
+            .get("currentMultiplier")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let status = value.get("status").and_then(Value::as_str).unwrap_or("");
-        let deployment = value.get("deployments").and_then(Value::as_array).and_then(|items|
-            items.iter().find(|item| item.get("chainId").and_then(Value::as_u64) == Some(4663))
-        ).ok_or_else(|| anyhow::anyhow!("asset has no Robinhood mainnet deployment"))?;
-        let contract_address = deployment.get("contractAddress").and_then(Value::as_str).unwrap_or("");
-        if !is_hex_bytes32(uid) || symbol.is_empty() || !is_address(contract_address)
-            || multiplier.is_empty() || status.is_empty() {
+        let deployment = value
+            .get("deployments")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("chainId").and_then(Value::as_u64) == Some(4663))
+            })
+            .ok_or_else(|| anyhow::anyhow!("asset has no Robinhood mainnet deployment"))?;
+        let contract_address = deployment
+            .get("contractAddress")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !is_hex_bytes32(uid)
+            || symbol.is_empty()
+            || !is_address(contract_address)
+            || multiplier.is_empty()
+            || status.is_empty()
+        {
             bail!("Robinhood asset metadata is incomplete");
         }
-        let capabilities = value.get("tradingCapabilities").and_then(|caps| {
-            Some(RobinhoodTradingCapabilities {
-                fractional_tradability: caps.get("fractionalTradability").and_then(Value::as_str).map(ToOwned::to_owned),
-                all_day_tradability: caps.get("allDayTradability").and_then(Value::as_str).map(ToOwned::to_owned),
-                extended_hours_fractional_tradability: caps.get("extendedHoursFractionalTradability").and_then(Value::as_bool),
-            })
-        });
-        Ok(Self { uid: uid.to_string(), symbol: symbol.to_string(), contract_address: contract_address.to_string(), chain_id: 4663, current_multiplier: multiplier.to_string(), status: status.to_string(), trading_capabilities: capabilities })
+        let capabilities =
+            value
+                .get("tradingCapabilities")
+                .map(|caps| RobinhoodTradingCapabilities {
+                    fractional_tradability: caps
+                        .get("fractionalTradability")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    all_day_tradability: caps
+                        .get("allDayTradability")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    extended_hours_fractional_tradability: caps
+                        .get("extendedHoursFractionalTradability")
+                        .and_then(Value::as_bool),
+                });
+        Ok(Self {
+            uid: uid.to_string(),
+            symbol: symbol.to_string(),
+            contract_address: contract_address.to_string(),
+            chain_id: 4663,
+            current_multiplier: multiplier.to_string(),
+            status: status.to_string(),
+            trading_capabilities: capabilities,
+        })
     }
 }
 
@@ -278,7 +408,11 @@ pub struct SequencerUptimeSnapshot {
 
 impl SequencerUptimeSnapshot {
     pub fn validate(&self) -> Result<()> {
-        if !is_address(&self.feed) || self.status > 1 || self.started_at == 0 || self.updated_at == 0 {
+        if !is_address(&self.feed)
+            || self.status > 1
+            || self.started_at == 0
+            || self.updated_at == 0
+        {
             bail!("sequencer uptime snapshot has invalid feed, status, or timestamp");
         }
         if self.heartbeat_secs == 0 || self.grace_period_secs == 0 {
@@ -321,10 +455,20 @@ impl ChainlinkPriceSnapshot {
 impl EvmBalanceSnapshot {
     pub fn validate(&self) -> Result<()> {
         for value in [&self.native_balance, &self.block] {
-            if !is_hex_quantity(value) { bail!("invalid balance snapshot quantity"); }
+            if !is_hex_quantity(value) {
+                bail!("invalid balance snapshot quantity");
+            }
         }
-        if let Some(value) = &self.token_balance_before { if !is_hex_quantity(value) { bail!("invalid token balance before"); } }
-        if let Some(value) = &self.token_balance_after { if !is_hex_quantity(value) { bail!("invalid token balance after"); } }
+        if let Some(value) = &self.token_balance_before {
+            if !is_hex_quantity(value) {
+                bail!("invalid token balance before");
+            }
+        }
+        if let Some(value) = &self.token_balance_after {
+            if !is_hex_quantity(value) {
+                bail!("invalid token balance after");
+            }
+        }
         Ok(())
     }
 }
@@ -344,16 +488,26 @@ pub struct UniversalRouterV4Plan {
 impl UniversalRouterV4Plan {
     pub fn validate(&self) -> Result<()> {
         for address in [&self.router, &self.permit2, &self.token_in, &self.token_out] {
-            if !is_address(address) { bail!("router plan contains invalid address"); }
+            if !is_address(address) {
+                bail!("router plan contains invalid address");
+            }
         }
-        if !self.router.eq_ignore_ascii_case(UNIVERSAL_ROUTER) || !self.permit2.eq_ignore_ascii_case(PERMIT2) {
+        if !self.router.eq_ignore_ascii_case(UNIVERSAL_ROUTER)
+            || !self.permit2.eq_ignore_ascii_case(PERMIT2)
+        {
             bail!("router plan targets an unapproved Robinhood deployment");
         }
         for quantity in [&self.amount_in, &self.amount_out_minimum] {
-            if !is_hex_quantity(quantity) || quantity == "0x0" { bail!("router plan quantity is invalid"); }
+            if !is_hex_quantity(quantity) || quantity == "0x0" {
+                bail!("router plan quantity is invalid");
+            }
         }
-        if self.token_in.eq_ignore_ascii_case(&self.token_out) || self.deadline == 0 { bail!("router plan token/deadline invalid"); }
-        if !self.calldata.starts_with("0x") || self.calldata.len() < 10 { bail!("router calldata missing"); }
+        if self.token_in.eq_ignore_ascii_case(&self.token_out) || self.deadline == 0 {
+            bail!("router plan token/deadline invalid");
+        }
+        if !self.calldata.starts_with("0x") || self.calldata.len() < 10 {
+            bail!("router calldata missing");
+        }
         Ok(())
     }
 }
@@ -393,20 +547,29 @@ pub struct UniversalRouterV4MultiHopSwap {
 
 impl UniversalRouterV4MultiHopSwap {
     pub fn encode_calldata(&self) -> Result<String> {
-        if !is_address(&self.currency_in) || self.path.is_empty() || self.amount_in == 0
-            || self.amount_out_minimum == 0 || self.deadline == 0 {
+        if !is_address(&self.currency_in)
+            || self.path.is_empty()
+            || self.amount_in == 0
+            || self.amount_out_minimum == 0
+            || self.deadline == 0
+        {
             bail!("invalid V4 multi-hop parameters");
         }
         for key in &self.path {
-            if !is_address(&key.intermediate_currency) || !is_address(&key.hooks)
-                || key.fee > 1_000_000 || key.tick_spacing < -8_388_608 || key.tick_spacing > 8_388_607 {
+            if !is_address(&key.intermediate_currency)
+                || !is_address(&key.hooks)
+                || key.fee > 1_000_000
+                || key.tick_spacing < -8_388_608
+                || key.tick_spacing > 8_388_607
+            {
                 bail!("invalid V4 PathKey");
             }
         }
         let swap_params = encode_v4_exact_input_multi(self)?;
         let settle = encode_currency_amount_payer(&self.currency_in, self.amount_in, true)?;
         let output = self.path.last().unwrap().intermediate_currency.clone();
-        let take = encode_currency_recipient_amount(&output, &self.recipient, self.amount_out_minimum)?;
+        let take =
+            encode_currency_recipient_amount(&output, &self.recipient, self.amount_out_minimum)?;
         let input = encode_v4_router_input(&[0x07, 0x0b, 0x0e], &[swap_params, settle, take]);
         let body = encode_execute_args(&[0x10], &[input], self.deadline);
         let mut out = function_selector("execute(bytes,bytes[],uint256)").to_vec();
@@ -415,8 +578,14 @@ impl UniversalRouterV4MultiHopSwap {
     }
 }
 
-fn encode_v4_quote_params(currency_in: &str, path: &[V4PathKey], amount_in: u128) -> Result<Vec<u8>> {
-    if !is_address(currency_in) || path.is_empty() || amount_in == 0 { bail!("invalid V4 quote parameters"); }
+fn encode_v4_quote_params(
+    currency_in: &str,
+    path: &[V4PathKey],
+    amount_in: u128,
+) -> Result<Vec<u8>> {
+    if !is_address(currency_in) || path.is_empty() || amount_in == 0 {
+        bail!("invalid V4 quote parameters");
+    }
     let mut tails = Vec::new();
     for key in path {
         let mut item = Vec::new();
@@ -437,7 +606,9 @@ fn encode_v4_quote_params(currency_in: &str, path: &[V4PathKey], amount_in: u128
         array.extend_from_slice(&abi_uint(offset as u128));
         offset += tail.len();
     }
-    for tail in tails { array.extend(tail); }
+    for tail in tails {
+        array.extend(tail);
+    }
     let mut out = Vec::new();
     out.extend_from_slice(&abi_address(currency_in));
     out.extend_from_slice(&abi_uint(96));
@@ -468,8 +639,10 @@ fn encode_v4_exact_input_multi(plan: &UniversalRouterV4MultiHopSwap) -> Result<V
         path.extend_from_slice(&abi_uint(offset as u128));
         offset += tail.len();
     }
-    for tail in path_tails { path.extend(tail); }
-    let min_prices = vec![0u8; 32 + 32 * 0];
+    for tail in path_tails {
+        path.extend(tail);
+    }
+    let min_prices = vec![0u8; 32];
     let mut out = Vec::new();
     out.extend_from_slice(&abi_address(&plan.currency_in));
     out.extend_from_slice(&abi_uint(160));
@@ -534,22 +707,36 @@ fn encode_v4_exact_input_single(plan: &UniversalRouterV4Swap) -> Result<Vec<u8>>
 }
 
 fn encode_two_words(address: &str, amount: u128) -> Result<Vec<u8>> {
-    if !is_address(address) || amount == 0 { bail!("invalid V4 settlement parameter"); }
+    if !is_address(address) || amount == 0 {
+        bail!("invalid V4 settlement parameter");
+    }
     let mut out = Vec::with_capacity(64);
     out.extend_from_slice(&abi_address(address));
     out.extend_from_slice(&abi_uint(amount));
     Ok(out)
 }
 
-fn encode_currency_amount_payer(address: &str, amount: u128, payer_is_user: bool) -> Result<Vec<u8>> {
-    if !is_address(address) || amount == 0 { bail!("invalid V4 settle parameter"); }
+fn encode_currency_amount_payer(
+    address: &str,
+    amount: u128,
+    payer_is_user: bool,
+) -> Result<Vec<u8>> {
+    if !is_address(address) || amount == 0 {
+        bail!("invalid V4 settle parameter");
+    }
     let mut out = encode_two_words(address, amount)?;
     out.extend_from_slice(&abi_bool(payer_is_user));
     Ok(out)
 }
 
-fn encode_currency_recipient_amount(address: &str, recipient: &str, amount: u128) -> Result<Vec<u8>> {
-    if !is_address(address) || !is_address(recipient) || amount == 0 { bail!("invalid V4 take parameter"); }
+fn encode_currency_recipient_amount(
+    address: &str,
+    recipient: &str,
+    amount: u128,
+) -> Result<Vec<u8>> {
+    if !is_address(address) || !is_address(recipient) || amount == 0 {
+        bail!("invalid V4 take parameter");
+    }
     let mut out = encode_two_words(address, amount)?;
     out[32..64].copy_from_slice(&abi_address(recipient));
     out.extend_from_slice(&abi_uint(amount));
@@ -589,7 +776,9 @@ fn encode_bytes(value: &[u8]) -> Vec<u8> {
 
 fn encode_bytes_array(values: &[Vec<u8>]) -> Vec<u8> {
     let mut tails = Vec::with_capacity(values.len());
-    for value in values { tails.push(encode_bytes(value)); }
+    for value in values {
+        tails.push(encode_bytes(value));
+    }
     let head_len = 32 + 32 * values.len();
     let mut out = Vec::new();
     out.extend_from_slice(&abi_uint(values.len() as u128));
@@ -598,14 +787,17 @@ fn encode_bytes_array(values: &[Vec<u8>]) -> Vec<u8> {
         out.extend_from_slice(&abi_uint(offset as u128));
         offset += tail.len();
     }
-    for tail in tails { out.extend(tail); }
+    for tail in tails {
+        out.extend(tail);
+    }
     out
 }
 
 fn pad_32(value: &mut Vec<u8>) {
-    while value.len() % 32 != 0 { value.push(0); }
+    while !value.len().is_multiple_of(32) {
+        value.push(0);
+    }
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V4PoolKey {
@@ -644,7 +836,9 @@ impl V4QuoteExactInputSingle {
             bail!("V4 tick spacing does not fit int24");
         }
 
-        let selector = function_selector("quoteExactInputSingle(((address,address,uint24,int24,address),bool,uint128,bytes))");
+        let selector = function_selector(
+            "quoteExactInputSingle(((address,address,uint24,int24,address),bool,uint128,bytes))",
+        );
         let mut encoded = Vec::with_capacity(4 + 32 * 8 + self.hook_data.len());
         encoded.extend_from_slice(&selector);
         // The single struct argument is a dynamic tuple because hookData is dynamic.
@@ -663,7 +857,9 @@ impl V4QuoteExactInputSingle {
         // ABI tail dipad relatif terhadap selector, bukan mem-pad selector.
         encoded.extend_from_slice(&abi_uint(self.hook_data.len() as u128));
         encoded.extend_from_slice(&self.hook_data);
-        while (encoded.len() - 4) % 32 != 0 { encoded.push(0); }
+        while (encoded.len() - 4) % 32 != 0 {
+            encoded.push(0);
+        }
         Ok(format!("0x{}", hex::encode(encoded)))
     }
 }
@@ -711,8 +907,12 @@ fn abi_bool(value: bool) -> [u8; 32] {
 }
 
 fn parse_first_abi_word(value: &str) -> Result<u128> {
-    let raw = value.strip_prefix("0x").ok_or_else(|| anyhow::anyhow!("invalid ABI output"))?;
-    if raw.len() < 64 { bail!("ABI output too short"); }
+    let raw = value
+        .strip_prefix("0x")
+        .ok_or_else(|| anyhow::anyhow!("invalid ABI output"))?;
+    if raw.len() < 64 {
+        bail!("ABI output too short");
+    }
     u128::from_str_radix(&raw[..64], 16).context("ABI amount overflow")
 }
 
@@ -784,7 +984,9 @@ pub struct EvmSwapReconciliation {
 impl EvmSwapReconciliation {
     pub fn validate_buy(&self) -> Result<()> {
         for address in [&self.token_in, &self.token_out] {
-            if !is_address(address) { bail!("swap reconciliation token address invalid"); }
+            if !is_address(address) {
+                bail!("swap reconciliation token address invalid");
+            }
         }
         if self.token_in.eq_ignore_ascii_case(&self.token_out) {
             bail!("swap reconciliation token addresses must differ");
@@ -793,9 +995,11 @@ impl EvmSwapReconciliation {
         let input_after = parse_quantity_u128(&self.input_balance_after)?;
         let output_before = parse_quantity_u128(&self.output_balance_before)?;
         let output_after = parse_quantity_u128(&self.output_balance_after)?;
-        let input_delta = input_before.checked_sub(input_after)
+        let input_delta = input_before
+            .checked_sub(input_after)
             .ok_or_else(|| anyhow::anyhow!("input balance increased during BUY"))?;
-        let output_delta = output_after.checked_sub(output_before)
+        let output_delta = output_after
+            .checked_sub(output_before)
             .ok_or_else(|| anyhow::anyhow!("output balance decreased during BUY"))?;
         if input_delta != self.actual_amount_in {
             bail!("input balance delta does not match actual fill");
@@ -834,25 +1038,38 @@ impl RobinhoodRpc {
     async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
         let payload = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
         let count = self.urls.len();
-        if count == 0 { bail!("Robinhood RPC pool kosong"); }
+        if count == 0 {
+            bail!("Robinhood RPC pool kosong");
+        }
         let start = self.rpc_index.fetch_add(1, Ordering::Relaxed) % count;
         let mut last_error = String::new();
         for offset in 0..count {
             let index = (start + offset) % count;
             let available = self.cooldowns.lock().unwrap()[index]
-                .map(|until| until <= Instant::now()).unwrap_or(true);
-            if !available { continue; }
-            let response = match self.client.post(&self.urls[index]).json(&payload).send().await {
+                .map(|until| until <= Instant::now())
+                .unwrap_or(true);
+            if !available {
+                continue;
+            }
+            let response = match self
+                .client
+                .post(&self.urls[index])
+                .json(&payload)
+                .send()
+                .await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     last_error = format!("endpoint {index} transport: {error}");
-                    self.cooldowns.lock().unwrap()[index] = Some(Instant::now() + Duration::from_secs(15));
+                    self.cooldowns.lock().unwrap()[index] =
+                        Some(Instant::now() + Duration::from_secs(15));
                     continue;
                 }
             };
             if response.status().as_u16() == 429 || response.status().is_server_error() {
                 last_error = format!("endpoint {index} HTTP {}", response.status());
-                self.cooldowns.lock().unwrap()[index] = Some(Instant::now() + Duration::from_secs(30));
+                self.cooldowns.lock().unwrap()[index] =
+                    Some(Instant::now() + Duration::from_secs(30));
                 continue;
             }
             if !response.status().is_success() {
@@ -864,7 +1081,9 @@ impl RobinhoodRpc {
                 last_error = format!("endpoint {index} RPC error: {error}");
                 continue;
             }
-            return response.get("result").cloned()
+            return response
+                .get("result")
+                .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Robinhood RPC {method} returned no result"));
         }
         bail!("Robinhood RPC {method} failed after pool rotation: {last_error}")
@@ -872,17 +1091,29 @@ impl RobinhoodRpc {
 
     /// Reads official Robinhood Stock Token metadata without using it as an execution price source.
     pub async fn asset_metadata(&self, contract_address: &str) -> Result<RobinhoodAssetMetadata> {
-        if !is_address(contract_address) { bail!("invalid Robinhood asset contract address"); }
-        let response = self.client.get(ROBINHOOD_ASSETS_API).send().await?.error_for_status()?;
+        if !is_address(contract_address) {
+            bail!("invalid Robinhood asset contract address");
+        }
+        let response = self
+            .client
+            .get(ROBINHOOD_ASSETS_API)
+            .send()
+            .await?
+            .error_for_status()?;
         let body: Value = response.json().await?;
-        let assets = body.get("assets").and_then(Value::as_array)
+        let assets = body
+            .get("assets")
+            .and_then(Value::as_array)
             .ok_or_else(|| anyhow::anyhow!("Robinhood assets API response missing assets"))?;
         for asset in assets {
             let metadata = match RobinhoodAssetMetadata::from_api_value(asset) {
                 Ok(metadata) => metadata,
                 Err(_) => continue,
             };
-            if metadata.contract_address.eq_ignore_ascii_case(contract_address) {
+            if metadata
+                .contract_address
+                .eq_ignore_ascii_case(contract_address)
+            {
                 return Ok(metadata);
             }
         }
@@ -892,7 +1123,9 @@ impl RobinhoodRpc {
     pub async fn block_number(&self) -> Result<String> {
         let result = self.rpc("eth_blockNumber", json!([])).await?;
         let value = result.as_str().unwrap_or("");
-        if !is_hex_quantity(value) { bail!("invalid block number returned by RPC"); }
+        if !is_hex_quantity(value) {
+            bail!("invalid block number returned by RPC");
+        }
         Ok(value.to_string())
     }
 
@@ -917,14 +1150,18 @@ impl RobinhoodRpc {
             json!([ERC20_TRANSFER_TOPIC, wallet_topic, Value::Null]),
             json!([ERC20_TRANSFER_TOPIC, Value::Null, wallet_topic]),
         ] {
-            let result = self.rpc(
-                "eth_getLogs",
-                json!([{"fromBlock": from_block, "toBlock": to_block, "topics": topics}]),
-            ).await?;
-            let values = result.as_array().ok_or_else(|| anyhow::anyhow!("invalid wallet transfer logs result"))?;
+            let result = self
+                .rpc(
+                    "eth_getLogs",
+                    json!([{"fromBlock": from_block, "toBlock": to_block, "topics": topics}]),
+                )
+                .await?;
+            let values = result
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("invalid wallet transfer logs result"))?;
             logs.extend(values.iter().cloned());
         }
-        logs.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        logs.sort_by_key(|a| a.to_string());
         logs.dedup_by(|a, b| a == b);
         Ok(logs)
     }
@@ -939,16 +1176,20 @@ impl RobinhoodRpc {
         if !is_hex_quantity(from_block) || !is_hex_quantity(to_block) || !is_address(token) {
             bail!("invalid token transfer log query");
         }
-        let result = self.rpc(
-            "eth_getLogs",
-            json!([{
-                "address": token,
-                "fromBlock": from_block,
-                "toBlock": to_block,
-                "topics": [ERC20_TRANSFER_TOPIC]
-            }]),
-        ).await?;
-        let logs = result.as_array().ok_or_else(|| anyhow::anyhow!("invalid token transfer logs result"))?;
+        let result = self
+            .rpc(
+                "eth_getLogs",
+                json!([{
+                    "address": token,
+                    "fromBlock": from_block,
+                    "toBlock": to_block,
+                    "topics": [ERC20_TRANSFER_TOPIC]
+                }]),
+            )
+            .await?;
+        let logs = result
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("invalid token transfer logs result"))?;
         Ok(logs.clone())
     }
 
@@ -968,11 +1209,19 @@ impl RobinhoodRpc {
             if !is_address(address) {
                 bail!("invalid token address for pool discovery");
             }
-            Some(format!("0x{}{}", "0".repeat(24), address[2..].to_lowercase()))
+            Some(format!(
+                "0x{}{}",
+                "0".repeat(24),
+                address[2..].to_lowercase()
+            ))
         } else {
             None
         };
-        let topic_indexes: Vec<usize> = if token_topic.is_some() { vec![2, 3] } else { vec![0] };
+        let topic_indexes: Vec<usize> = if token_topic.is_some() {
+            vec![2, 3]
+        } else {
+            vec![0]
+        };
         let mut all_logs = Vec::new();
         for topic_index in topic_indexes {
             let topics = match token_topic {
@@ -984,79 +1233,139 @@ impl RobinhoodRpc {
                 }
                 None => json!([V4_INITIALIZE_TOPIC]),
             };
-            let result = self.rpc("eth_getLogs", json!([{
-                "address": POOL_MANAGER_V4,
-                "fromBlock": from_block,
-                "toBlock": to_block,
-                "topics": topics
-            }])).await?;
-            let logs = result.as_array().ok_or_else(|| anyhow::anyhow!("invalid eth_getLogs result"))?;
+            let result = self
+                .rpc(
+                    "eth_getLogs",
+                    json!([{
+                        "address": POOL_MANAGER_V4,
+                        "fromBlock": from_block,
+                        "toBlock": to_block,
+                        "topics": topics
+                    }]),
+                )
+                .await?;
+            let logs = result
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("invalid eth_getLogs result"))?;
             all_logs.extend(logs.iter().cloned());
         }
-        all_logs.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        all_logs.sort_by_key(|a| a.to_string());
         all_logs.dedup_by(|a, b| a == b);
         Ok(all_logs)
     }
 
     pub fn parse_initialize_log(log: &Value) -> Result<V4InitializedPool> {
-        let topics = log.get("topics").and_then(Value::as_array).ok_or_else(|| anyhow::anyhow!("Initialize log topics missing"))?;
-        if topics.len() != 4 || topics.first().and_then(Value::as_str).unwrap_or("").to_lowercase() != V4_INITIALIZE_TOPIC {
+        let topics = log
+            .get("topics")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Initialize log topics missing"))?;
+        if topics.len() != 4
+            || topics
+                .first()
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase()
+                != V4_INITIALIZE_TOPIC
+        {
             bail!("not a V4 Initialize log");
         }
         let pool_id = topics[1].as_str().unwrap_or("").to_string();
-        let currency0 = format!("0x{}", topics[2].as_str().unwrap_or("").trim_start_matches("0x")[24..].to_string());
-        let currency1 = format!("0x{}", topics[3].as_str().unwrap_or("").trim_start_matches("0x")[24..].to_string());
+        let currency0 = format!(
+            "0x{}",
+            &topics[2].as_str().unwrap_or("").trim_start_matches("0x")[24..]
+        );
+        let currency1 = format!(
+            "0x{}",
+            &topics[3].as_str().unwrap_or("").trim_start_matches("0x")[24..]
+        );
         let data = log.get("data").and_then(Value::as_str).unwrap_or("");
         let words = data.strip_prefix("0x").unwrap_or("");
-        if words.len() < 192 || words.len() % 64 != 0 { bail!("Initialize log data malformed"); }
+        if words.len() < 192 || !words.len().is_multiple_of(64) {
+            bail!("Initialize log data malformed");
+        }
         let word = |index: usize| -> &str { &words[index * 64..(index + 1) * 64] };
         let fee = u32::from_str_radix(word(0), 16)?;
         let tick_raw = i32::from_str_radix(&word(1)[56..], 16)?;
-        let tick_spacing = if tick_raw & 0x0080_0000 != 0 { tick_raw | !0x00ff_ffff } else { tick_raw };
+        let tick_spacing = if tick_raw & 0x0080_0000 != 0 {
+            tick_raw | !0x00ff_ffff
+        } else {
+            tick_raw
+        };
         let hooks = format!("0x{}", &word(2)[24..]);
         let sqrt_price_x96 = format!("0x{}", word(3).trim_start_matches('0'));
         let tick = i32::from_str_radix(&word(4)[56..], 16)?;
-        let pool = V4InitializedPool { pool_id, pool_key: V4PoolKey { currency0, currency1, fee, tick_spacing, hooks }, sqrt_price_x96, tick };
+        let pool = V4InitializedPool {
+            pool_id,
+            pool_key: V4PoolKey {
+                currency0,
+                currency1,
+                fee,
+                tick_spacing,
+                hooks,
+            },
+            sqrt_price_x96,
+            tick,
+        };
         pool.validate()?;
         Ok(pool)
     }
 
     pub async fn get_balance(&self, address: &str, tag: &str) -> Result<String> {
-        if !is_address(address) || tag.trim().is_empty() { bail!("invalid balance query"); }
+        if !is_address(address) || tag.trim().is_empty() {
+            bail!("invalid balance query");
+        }
         let result = self.rpc("eth_getBalance", json!([address, tag])).await?;
         let value = result.as_str().unwrap_or("");
-        if !is_hex_quantity(value) { bail!("invalid balance returned by RPC"); }
+        if !is_hex_quantity(value) {
+            bail!("invalid balance returned by RPC");
+        }
         Ok(value.to_string())
     }
 
     pub async fn get_transaction_count(&self, address: &str, tag: &str) -> Result<String> {
-        if !is_address(address) || tag.trim().is_empty() { bail!("invalid nonce query"); }
-        let result = self.rpc("eth_getTransactionCount", json!([address, tag])).await?;
+        if !is_address(address) || tag.trim().is_empty() {
+            bail!("invalid nonce query");
+        }
+        let result = self
+            .rpc("eth_getTransactionCount", json!([address, tag]))
+            .await?;
         let value = result.as_str().unwrap_or("");
-        if !is_hex_quantity(value) { bail!("invalid nonce returned by RPC"); }
+        if !is_hex_quantity(value) {
+            bail!("invalid nonce returned by RPC");
+        }
         Ok(value.to_string())
     }
 
     pub async fn gas_price(&self) -> Result<String> {
         let result = self.rpc("eth_gasPrice", json!([])).await?;
         let value = result.as_str().unwrap_or("");
-        if !is_hex_quantity(value) { bail!("invalid gas price returned by RPC"); }
+        if !is_hex_quantity(value) {
+            bail!("invalid gas price returned by RPC");
+        }
         Ok(value.to_string())
     }
 
     pub async fn estimate_gas(&self, tx: &Value) -> Result<String> {
-        if !tx.is_object() { bail!("gas estimate transaction must be an object"); }
+        if !tx.is_object() {
+            bail!("gas estimate transaction must be an object");
+        }
         let result = self.rpc("eth_estimateGas", json!([tx, "latest"])).await?;
         let value = result.as_str().unwrap_or("");
-        if !is_hex_quantity(value) { bail!("invalid gas estimate returned by RPC"); }
+        if !is_hex_quantity(value) {
+            bail!("invalid gas estimate returned by RPC");
+        }
         Ok(value.to_string())
     }
 
     pub async fn eth_call(&self, tx: &Value) -> Result<String> {
-        if !tx.is_object() { bail!("eth_call transaction must be an object"); }
+        if !tx.is_object() {
+            bail!("eth_call transaction must be an object");
+        }
         let result = self.rpc("eth_call", json!([tx, "latest"])).await?;
         let value = result.as_str().unwrap_or("");
-        if value.is_empty() || value == "0x" { bail!("eth_call returned empty output"); }
+        if value.is_empty() || value == "0x" {
+            bail!("eth_call returned empty output");
+        }
         Ok(value.to_string())
     }
 
@@ -1069,14 +1378,23 @@ impl RobinhoodRpc {
         heartbeat_secs: u64,
         grace_period_secs: u64,
     ) -> Result<SequencerUptimeSnapshot> {
-        if !is_address(feed) { bail!("invalid sequencer uptime feed address"); }
-        let raw = self.eth_call(&json!({"to": feed, "data": CHAINLINK_LATEST_ROUND_DATA_SELECTOR})).await?;
+        if !is_address(feed) {
+            bail!("invalid sequencer uptime feed address");
+        }
+        let raw = self
+            .eth_call(&json!({"to": feed, "data": CHAINLINK_LATEST_ROUND_DATA_SELECTOR}))
+            .await?;
         let status = parse_abi_u64_word(&raw, 1)?;
         let started_at = parse_abi_u64_word(&raw, 2)?;
         let updated_at = parse_abi_u64_word(&raw, 3)?;
         let snapshot = SequencerUptimeSnapshot {
-            feed: feed.to_string(), status, started_at, updated_at, observed_at,
-            heartbeat_secs, grace_period_secs,
+            feed: feed.to_string(),
+            status,
+            started_at,
+            updated_at,
+            observed_at,
+            heartbeat_secs,
+            grace_period_secs,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -1091,17 +1409,26 @@ impl RobinhoodRpc {
         observed_at: u64,
         heartbeat_secs: u64,
     ) -> Result<ChainlinkPriceSnapshot> {
-        if !is_address(feed) { bail!("invalid Chainlink feed address"); }
-        if heartbeat_secs == 0 { bail!("Chainlink heartbeat must be non-zero"); }
-        let raw = self.eth_call(&json!({"to": feed, "data": CHAINLINK_LATEST_ROUND_DATA_SELECTOR})).await?;
+        if !is_address(feed) {
+            bail!("invalid Chainlink feed address");
+        }
+        if heartbeat_secs == 0 {
+            bail!("Chainlink heartbeat must be non-zero");
+        }
+        let raw = self
+            .eth_call(&json!({"to": feed, "data": CHAINLINK_LATEST_ROUND_DATA_SELECTOR}))
+            .await?;
         let answer = parse_positive_int256_word(&raw, 1)?;
         let updated_at = parse_abi_u64_word(&raw, 3)?;
-        let decimals_raw = self.eth_call(&json!({"to": feed, "data": CHAINLINK_DECIMALS_SELECTOR})).await?;
+        let decimals_raw = self
+            .eth_call(&json!({"to": feed, "data": CHAINLINK_DECIMALS_SELECTOR}))
+            .await?;
         let decimals = parse_abi_u64_word(&decimals_raw, 0)?;
         let snapshot = ChainlinkPriceSnapshot {
             feed: feed.to_string(),
             answer,
-            decimals: u8::try_from(decimals).map_err(|_| anyhow::anyhow!("Chainlink decimals exceed u8"))?,
+            decimals: u8::try_from(decimals)
+                .map_err(|_| anyhow::anyhow!("Chainlink decimals exceed u8"))?,
             updated_at,
             observed_at,
             heartbeat_secs,
@@ -1111,8 +1438,12 @@ impl RobinhoodRpc {
     }
 
     pub async fn token_oracle_paused(&self, token: &str) -> Result<bool> {
-        if !is_address(token) { bail!("invalid token address for oracle pause"); }
-        let raw = self.eth_call(&json!({"to": token, "data": ORACLE_PAUSED_SELECTOR})).await?;
+        if !is_address(token) {
+            bail!("invalid token address for oracle pause");
+        }
+        let raw = self
+            .eth_call(&json!({"to": token, "data": ORACLE_PAUSED_SELECTOR}))
+            .await?;
         match parse_abi_u64_word(&raw, 0)? {
             0 => Ok(false),
             1 => Ok(true),
@@ -1121,18 +1452,29 @@ impl RobinhoodRpc {
     }
 
     pub async fn token_ui_multiplier(&self, token: &str) -> Result<u128> {
-        if !is_address(token) { bail!("invalid token address for UI multiplier"); }
-        let raw = self.eth_call(&json!({"to": token, "data": UI_MULTIPLIER_SELECTOR})).await?;
+        if !is_address(token) {
+            bail!("invalid token address for UI multiplier");
+        }
+        let raw = self
+            .eth_call(&json!({"to": token, "data": UI_MULTIPLIER_SELECTOR}))
+            .await?;
         let multiplier = parse_abi_u128_word(&raw, 0)?;
-        if multiplier == 0 { bail!("token uiMultiplier is zero"); }
+        if multiplier == 0 {
+            bail!("token uiMultiplier is zero");
+        }
         Ok(multiplier)
     }
 
     pub async fn transaction_receipt(&self, tx_hash: &str) -> Result<Option<Value>> {
-        if !tx_hash.starts_with("0x") || tx_hash.len() != 66 || !tx_hash[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+        if !tx_hash.starts_with("0x")
+            || tx_hash.len() != 66
+            || !tx_hash[2..].chars().all(|c| c.is_ascii_hexdigit())
+        {
             bail!("invalid transaction hash");
         }
-        let result = self.rpc("eth_getTransactionReceipt", json!([tx_hash])).await?;
+        let result = self
+            .rpc("eth_getTransactionReceipt", json!([tx_hash]))
+            .await?;
         match result {
             Value::Null => Ok(None),
             receipt if receipt.is_object() => Ok(Some(receipt)),
@@ -1147,7 +1489,9 @@ impl RobinhoodRpc {
         max_attempts: usize,
         interval: Duration,
     ) -> Result<Option<Value>> {
-        if max_attempts == 0 { bail!("receipt polling max_attempts must be non-zero"); }
+        if max_attempts == 0 {
+            bail!("receipt polling max_attempts must be non-zero");
+        }
         for attempt in 0..max_attempts {
             if let Some(receipt) = self.transaction_receipt(tx_hash).await? {
                 return Ok(Some(receipt));
@@ -1163,34 +1507,62 @@ impl RobinhoodRpc {
         self.token_balance_of_at(token, owner, "latest").await
     }
 
-    pub async fn token_balance_of_at(&self, token: &str, owner: &str, block_tag: &str) -> Result<String> {
-        if !is_address(token) || !is_address(owner) || block_tag.trim().is_empty() { bail!("invalid token balance address or block tag"); }
+    pub async fn token_balance_of_at(
+        &self,
+        token: &str,
+        owner: &str,
+        block_tag: &str,
+    ) -> Result<String> {
+        if !is_address(token) || !is_address(owner) || block_tag.trim().is_empty() {
+            bail!("invalid token balance address or block tag");
+        }
         let mut data = function_selector("balanceOf(address)").to_vec();
         data.extend_from_slice(&abi_address(owner));
-        let result = self.rpc("eth_call", json!([{"to": token, "data": format!("0x{}", hex::encode(data))}, block_tag])).await?;
+        let result = self
+            .rpc(
+                "eth_call",
+                json!([{"to": token, "data": format!("0x{}", hex::encode(data))}, block_tag]),
+            )
+            .await?;
         let value = result.as_str().unwrap_or("");
-        if !is_hex_quantity(value) { bail!("invalid token balance returned by RPC"); }
+        if !is_hex_quantity(value) {
+            bail!("invalid token balance returned by RPC");
+        }
         Ok(value.to_string())
     }
 
     pub async fn token_allowance(&self, token: &str, owner: &str, spender: &str) -> Result<String> {
-        if !is_address(token) || !is_address(owner) || !is_address(spender) { bail!("invalid allowance address"); }
+        if !is_address(token) || !is_address(owner) || !is_address(spender) {
+            bail!("invalid allowance address");
+        }
         let mut data = function_selector("allowance(address,address)").to_vec();
         data.extend_from_slice(&abi_address(owner));
         data.extend_from_slice(&abi_address(spender));
-        self.eth_call(&json!({"to": token, "data": format!("0x{}", hex::encode(data))})).await
+        self.eth_call(&json!({"to": token, "data": format!("0x{}", hex::encode(data))}))
+            .await
     }
 
     /// Reads Permit2 allowance(owner, token, spender) => amount, expiration, nonce.
-    pub async fn permit2_allowance(&self, owner: &str, token: &str, spender: &str) -> Result<Permit2AllowanceSnapshot> {
-        if !is_address(owner) || !is_address(token) || !is_address(spender) { bail!("invalid Permit2 allowance address"); }
+    pub async fn permit2_allowance(
+        &self,
+        owner: &str,
+        token: &str,
+        spender: &str,
+    ) -> Result<Permit2AllowanceSnapshot> {
+        if !is_address(owner) || !is_address(token) || !is_address(spender) {
+            bail!("invalid Permit2 allowance address");
+        }
         let mut data = function_selector("allowance(address,address,address)").to_vec();
         data.extend_from_slice(&abi_address(owner));
         data.extend_from_slice(&abi_address(token));
         data.extend_from_slice(&abi_address(spender));
-        let raw = self.eth_call(&json!({"to": PERMIT2, "data": format!("0x{}", hex::encode(data))})).await?;
+        let raw = self
+            .eth_call(&json!({"to": PERMIT2, "data": format!("0x{}", hex::encode(data))}))
+            .await?;
         Ok(Permit2AllowanceSnapshot {
-            owner: owner.to_string(), token: token.to_string(), spender: spender.to_string(),
+            owner: owner.to_string(),
+            token: token.to_string(),
+            spender: spender.to_string(),
             amount: parse_abi_u128_word(&raw, 0)?,
             expiration: parse_abi_u64_word(&raw, 1)?,
             nonce: parse_abi_u64_word(&raw, 2)?,
@@ -1206,12 +1578,19 @@ impl RobinhoodRpc {
         path: &[V4PathKey],
         amount_in: u128,
     ) -> Result<u128> {
-        if !is_address(currency_in) || path.is_empty() || amount_in == 0 { bail!("invalid V4 multi-hop quote"); }
-        let mut data = function_selector("quoteExactInput((address,(address,uint24,int24,address,bytes)[],uint128))").to_vec();
+        if !is_address(currency_in) || path.is_empty() || amount_in == 0 {
+            bail!("invalid V4 multi-hop quote");
+        }
+        let mut data = function_selector(
+            "quoteExactInput((address,(address,uint24,int24,address,bytes)[],uint128))",
+        )
+        .to_vec();
         let encoded = encode_v4_quote_params(currency_in, path, amount_in)?;
         data.extend_from_slice(&abi_uint(32));
         data.extend(encoded);
-        let result = self.eth_call(&json!({"to": V4_QUOTER, "data": format!("0x{}", hex::encode(data))})).await?;
+        let result = self
+            .eth_call(&json!({"to": V4_QUOTER, "data": format!("0x{}", hex::encode(data))}))
+            .await?;
         parse_first_abi_word(&result)
     }
 
@@ -1223,22 +1602,36 @@ impl RobinhoodRpc {
         fee: u32,
     ) -> Result<u128> {
         for address in [token_in, token_out] {
-            if !is_address(address) { bail!("invalid V3 quote token address"); }
+            if !is_address(address) {
+                bail!("invalid V3 quote token address");
+            }
         }
-        if amount_in == 0 || fee > 1_000_000 { bail!("invalid V3 quote amount or fee"); }
-        let mut data = function_selector("quoteExactInputSingle((address,address,uint256,uint24,uint160))").to_vec();
+        if amount_in == 0 || fee > 1_000_000 {
+            bail!("invalid V3 quote amount or fee");
+        }
+        let mut data =
+            function_selector("quoteExactInputSingle((address,address,uint256,uint24,uint160))")
+                .to_vec();
         data.extend_from_slice(&abi_address(token_in));
         data.extend_from_slice(&abi_address(token_out));
         data.extend_from_slice(&abi_uint(amount_in));
         data.extend_from_slice(&abi_uint(fee as u128));
         data.extend_from_slice(&abi_uint(0));
-        let result = self.eth_call(&json!({"to": V3_QUOTER_V2, "data": format!("0x{}", hex::encode(data))})).await?;
+        let result = self
+            .eth_call(&json!({"to": V3_QUOTER_V2, "data": format!("0x{}", hex::encode(data))}))
+            .await?;
         parse_first_abi_word(&result)
     }
 
     /// Quotes a Uniswap V3 multi-hop via encoded path using QuoterV2.quoteExactInput.
-    pub async fn v3_quote_exact_input(&self, encoded_path_hex: &str, amount_in: u128) -> Result<u128> {
-        if amount_in == 0 { bail!("amount_in harus > 0"); }
+    pub async fn v3_quote_exact_input(
+        &self,
+        encoded_path_hex: &str,
+        amount_in: u128,
+    ) -> Result<u128> {
+        if amount_in == 0 {
+            bail!("amount_in harus > 0");
+        }
         let path_bytes = hex::decode(encoded_path_hex.trim_start_matches("0x"))
             .context("encoded_path bukan hex yang valid")?;
         // quoteExactInput(bytes path, uint256 amountIn)
@@ -1246,38 +1639,55 @@ impl RobinhoodRpc {
         // calldata: selector + offset_path(32) + amountIn(32) + path_len(32) + path_data
         let sel = function_selector("quoteExactInput(bytes,uint256)");
         let mut data = sel.to_vec();
-        data.extend_from_slice(&abi_uint(64u128));                       // offset of path = 2*32
+        data.extend_from_slice(&abi_uint(64u128)); // offset of path = 2*32
         data.extend_from_slice(&abi_uint(amount_in));
         data.extend_from_slice(&abi_uint(path_bytes.len() as u128));
         data.extend_from_slice(&path_bytes);
-        while data.len() % 32 != 0 { data.push(0); }
-        let result = self.eth_call(&json!({"to": V3_QUOTER_V2, "data": format!("0x{}", hex::encode(data))})).await?;
+        while !data.len().is_multiple_of(32) {
+            data.push(0);
+        }
+        let result = self
+            .eth_call(&json!({"to": V3_QUOTER_V2, "data": format!("0x{}", hex::encode(data))}))
+            .await?;
         parse_first_abi_word(&result)
     }
 
     /// Returns the V3 pool address for a token pair and fee tier.
     pub async fn v3_pool(&self, token_a: &str, token_b: &str, fee: u32) -> Result<String> {
         for address in [token_a, token_b] {
-            if !is_address(address) { bail!("invalid V3 pool token address"); }
+            if !is_address(address) {
+                bail!("invalid V3 pool token address");
+            }
         }
         let mut data = function_selector("getPool(address,address,uint24)").to_vec();
         data.extend_from_slice(&abi_address(token_a));
         data.extend_from_slice(&abi_address(token_b));
         data.extend_from_slice(&abi_uint(fee as u128));
-        let result = self.eth_call(&json!({"to": V3_FACTORY, "data": format!("0x{}", hex::encode(data))})).await?;
-        let raw = result.strip_prefix("0x").ok_or_else(|| anyhow::anyhow!("invalid V3 pool output"))?;
-        if raw.len() < 64 { bail!("V3 factory output too short"); }
+        let result = self
+            .eth_call(&json!({"to": V3_FACTORY, "data": format!("0x{}", hex::encode(data))}))
+            .await?;
+        let raw = result
+            .strip_prefix("0x")
+            .ok_or_else(|| anyhow::anyhow!("invalid V3 pool output"))?;
+        if raw.len() < 64 {
+            bail!("V3 factory output too short");
+        }
         let address = format!("0x{}", &raw[24..64]);
-        if address == "0x0000000000000000000000000000000000000000" { bail!("V3 pool does not exist"); }
+        if address == "0x0000000000000000000000000000000000000000" {
+            bail!("V3 pool does not exist");
+        }
         Ok(address)
     }
 
     /// Reads the V4 PoolManager slot0 state for a pool ID at the current latest block.
     pub async fn pool_slot0(&self, pool_id: &str) -> Result<String> {
-        if !is_hex_bytes32(pool_id) { bail!("invalid V4 pool id"); }
+        if !is_hex_bytes32(pool_id) {
+            bail!("invalid V4 pool id");
+        }
         let mut data = function_selector("getSlot0(bytes32)").to_vec();
         data.extend_from_slice(&hex::decode(&pool_id[2..])?);
-        self.eth_call(&json!({"to": POOL_MANAGER_V4, "data": format!("0x{}", hex::encode(data))})).await
+        self.eth_call(&json!({"to": POOL_MANAGER_V4, "data": format!("0x{}", hex::encode(data))}))
+            .await
     }
 
     /// Broadcasts one already-signed transaction through the RPC pool.
@@ -1286,9 +1696,7 @@ impl RobinhoodRpc {
         if !raw_tx.starts_with("0x") || raw_tx.len() <= 2 {
             bail!("signed raw transaction is empty or malformed");
         }
-        let result = self
-            .rpc("eth_sendRawTransaction", json!([raw_tx]))
-            .await?;
+        let result = self.rpc("eth_sendRawTransaction", json!([raw_tx])).await?;
         let hash = result.as_str().unwrap_or("");
         if !hash.starts_with("0x") || hash.len() != 66 {
             bail!("RPC returned invalid transaction hash");
@@ -1318,17 +1726,30 @@ impl RobinhoodRpc {
         let result = self.rpc("eth_chainId", json!([])).await?;
         let chain_id = result.as_str().unwrap_or("");
         if chain_id != ROBINHOOD_CHAIN_ID_HEX {
-            bail!("wrong Robinhood chain id: expected {}, got {}", ROBINHOOD_CHAIN_ID_HEX, chain_id);
+            bail!(
+                "wrong Robinhood chain id: expected {}, got {}",
+                ROBINHOOD_CHAIN_ID_HEX,
+                chain_id
+            );
         }
         Ok(chain_id.to_string())
     }
 
     pub async fn validate_deployments(&self) -> Result<()> {
-        for address in [POOL_MANAGER_V4, POSITION_MANAGER_V4, V4_QUOTER, UNIVERSAL_ROUTER, PERMIT2] {
+        for address in [
+            POOL_MANAGER_V4,
+            POSITION_MANAGER_V4,
+            V4_QUOTER,
+            UNIVERSAL_ROUTER,
+            PERMIT2,
+        ] {
             let result = self.rpc("eth_getCode", json!([address, "latest"])).await?;
             let code = result.as_str().unwrap_or("0x");
             if code == "0x" || code.is_empty() {
-                bail!("official Robinhood deployment has no contract code: {}", address);
+                bail!(
+                    "official Robinhood deployment has no contract code: {}",
+                    address
+                );
             }
         }
         Ok(())
@@ -1359,28 +1780,56 @@ impl RobinhoodRpc {
         if status != "0x1" {
             bail!("transaction receipt is not successful");
         }
-        let tx_hash = receipt.get("transactionHash").and_then(Value::as_str).unwrap_or("");
-        let block_number = receipt.get("blockNumber").and_then(Value::as_str).unwrap_or("");
+        let tx_hash = receipt
+            .get("transactionHash")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let block_number = receipt
+            .get("blockNumber")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let router = receipt.get("to").and_then(Value::as_str).unwrap_or("");
         if tx_hash.is_empty() || block_number.is_empty() || router.is_empty() {
             bail!("receipt missing transactionHash, blockNumber, or router");
         }
-        let logs = receipt.get("logs").and_then(Value::as_array).ok_or_else(|| anyhow::anyhow!("receipt missing logs"))?;
+        let logs = receipt
+            .get("logs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("receipt missing logs"))?;
         let mut has_transfer = false;
         let mut has_swap = false;
         let mut pool = String::new();
         let mut token_contracts: Vec<String> = Vec::new();
         for log in logs {
-            let address = log.get("address").and_then(Value::as_str).unwrap_or("").to_string();
-            let topics = log.get("topics").and_then(Value::as_array).cloned().unwrap_or_default();
-            let topic0 = topics.first().and_then(Value::as_str).unwrap_or("").to_lowercase();
+            let address = log
+                .get("address")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let topics = log
+                .get("topics")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let topic0 = topics
+                .first()
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase();
             if topic0 == ERC20_TRANSFER_TOPIC {
                 has_transfer = true;
-                if !address.is_empty() && !token_contracts.iter().any(|v| v.eq_ignore_ascii_case(&address)) {
+                if !address.is_empty()
+                    && !token_contracts
+                        .iter()
+                        .any(|v| v.eq_ignore_ascii_case(&address))
+                {
                     token_contracts.push(address.clone());
                 }
             }
-            if swap_topics.iter().any(|topic| topic.eq_ignore_ascii_case(&topic0)) {
+            if swap_topics
+                .iter()
+                .any(|topic| topic.eq_ignore_ascii_case(&topic0))
+            {
                 has_swap = true;
                 pool = address;
             }
@@ -1388,15 +1837,28 @@ impl RobinhoodRpc {
         if !has_transfer || !has_swap || pool.is_empty() {
             bail!("receipt does not contain a verified swap event");
         }
-        Ok(VerifiedSwap { tx_hash: tx_hash.to_string(), block_number: block_number.to_string(), router: router.to_string(), pool, token_contracts })
+        Ok(VerifiedSwap {
+            tx_hash: tx_hash.to_string(),
+            block_number: block_number.to_string(),
+            router: router.to_string(),
+            pool,
+            token_contracts,
+        })
     }
 }
 
 fn abi_word(value: &str, index: usize) -> Result<&str> {
-    let raw = value.strip_prefix("0x").ok_or_else(|| anyhow::anyhow!("ABI output missing 0x prefix"))?;
-    let start = index.checked_mul(64).ok_or_else(|| anyhow::anyhow!("ABI word offset overflow"))?;
-    let end = start.checked_add(64).ok_or_else(|| anyhow::anyhow!("ABI word end overflow"))?;
-    raw.get(start..end).ok_or_else(|| anyhow::anyhow!("ABI output missing word {index}"))
+    let raw = value
+        .strip_prefix("0x")
+        .ok_or_else(|| anyhow::anyhow!("ABI output missing 0x prefix"))?;
+    let start = index
+        .checked_mul(64)
+        .ok_or_else(|| anyhow::anyhow!("ABI word offset overflow"))?;
+    let end = start
+        .checked_add(64)
+        .ok_or_else(|| anyhow::anyhow!("ABI word end overflow"))?;
+    raw.get(start..end)
+        .ok_or_else(|| anyhow::anyhow!("ABI output missing word {index}"))
 }
 
 fn parse_abi_u128_word(value: &str, index: usize) -> Result<u128> {
@@ -1424,7 +1886,9 @@ fn parse_positive_int256_word(value: &str, index: usize) -> Result<u128> {
 }
 
 fn is_address(value: &str) -> bool {
-    value.len() == 42 && value.starts_with("0x") && value[2..].chars().all(|c| c.is_ascii_hexdigit())
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn is_hex_quantity(value: &str) -> bool {
@@ -1432,7 +1896,9 @@ fn is_hex_quantity(value: &str) -> bool {
 }
 
 fn parse_quantity_u128(value: &str) -> Result<u128> {
-    if !is_hex_quantity(value) { bail!("invalid hexadecimal quantity"); }
+    if !is_hex_quantity(value) {
+        bail!("invalid hexadecimal quantity");
+    }
     Ok(u128::from_str_radix(&value[2..], 16)?)
 }
 
@@ -1443,8 +1909,31 @@ mod tests {
 
     fn receipt(status: &str, swap: bool) -> Value {
         let mut logs = vec![json!({"address":"0xtoken","topics":[ERC20_TRANSFER_TOPIC]})];
-        if swap { logs.push(json!({"address":"0xpool","topics":["0xswap"]})); }
+        if swap {
+            logs.push(json!({"address":"0xpool","topics":["0xswap"]}));
+        }
         json!({"status":status,"transactionHash":"0xtx","blockNumber":"0x10","to":"0xrouter","logs":logs})
+    }
+
+    #[test]
+    fn receipt_transaction_hash_mismatch_is_rejected() {
+        let expected = format!("0x{}", "11".repeat(32));
+        let actual = format!("0x{}", "22".repeat(32));
+        let receipt = json!({"transactionHash": actual});
+        assert!(validate_receipt_transaction_hash(&expected, &receipt).is_err());
+    }
+
+    #[test]
+    fn receipt_transaction_hash_match_is_accepted_case_insensitively() {
+        let expected = format!("0x{}", "ab".repeat(32));
+        let receipt = json!({"transactionHash": format!("0x{}", expected[2..].to_uppercase())});
+        assert!(validate_receipt_transaction_hash(&expected, &receipt).is_ok());
+    }
+
+    #[test]
+    fn receipt_missing_transaction_hash_is_rejected() {
+        let expected = format!("0x{}", "11".repeat(32));
+        assert!(validate_receipt_transaction_hash(&expected, &json!({})).is_err());
     }
 
     fn quote(expires_at_unix: u64) -> RobinhoodQuote {
@@ -1513,8 +2002,18 @@ mod tests {
         let metadata = RobinhoodAssetMetadata::from_api_value(&asset).unwrap();
         assert_eq!(metadata.chain_id, 4663);
         assert_eq!(metadata.symbol, "TEST");
-        assert_eq!(metadata.contract_address, "0x0000000000000000000000000000000000000002");
-        assert_eq!(metadata.trading_capabilities.unwrap().all_day_tradability.as_deref(), Some("untradable"));
+        assert_eq!(
+            metadata.contract_address,
+            "0x0000000000000000000000000000000000000002"
+        );
+        assert_eq!(
+            metadata
+                .trading_capabilities
+                .unwrap()
+                .all_day_tradability
+                .as_deref(),
+            Some("untradable")
+        );
     }
 
     #[test]
@@ -1555,8 +2054,20 @@ mod tests {
             grace_period_secs: 300,
         };
         assert!(base.validate().is_err());
-        assert!(SequencerUptimeSnapshot { updated_at: 1, status: 0, ..base.clone() }.validate().is_err());
-        assert!(SequencerUptimeSnapshot { started_at: 800, status: 0, ..base }.validate().is_err());
+        assert!(SequencerUptimeSnapshot {
+            updated_at: 1,
+            status: 0,
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(SequencerUptimeSnapshot {
+            started_at: 800,
+            status: 0,
+            ..base
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -1598,7 +2109,9 @@ mod tests {
     }
 
     #[test]
-    fn transfer_only_is_rejected() { assert!(RobinhoodRpc::parse_verified_swap(&receipt("0x1", false), &["0xswap"]).is_err()); }
+    fn transfer_only_is_rejected() {
+        assert!(RobinhoodRpc::parse_verified_swap(&receipt("0x1", false), &["0xswap"]).is_err());
+    }
 
     #[test]
     fn classifier_keeps_unknown_transfer_fail_closed() {
@@ -1609,10 +2122,9 @@ mod tests {
                 "topics": [ERC20_TRANSFER_TOPIC]
             }]
         });
-        let classified = classify_robinhood_receipt(
-            &receipt,
-            "0x0000000000000000000000000000000000000001",
-        ).unwrap();
+        let classified =
+            classify_robinhood_receipt(&receipt, "0x0000000000000000000000000000000000000001")
+                .unwrap();
         assert_eq!(classified.venue, RobinhoodVenue::TransferOnly);
         assert!(classified.has_transfer);
     }
@@ -1626,14 +2138,15 @@ mod tests {
                 {"address": "0x0000000000000000000000000000000000000009", "topics": [ERC20_TRANSFER_TOPIC]}
             ]
         });
-        let classified = classify_robinhood_receipt(
-            &receipt,
-            "0x0000000000000000000000000000000000000001",
-        ).unwrap();
+        let classified =
+            classify_robinhood_receipt(&receipt, "0x0000000000000000000000000000000000000001")
+                .unwrap();
         assert_eq!(classified.venue, RobinhoodVenue::PonsV2Curve);
     }
     #[test]
-    fn failed_receipt_is_rejected() { assert!(RobinhoodRpc::parse_verified_swap(&receipt("0x0", true), &["0xswap"]).is_err()); }
+    fn failed_receipt_is_rejected() {
+        assert!(RobinhoodRpc::parse_verified_swap(&receipt("0x0", true), &["0xswap"]).is_err());
+    }
     #[test]
     fn successful_swap_is_accepted() {
         let parsed = RobinhoodRpc::parse_verified_swap(&receipt("0x1", true), &["0xswap"]).unwrap();
@@ -1756,7 +2269,10 @@ mod tests {
             actual_amount_out: 110,
             minimum_amount_out: 100,
         };
-        assert_eq!(reconciliation.fill_price_x18().unwrap(), 2_200_000_000_000_000_000);
+        assert_eq!(
+            reconciliation.fill_price_x18().unwrap(),
+            2_200_000_000_000_000_000
+        );
     }
 
     #[test]
@@ -1803,9 +2319,13 @@ mod tests {
     }
 
     #[test]
-    fn valid_quote_is_accepted() { assert!(quote(200).validate(100).is_ok()); }
+    fn valid_quote_is_accepted() {
+        assert!(quote(200).validate(100).is_ok());
+    }
     #[test]
-    fn expired_quote_is_rejected() { assert!(quote(100).validate(100).is_err()); }
+    fn expired_quote_is_rejected() {
+        assert!(quote(100).validate(100).is_err());
+    }
     #[test]
     fn zero_output_quote_is_rejected() {
         let mut q = quote(200);

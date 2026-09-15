@@ -1,14 +1,14 @@
 use crate::db::SmartWalletDb;
 use crate::models::{ActivityType, Chain, WalletActivity};
 use anyhow::Result;
-use futures_util::StreamExt;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
 use chrono::Utc;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 /// Envelope JSON yang dikeluarkan Nitro feed relay pada endpoint `/feed`.
 /// `l2Msg` adalah bytes ter-encode base64; bukan JSON raw transaction.
@@ -220,18 +220,34 @@ impl NitroIncomingMessage {
         }
         let bytes = self.decode_l2_msg()?;
         let raw = &bytes[1..];
-        if raw.is_empty() { anyhow::bail!("signed transaction payload is empty"); }
+        if raw.is_empty() {
+            anyhow::bail!("signed transaction payload is empty");
+        }
         let (tx_type, rlp) = if raw[0] == 0x01 || raw[0] == 0x02 {
             (raw[0], &raw[1..])
         } else {
             (0, raw)
         };
         let fields = decode_rlp_list(rlp)?;
-        let required_fields = match tx_type { 2 => 9, 1 => 8, 0 => 9, _ => 0 };
+        let required_fields = match tx_type {
+            2 => 9,
+            1 => 8,
+            0 => 9,
+            _ => 0,
+        };
         if fields.len() < required_fields {
             anyhow::bail!("signed transaction has insufficient RLP fields");
         }
-        let (chain_id_idx, nonce_idx, gas_limit_idx, max_priority, max_fee, to_idx, value_idx, data_idx) = match tx_type {
+        let (
+            chain_id_idx,
+            nonce_idx,
+            gas_limit_idx,
+            max_priority,
+            max_fee,
+            to_idx,
+            value_idx,
+            data_idx,
+        ) = match tx_type {
             2 => (Some(0), 1, 4, Some(2), Some(3), 5, 6, 7),
             1 => (Some(0), 1, 3, None, None, 4, 5, 6),
             0 => (None, 0, 2, None, None, 3, 4, 5),
@@ -243,14 +259,25 @@ impl NitroIncomingMessage {
             .unwrap_or(0);
         let nonce = rlp_u128(&fields[nonce_idx])? as u64;
         let gas_limit = rlp_u128(&fields[gas_limit_idx])? as u64;
-        let to = if fields[to_idx].is_empty() { None } else if fields[to_idx].len() == 20 { Some(format!("0x{}", hex::encode(&fields[to_idx]))) } else { anyhow::bail!("transaction to field is not 20 bytes"); };
+        let to = if fields[to_idx].is_empty() {
+            None
+        } else if fields[to_idx].len() == 20 {
+            Some(format!("0x{}", hex::encode(&fields[to_idx])))
+        } else {
+            anyhow::bail!("transaction to field is not 20 bytes");
+        };
         let value = rlp_u128(&fields[value_idx])?;
         let data = fields[data_idx].clone();
         Ok(DecodedSignedNitroTransaction {
-            tx_type, chain_id, nonce, gas_limit,
+            tx_type,
+            chain_id,
+            nonce,
+            gas_limit,
             max_priority_fee_per_gas: max_priority.map(|i| rlp_u128(&fields[i])).transpose()?,
             max_fee_per_gas: max_fee.map(|i| rlp_u128(&fields[i])).transpose()?,
-            to, value, data,
+            to,
+            value,
+            data,
         })
     }
 }
@@ -324,7 +351,9 @@ fn read_nitro_u128(input: &[u8], cursor: &mut usize, field: &str) -> Result<u128
 
 fn decode_rlp_list(input: &[u8]) -> Result<Vec<Vec<u8>>> {
     let (payload, consumed) = rlp_payload(input)?;
-    if consumed != input.len() { anyhow::bail!("RLP list has trailing bytes"); }
+    if consumed != input.len() {
+        anyhow::bail!("RLP list has trailing bytes");
+    }
     let mut values = Vec::new();
     let mut offset = 0;
     while offset < payload.len() {
@@ -336,7 +365,9 @@ fn decode_rlp_list(input: &[u8]) -> Result<Vec<Vec<u8>>> {
 }
 
 fn rlp_payload(input: &[u8]) -> Result<(Vec<u8>, usize)> {
-    let first = *input.first().ok_or_else(|| anyhow::anyhow!("RLP input empty"))?;
+    let first = *input
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("RLP input empty"))?;
     if first <= 0x7f {
         return Ok((vec![first], 1));
     }
@@ -355,35 +386,57 @@ fn rlp_payload(input: &[u8]) -> Result<(Vec<u8>, usize)> {
         .checked_add(payload_len)
         .ok_or_else(|| anyhow::anyhow!("RLP length overflow"))?;
     if end > input.len() {
-        anyhow::bail!(if is_list { "RLP list truncated" } else { "RLP bytes truncated" });
+        anyhow::bail!(if is_list {
+            "RLP list truncated"
+        } else {
+            "RLP bytes truncated"
+        });
     }
-    if is_list {
-        Ok((input[payload_start..end].to_vec(), end))
-    } else {
-        Ok((input[payload_start..end].to_vec(), end))
-    }
+    let _ = is_list;
+    Ok((input[payload_start..end].to_vec(), end))
 }
 
 fn read_len(input: &[u8], start: usize, count: usize) -> Result<usize> {
-    if count == 0 || count > 8 || start + count > input.len() { anyhow::bail!("invalid RLP length"); }
+    if count == 0 || count > 8 || start + count > input.len() {
+        anyhow::bail!("invalid RLP length");
+    }
     let mut value = 0usize;
-    for byte in &input[start..start+count] { value = value.checked_mul(256).and_then(|v| v.checked_add(*byte as usize)).ok_or_else(|| anyhow::anyhow!("RLP length overflow"))?; }
+    for byte in &input[start..start + count] {
+        value = value
+            .checked_mul(256)
+            .and_then(|v| v.checked_add(*byte as usize))
+            .ok_or_else(|| anyhow::anyhow!("RLP length overflow"))?;
+    }
     Ok(value)
 }
 
 fn rlp_u128(value: &[u8]) -> Result<u128> {
-    if value.len() > 16 { anyhow::bail!("RLP integer exceeds u128"); }
+    if value.len() > 16 {
+        anyhow::bail!("RLP integer exceeds u128");
+    }
     let mut out = 0u128;
-    for byte in value { out = out.checked_mul(256).and_then(|v| v.checked_add(*byte as u128)).ok_or_else(|| anyhow::anyhow!("RLP integer overflow"))?; }
+    for byte in value {
+        out = out
+            .checked_mul(256)
+            .and_then(|v| v.checked_add(*byte as u128))
+            .ok_or_else(|| anyhow::anyhow!("RLP integer overflow"))?;
+    }
     Ok(out)
 }
 
 fn is_evm_address(value: &str) -> bool {
-    value.len() == 42 && value.starts_with("0x") && value[2..].chars().all(|c| c.is_ascii_hexdigit())
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn parse_hex_quantity(value: &str) -> Result<u128> {
-    Ok(u128::from_str_radix(value.strip_prefix("0x").ok_or_else(|| anyhow::anyhow!("invalid hex quantity"))?, 16)?)
+    Ok(u128::from_str_radix(
+        value
+            .strip_prefix("0x")
+            .ok_or_else(|| anyhow::anyhow!("invalid hex quantity"))?,
+        16,
+    )?)
 }
 
 pub struct EvmStreamListener {
@@ -391,7 +444,6 @@ pub struct EvmStreamListener {
     rpc_index: AtomicUsize,
     rpc_cooldowns: Arc<Mutex<Vec<Option<Instant>>>>,
     chain: Chain,
-    last_hashes: Arc<Mutex<HashMap<String, String>>>,
     processed_hashes: Arc<Mutex<HashSet<String>>>,
     client: reqwest::Client,
     latest_block_cache: Arc<Mutex<Option<(u128, Instant)>>>,
@@ -418,7 +470,6 @@ impl EvmStreamListener {
             rpc_urls,
             rpc_index: AtomicUsize::new(0),
             chain,
-            last_hashes: Arc::new(Mutex::new(HashMap::new())),
             processed_hashes: Arc::new(Mutex::new(HashSet::new())),
             client,
             latest_block_cache: Arc::new(Mutex::new(None)),
@@ -437,7 +488,10 @@ impl EvmStreamListener {
         }
         for item in &payload.messages {
             if item.message.message.decode_l2_msg()?.is_empty() {
-                anyhow::bail!("sequencer feed message {} has empty l2Msg", item.sequence_number);
+                anyhow::bail!(
+                    "sequencer feed message {} has empty l2Msg",
+                    item.sequence_number
+                );
             }
         }
         Ok(payload)
@@ -477,18 +531,25 @@ impl EvmStreamListener {
                 Err(error) => {
                     consecutive_disconnects += 1;
                     if consecutive_disconnects >= 3 {
-                        return Err(anyhow::anyhow!("Nitro feed connection failed after retries: {error}"));
+                        return Err(anyhow::anyhow!(
+                            "Nitro feed connection failed after retries: {error}"
+                        ));
                     }
-                    tokio::time::sleep(Duration::from_millis(250 * consecutive_disconnects as u64)).await;
+                    tokio::time::sleep(Duration::from_millis(250 * consecutive_disconnects as u64))
+                        .await;
                     continue;
                 }
             };
             while let Some(frame) = socket.next().await {
-                let frame = frame.map_err(|error| anyhow::anyhow!("Nitro feed read failed: {error}"))?;
+                let frame =
+                    frame.map_err(|error| anyhow::anyhow!("Nitro feed read failed: {error}"))?;
                 let raw = match frame {
                     Message::Text(text) => text.to_string(),
-                    Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
-                        .map_err(|error| anyhow::anyhow!("Nitro feed binary frame is not UTF-8: {error}"))?,
+                    Message::Binary(bytes) => {
+                        String::from_utf8(bytes.to_vec()).map_err(|error| {
+                            anyhow::anyhow!("Nitro feed binary frame is not UTF-8: {error}")
+                        })?
+                    }
                     Message::Ping(_) | Message::Pong(_) => continue,
                     Message::Close(_) => break,
                     _ => continue,
@@ -545,7 +606,9 @@ impl EvmStreamListener {
         wallets: &[(String, String)],
         db: Arc<SmartWalletDb>,
     ) -> Result<Vec<WalletActivity>> {
-        use crate::chains::robinhood::{classify_robinhood_receipt, RobinhoodVenue, ERC20_TRANSFER_TOPIC};
+        use crate::chains::robinhood::{
+            classify_robinhood_receipt, RobinhoodVenue, ERC20_TRANSFER_TOPIC,
+        };
         if self.chain != Chain::Robinhood || wallets.is_empty() {
             return Ok(Vec::new());
         }
@@ -555,23 +618,34 @@ impl EvmStreamListener {
         let mut address_to_handle = HashMap::new();
         let mut wallet_topics = Vec::new();
         for (handle, address) in wallets {
-            if !is_evm_address(address) { continue; }
+            if !is_evm_address(address) {
+                continue;
+            }
             let topic = format!("0x{}{}", "0".repeat(24), address[2..].to_lowercase());
             wallet_topics.push(topic);
             address_to_handle.insert(address.to_lowercase(), handle.clone());
         }
-        if wallet_topics.is_empty() { return Ok(Vec::new()); }
+        if wallet_topics.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut logs = Vec::new();
         for topics in [
             json!([ERC20_TRANSFER_TOPIC, wallet_topics, Value::Null]),
             json!([ERC20_TRANSFER_TOPIC, Value::Null, wallet_topics]),
         ] {
-            let result = self.rpc_call("eth_getLogs", json!([{
-                "fromBlock": format!("0x{from:x}"),
-                "toBlock": format!("0x{latest_n:x}"),
-                "topics": topics,
-            }])).await?;
-            if let Some(values) = result.as_array() { logs.extend(values.iter().cloned()); }
+            let result = self
+                .rpc_call(
+                    "eth_getLogs",
+                    json!([{
+                        "fromBlock": format!("0x{from:x}"),
+                        "toBlock": format!("0x{latest_n:x}"),
+                        "topics": topics,
+                    }]),
+                )
+                .await?;
+            if let Some(values) = result.as_array() {
+                logs.extend(values.iter().cloned());
+            }
         }
         let mut activities = Vec::new();
         let mut seen = HashSet::new();
@@ -586,31 +660,63 @@ impl EvmStreamListener {
             };
             let from_topic = topics[1].as_str().unwrap_or("");
             let to_topic = topics[2].as_str().unwrap_or("");
-            if from_topic.len() != 66 || to_topic.len() != 66 { continue; }
+            if from_topic.len() != 66 || to_topic.len() != 66 {
+                continue;
+            }
             let from_addr = format!("0x{}", &from_topic[26..]).to_lowercase();
             let to_addr = format!("0x{}", &to_topic[26..]).to_lowercase();
             let (wallet_address, incoming) = if address_to_handle.contains_key(&to_addr) {
                 (to_addr, true)
             } else if address_to_handle.contains_key(&from_addr) {
                 (from_addr, false)
-            } else { continue; };
-            let handle = address_to_handle.get(&wallet_address).cloned().unwrap_or_default();
-            let receipt = self.rpc_call("eth_getTransactionReceipt", json!([tx_hash])).await?;
+            } else {
+                continue;
+            };
+            let handle = address_to_handle
+                .get(&wallet_address)
+                .cloned()
+                .unwrap_or_default();
+            let receipt = self
+                .rpc_call("eth_getTransactionReceipt", json!([tx_hash]))
+                .await?;
             let classified = classify_robinhood_receipt(&receipt, &wallet_address)?;
-            if !classified.success || !classified.has_transfer
-                || matches!(classified.venue, RobinhoodVenue::Unknown | RobinhoodVenue::TransferOnly) { continue; }
-            let token = log.get("address").and_then(Value::as_str).unwrap_or("").to_string();
-            let raw_amount = parse_hex_quantity(log.get("data").and_then(Value::as_str).unwrap_or("0x0"))?;
-            if !is_evm_address(&token) || raw_amount == 0 { continue; }
+            if !classified.success
+                || !classified.has_transfer
+                || matches!(
+                    classified.venue,
+                    RobinhoodVenue::Unknown | RobinhoodVenue::TransferOnly
+                )
+            {
+                continue;
+            }
+            let token = log
+                .get("address")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let raw_amount =
+                parse_hex_quantity(log.get("data").and_then(Value::as_str).unwrap_or("0x0"))?;
+            if !is_evm_address(&token) || raw_amount == 0 {
+                continue;
+            }
             let decimals = self.erc20_uint(&token, "0x313ce567").await.unwrap_or(18);
-            let symbol = self.erc20_string(&token, "0x95d89b41").await.unwrap_or_else(|_| "TOKEN".to_string());
-            if crate::models::is_blacklisted_asset(&token, &symbol) { continue; }
+            let symbol = self
+                .erc20_string(&token, "0x95d89b41")
+                .await
+                .unwrap_or_else(|_| "TOKEN".to_string());
+            if crate::models::is_blacklisted_asset(&token, &symbol) {
+                continue;
+            }
             let activity = WalletActivity {
                 id: None,
                 wallet_handle: handle,
                 wallet_address,
                 chain: self.chain,
-                activity_type: if incoming { ActivityType::Buy } else { ActivityType::Sell },
+                activity_type: if incoming {
+                    ActivityType::Buy
+                } else {
+                    ActivityType::Sell
+                },
                 token_symbol: symbol,
                 token_mint: token,
                 amount_usd: 0.0,
@@ -636,8 +742,12 @@ impl EvmStreamListener {
         address: &str,
         db: Arc<SmartWalletDb>,
     ) -> Result<Option<WalletActivity>> {
-        use crate::chains::robinhood::{classify_robinhood_receipt, RobinhoodVenue, ERC20_TRANSFER_TOPIC};
-        if self.chain != Chain::Robinhood || !is_evm_address(address) { return Ok(None); }
+        use crate::chains::robinhood::{
+            classify_robinhood_receipt, RobinhoodVenue, ERC20_TRANSFER_TOPIC,
+        };
+        if self.chain != Chain::Robinhood || !is_evm_address(address) {
+            return Ok(None);
+        }
         let cached_block = { *self.latest_block_cache.lock().unwrap() };
         let latest_n = if let Some((block, observed)) = cached_block {
             if observed.elapsed() < Duration::from_secs(5) {
@@ -688,40 +798,101 @@ impl EvmStreamListener {
         }
         txs.sort();
         for tx_hash in txs.into_iter().rev() {
-            if self.processed_hashes.lock().unwrap().contains(&tx_hash) { continue; }
-            let receipt = self.rpc_call("eth_getTransactionReceipt", json!([tx_hash])).await?;
+            if self.processed_hashes.lock().unwrap().contains(&tx_hash) {
+                continue;
+            }
+            let receipt = self
+                .rpc_call("eth_getTransactionReceipt", json!([tx_hash]))
+                .await?;
             let classified = classify_robinhood_receipt(&receipt, address)?;
-            if !classified.success || !classified.has_transfer || matches!(classified.venue, RobinhoodVenue::Unknown | RobinhoodVenue::TransferOnly) { continue; }
-            let logs = receipt.get("logs").and_then(Value::as_array).cloned().unwrap_or_default();
+            if !classified.success
+                || !classified.has_transfer
+                || matches!(
+                    classified.venue,
+                    RobinhoodVenue::Unknown | RobinhoodVenue::TransferOnly
+                )
+            {
+                continue;
+            }
+            let logs = receipt
+                .get("logs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let mut selected: Option<(String, bool, u128)> = None;
             for log in logs {
                 let token = log.get("address").and_then(Value::as_str).unwrap_or("");
-                let topics = log.get("topics").and_then(Value::as_array).cloned().unwrap_or_default();
-                if topics.len() < 3 || !topics[0].as_str().unwrap_or("").eq_ignore_ascii_case(ERC20_TRANSFER_TOPIC) || !is_evm_address(token) { continue; }
-                let from_addr = format!("0x{}", topics[1].as_str().unwrap_or("").trim_start_matches("0x")[24..].to_string());
-                let to_addr = format!("0x{}", topics[2].as_str().unwrap_or("").trim_start_matches("0x")[24..].to_string());
+                let topics = log
+                    .get("topics")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if topics.len() < 3
+                    || !topics[0]
+                        .as_str()
+                        .unwrap_or("")
+                        .eq_ignore_ascii_case(ERC20_TRANSFER_TOPIC)
+                    || !is_evm_address(token)
+                {
+                    continue;
+                }
+                let from_addr = format!(
+                    "0x{}",
+                    &topics[1].as_str().unwrap_or("").trim_start_matches("0x")[24..]
+                );
+                let to_addr = format!(
+                    "0x{}",
+                    &topics[2].as_str().unwrap_or("").trim_start_matches("0x")[24..]
+                );
                 let incoming = to_addr.eq_ignore_ascii_case(address);
                 let outgoing = from_addr.eq_ignore_ascii_case(address);
-                if !incoming && !outgoing { continue; }
+                if !incoming && !outgoing {
+                    continue;
+                }
                 let data = log.get("data").and_then(Value::as_str).unwrap_or("0x");
                 let amount = parse_hex_quantity(data).unwrap_or(0);
-                if amount == 0 { continue; }
+                if amount == 0 {
+                    continue;
+                }
                 // Prefer an incoming token for BUY and an outgoing token for SELL;
                 // the first qualifying delta is still receipt-backed, not balance-only.
-                if selected.is_none() || incoming { selected = Some((token.to_string(), incoming, amount)); }
+                if selected.is_none() || incoming {
+                    selected = Some((token.to_string(), incoming, amount));
+                }
             }
-            let Some((token, incoming, raw_amount)) = selected else { continue; };
+            let Some((token, incoming, raw_amount)) = selected else {
+                continue;
+            };
             let decimals = self.erc20_uint(&token, "0x313ce567").await.unwrap_or(18);
-            let symbol = self.erc20_string(&token, "0x95d89b41").await.unwrap_or_else(|_| "TOKEN".to_string());
-            if crate::models::is_blacklisted_asset(&token, &symbol) { continue; }
+            let symbol = self
+                .erc20_string(&token, "0x95d89b41")
+                .await
+                .unwrap_or_else(|_| "TOKEN".to_string());
+            if crate::models::is_blacklisted_asset(&token, &symbol) {
+                continue;
+            }
             let token_amount = raw_amount as f64 / 10f64.powi(decimals as i32);
             let now = Utc::now();
             let activity = WalletActivity {
-                id: None, wallet_handle: handle.to_string(), wallet_address: address.to_string(), chain: self.chain,
-                activity_type: if incoming { ActivityType::Buy } else { ActivityType::Sell },
-                token_symbol: symbol, token_mint: token, amount_usd: 0.0, token_amount,
-                execution_price_usd: 0.0, whale_balance_before: 0.0, whale_balance_after: 0.0,
-                sell_ratio_pct: if incoming { 0.0 } else { 100.0 }, tx_signature: tx_hash.clone(), timestamp: now,
+                id: None,
+                wallet_handle: handle.to_string(),
+                wallet_address: address.to_string(),
+                chain: self.chain,
+                activity_type: if incoming {
+                    ActivityType::Buy
+                } else {
+                    ActivityType::Sell
+                },
+                token_symbol: symbol,
+                token_mint: token,
+                amount_usd: 0.0,
+                token_amount,
+                execution_price_usd: 0.0,
+                whale_balance_before: 0.0,
+                whale_balance_after: 0.0,
+                sell_ratio_pct: if incoming { 0.0 } else { 100.0 },
+                tx_signature: tx_hash.clone(),
+                timestamp: now,
             };
             self.processed_hashes.lock().unwrap().insert(tx_hash);
             let _ = db.insert_activity(&activity);
@@ -853,24 +1024,15 @@ impl EvmStreamListener {
                 0
             };
 
-            // Baseline registration on startup
-            {
-                let mut last_map = self.last_hashes.lock().unwrap();
-                if let Some(last) = last_map.get(address) {
-                    if last == hash {
-                        return Ok(None);
-                    }
-                } else {
-                    last_map.insert(address.to_string(), hash.to_string());
-                    let mut processed = self.processed_hashes.lock().unwrap();
-                    processed.insert(hash.to_string());
-
-                    // If older than 120s, it's historical data from before startup
-                    if tx_age_secs > 120 {
-                        return Ok(None);
-                    }
-                }
-                last_map.insert(address.to_string(), hash.to_string());
+            // Skip transactions already processed for this address; treat
+            // pre-startup (older than 120s) transactions as historical data.
+            if self.processed_hashes.lock().unwrap().contains(hash) {
+                return Ok(None);
+            }
+            if tx_age_secs > 120 {
+                let mut processed = self.processed_hashes.lock().unwrap();
+                processed.insert(hash.to_string());
+                return Ok(None);
             }
 
             {
@@ -957,28 +1119,40 @@ impl EvmStreamListener {
             let index = (start + offset) % endpoint_count;
             let now = Instant::now();
             let available = self.rpc_cooldowns.lock().unwrap()[index]
-                .map(|until| until <= now).unwrap_or(true);
-            if !available { continue; }
+                .map(|until| until <= now)
+                .unwrap_or(true);
+            if !available {
+                continue;
+            }
             self.requests.fetch_add(1, Ordering::Relaxed);
-            let response = match self.client.post(&self.rpc_urls[index]).json(&payload).send().await {
+            let response = match self
+                .client
+                .post(&self.rpc_urls[index])
+                .json(&payload)
+                .send()
+                .await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     self.failures.fetch_add(1, Ordering::Relaxed);
                     last_error = format!("endpoint {index} transport failed: {error}");
-                    self.rpc_cooldowns.lock().unwrap()[index] = Some(Instant::now() + Duration::from_secs(15));
+                    self.rpc_cooldowns.lock().unwrap()[index] =
+                        Some(Instant::now() + Duration::from_secs(15));
                     continue;
                 }
             };
             if response.status().as_u16() == 429 {
                 self.rate_limited.fetch_add(1, Ordering::Relaxed);
                 last_error = format!("endpoint {index} rate-limited (HTTP 429)");
-                self.rpc_cooldowns.lock().unwrap()[index] = Some(Instant::now() + Duration::from_secs(30));
+                self.rpc_cooldowns.lock().unwrap()[index] =
+                    Some(Instant::now() + Duration::from_secs(30));
                 continue;
             }
             if !response.status().is_success() {
                 self.failures.fetch_add(1, Ordering::Relaxed);
                 last_error = format!("endpoint {index} returned HTTP {}", response.status());
-                self.rpc_cooldowns.lock().unwrap()[index] = Some(Instant::now() + Duration::from_secs(15));
+                self.rpc_cooldowns.lock().unwrap()[index] =
+                    Some(Instant::now() + Duration::from_secs(15));
                 continue;
             }
             let response: Value = match response.json().await {
@@ -1001,19 +1175,36 @@ impl EvmStreamListener {
     }
 
     async fn erc20_uint(&self, token: &str, selector: &str) -> Result<u8> {
-        let value = self.rpc_call("eth_call", json!([{"to":token,"data":selector},"latest"])).await?;
+        let value = self
+            .rpc_call("eth_call", json!([{"to":token,"data":selector},"latest"]))
+            .await?;
         Ok(parse_hex_quantity(value.as_str().unwrap_or("0x0"))?.min(255) as u8)
     }
 
     async fn erc20_string(&self, token: &str, selector: &str) -> Result<String> {
-        let value = self.rpc_call("eth_call", json!([{"to":token,"data":selector},"latest"])).await?;
-        let raw = value.as_str().unwrap_or("").strip_prefix("0x").unwrap_or("");
-        if raw.len() < 128 { return Err(anyhow::anyhow!("ERC20 string output too short")); }
-        let offset = usize::from_str_radix(&raw[..64],16)? * 2;
-        if raw.len() < offset + 64 { return Err(anyhow::anyhow!("ERC20 string offset invalid")); }
-        let len = usize::from_str_radix(&raw[offset..offset+64],16)? * 2;
-        if raw.len() < offset + 64 + len { return Err(anyhow::anyhow!("ERC20 string length invalid")); }
-        Ok(String::from_utf8_lossy(&hex::decode(&raw[offset+64..offset+64+len])?).to_string())
+        let value = self
+            .rpc_call("eth_call", json!([{"to":token,"data":selector},"latest"]))
+            .await?;
+        let raw = value
+            .as_str()
+            .unwrap_or("")
+            .strip_prefix("0x")
+            .unwrap_or("");
+        if raw.len() < 128 {
+            return Err(anyhow::anyhow!("ERC20 string output too short"));
+        }
+        let offset = usize::from_str_radix(&raw[..64], 16)? * 2;
+        if raw.len() < offset + 64 {
+            return Err(anyhow::anyhow!("ERC20 string offset invalid"));
+        }
+        let len = usize::from_str_radix(&raw[offset..offset + 64], 16)? * 2;
+        if raw.len() < offset + 64 + len {
+            return Err(anyhow::anyhow!("ERC20 string length invalid"));
+        }
+        Ok(
+            String::from_utf8_lossy(&hex::decode(&raw[offset + 64..offset + 64 + len])?)
+                .to_string(),
+        )
     }
 }
 
@@ -1026,25 +1217,36 @@ mod feed_tests {
         let raw = r#"{"version":1,"messages":[{"sequenceNumber":7,"message":{"message":{"header":{"kind":3,"sender":"0xa4b000000000000000000073657175656e636572","blockNumber":12,"timestamp":1700000000,"requestId":null,"baseFeeL1":null},"l2Msg":"aGVsbG8="},"delayedMessagesRead":4},"signature":null}]}"#;
         let payload = EvmStreamListener::parse_sequencer_feed_payload(raw).unwrap();
         assert_eq!(payload.messages[0].sequence_number, 7);
-        assert_eq!(payload.messages[0].message.message.decode_l2_msg().unwrap(), b"hello");
+        assert_eq!(
+            payload.messages[0].message.message.decode_l2_msg().unwrap(),
+            b"hello"
+        );
     }
 
     #[test]
     fn rejects_unsupported_relay_version() {
-        assert!(EvmStreamListener::parse_sequencer_feed_payload(r#"{"version":2,"messages":[]}"#).is_err());
+        assert!(
+            EvmStreamListener::parse_sequencer_feed_payload(r#"{"version":2,"messages":[]}"#)
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn feed_reader_rejects_non_websocket_url_without_connecting() {
         let listener = EvmStreamListener::new("http://127.0.0.1:1", Chain::Robinhood);
-        let error = listener.read_sequencer_feed("https://example.invalid/feed", 1).await;
+        let error = listener
+            .read_sequencer_feed("https://example.invalid/feed", 1)
+            .await;
         assert!(error.is_err());
     }
 
     #[tokio::test]
     async fn feed_reader_zero_bound_is_read_only_noop() {
         let listener = EvmStreamListener::new("", Chain::Robinhood);
-        let result = listener.read_sequencer_feed("wss://example.invalid/feed", 0).await.unwrap();
+        let result = listener
+            .read_sequencer_feed("wss://example.invalid/feed", 0)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -1052,15 +1254,30 @@ mod feed_tests {
     fn classifies_nitro_l2_message_kind() {
         use base64::Engine;
         let encoded = |kind: u8| base64::engine::general_purpose::STANDARD.encode([kind, 1]);
-        let message = |kind| NitroIncomingMessage { header: None, l2_msg: encoded(kind) };
-        assert_eq!(message(4).l2_message_kind().unwrap(), NitroL2MessageKind::SignedTx);
-        assert_eq!(message(3).l2_message_kind().unwrap(), NitroL2MessageKind::Batch);
-        assert_eq!(message(99).l2_message_kind().unwrap(), NitroL2MessageKind::Unknown(99));
+        let message = |kind| NitroIncomingMessage {
+            header: None,
+            l2_msg: encoded(kind),
+        };
+        assert_eq!(
+            message(4).l2_message_kind().unwrap(),
+            NitroL2MessageKind::SignedTx
+        );
+        assert_eq!(
+            message(3).l2_message_kind().unwrap(),
+            NitroL2MessageKind::Batch
+        );
+        assert_eq!(
+            message(99).l2_message_kind().unwrap(),
+            NitroL2MessageKind::Unknown(99)
+        );
     }
 
     #[test]
     fn rejects_empty_nitro_l2_message() {
-        let message = NitroIncomingMessage { header: None, l2_msg: String::new() };
+        let message = NitroIncomingMessage {
+            header: None,
+            l2_msg: String::new(),
+        };
         assert!(message.decode_l2_msg().is_err());
     }
 
@@ -1099,7 +1316,10 @@ mod feed_tests {
         assert_eq!(tx.max_fee_per_gas, Some(3));
         assert_eq!(tx.value, 4);
         assert_eq!(tx.data, vec![0xab]);
-        assert_eq!(tx.to.as_deref(), Some("0x1111111111111111111111111111111111111111"));
+        assert_eq!(
+            tx.to.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
     }
 
     #[test]
@@ -1127,7 +1347,10 @@ mod feed_tests {
         assert_eq!(tx.gas_limit, 21_000);
         assert_eq!(tx.max_fee_per_gas, 7);
         assert_eq!(tx.nonce, 9);
-        assert_eq!(tx.to.as_deref(), Some("0x2222222222222222222222222222222222222222"));
+        assert_eq!(
+            tx.to.as_deref(),
+            Some("0x2222222222222222222222222222222222222222")
+        );
         assert_eq!(tx.value, 123);
         assert_eq!(tx.data, vec![0xde, 0xad, 0xbe, 0xef]);
     }
@@ -1140,7 +1363,10 @@ mod feed_tests {
             out.extend_from_slice(message);
             out
         }
-        let nested = [3u8].into_iter().chain(frame(&[0u8, 0xaa])).collect::<Vec<_>>();
+        let nested = [3u8]
+            .into_iter()
+            .chain(frame(&[0u8, 0xaa]))
+            .collect::<Vec<_>>();
         let raw = [vec![3u8], frame(&[4u8, 0xbb]), frame(&nested)].concat();
         let message = NitroIncomingMessage {
             header: None,
@@ -1170,7 +1396,8 @@ mod feed_tests {
                 let mut framed = (nested.len() as u64).to_be_bytes().to_vec();
                 framed.extend_from_slice(&nested);
                 framed
-            }].concat();
+            }]
+            .concat();
         }
         let message = NitroIncomingMessage {
             header: None,
@@ -1202,7 +1429,10 @@ mod feed_tests {
         let tx = message.decode_contract_transaction().unwrap();
         assert_eq!(tx.gas_limit, 50_000);
         assert_eq!(tx.max_fee_per_gas, 11);
-        assert_eq!(tx.to.as_deref(), Some("0x3333333333333333333333333333333333333333"));
+        assert_eq!(
+            tx.to.as_deref(),
+            Some("0x3333333333333333333333333333333333333333")
+        );
         assert_eq!(tx.value, 456);
         assert_eq!(tx.data, vec![0xca, 0xfe]);
     }

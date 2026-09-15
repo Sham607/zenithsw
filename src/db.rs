@@ -1,6 +1,6 @@
 use crate::models::{
-    ActivityType, Chain, ExecutionTrack, ShadowPosition, ShadowSignal, SmartWallet, TrackedToken, TradeRecord,
-    WalletActivity, WalletTier,
+    ActivityType, Chain, ExecutionTrack, ShadowPosition, ShadowSignal, SmartWallet, TrackedToken,
+    TradeRecord, WalletActivity, WalletTier,
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -8,6 +8,29 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
+
+type RecentWhaleActivityToken = (String, String, String, u32, f64, Vec<String>);
+type ExecutionIntentSummary = (String, String, Option<String>, Option<String>);
+type PendingExecutionIntent = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionIntentMetadata {
+    pub nonce: Option<i64>,
+    pub recent_blockhash: Option<String>,
+    pub last_valid_block_height: Option<i64>,
+    pub calldata_hash: Option<String>,
+    pub quote_block: Option<i64>,
+    pub expiry: Option<i64>,
+}
 
 pub struct SmartWalletDb {
     conn: Mutex<Connection>,
@@ -90,7 +113,9 @@ impl CandidateWalletDb {
              );
              CREATE INDEX IF NOT EXISTS idx_candidate_evidence_candidate ON candidate_evidence(candidate_id);",
         )?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn upsert_candidate(
@@ -112,7 +137,15 @@ impl CandidateWalletDb {
              ON CONFLICT(chain,address) DO UPDATE SET
                name=excluded.name, handle=excluded.handle, last_checked_at=excluded.last_checked_at,
                source=excluded.source",
-            params![wallet.rank, wallet.name, wallet.handle, wallet.chain.to_string(), wallet.address, wallet.source, now],
+            params![
+                wallet.rank,
+                wallet.name,
+                wallet.handle,
+                wallet.chain.to_string(),
+                wallet.address,
+                wallet.source,
+                now
+            ],
         )?;
         let candidate_id: i64 = conn.query_row(
             "SELECT id FROM candidates WHERE chain=?1 AND address=?2",
@@ -132,6 +165,24 @@ impl CandidateWalletDb {
         let conn = self.conn.lock().unwrap();
         Ok(conn.query_row("SELECT COUNT(*) FROM candidates", [], |row| row.get(0))?)
     }
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let exists = conn
+        .prepare("SELECT 1 FROM pragma_table_info(?) WHERE name = ?")?
+        .exists(params![table, column])?;
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 impl SmartWalletDb {
@@ -269,7 +320,43 @@ impl SmartWalletDb {
              CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
              CREATE INDEX IF NOT EXISTS idx_activities_mint ON wallet_activities(token_mint);
              CREATE INDEX IF NOT EXISTS idx_signals_mint ON shadow_signals(token_mint);
-             CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON shadow_signals(timestamp);",
+             CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON shadow_signals(timestamp);
+             CREATE TABLE IF NOT EXISTS execution_intents (
+                 intent_id TEXT PRIMARY KEY,
+                 chain TEXT NOT NULL,
+                 action TEXT NOT NULL,
+                 token_mint TEXT NOT NULL,
+                 wallet_address TEXT NOT NULL,
+                 amount_native REAL NOT NULL,
+                 state TEXT NOT NULL,
+                 tx_hash TEXT,
+                 signature TEXT,
+                 nonce INTEGER,
+                 recent_blockhash TEXT,
+                 last_valid_block_height INTEGER,
+                 calldata_hash TEXT,
+                 quote_block INTEGER,
+                 expiry INTEGER,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_execution_intents_state ON execution_intents(state);
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_intents_tx_hash ON execution_intents(tx_hash) WHERE tx_hash IS NOT NULL;
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_intents_signature ON execution_intents(signature) WHERE signature IS NOT NULL;",
+        )?;
+        for (column, definition) in [
+            ("nonce", "INTEGER"),
+            ("recent_blockhash", "TEXT"),
+            ("last_valid_block_height", "INTEGER"),
+            ("calldata_hash", "TEXT"),
+            ("quote_block", "INTEGER"),
+            ("expiry", "INTEGER"),
+        ] {
+            add_column_if_missing(&conn, "execution_intents", column, definition)?;
+        }
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_intents_signature
+             ON execution_intents(signature) WHERE signature IS NOT NULL;",
         )?;
 
         let wallet_conn = if trading_path == wallet_path {
@@ -418,11 +505,32 @@ impl SmartWalletDb {
              );",
         )?;
 
-        // Migrations for Dual-Track Execution
-        let _ = conn.execute("ALTER TABLE wallets ADD COLUMN execution_track TEXT NOT NULL DEFAULT 'FAST_LANE';", []);
-        let _ = conn.execute("ALTER TABLE shadow_positions ADD COLUMN track TEXT NOT NULL DEFAULT 'FAST_LANE';", []);
-        let _ = conn.execute("ALTER TABLE shadow_signals ADD COLUMN track TEXT NOT NULL DEFAULT 'FAST_LANE';", []);
-        let _ = conn.execute("ALTER TABLE trade_history ADD COLUMN track TEXT NOT NULL DEFAULT 'FAST_LANE';", []);
+        // Migrations for Dual-Track Execution. An existing column is not an
+        // error; every other schema error must stop startup.
+        add_column_if_missing(
+            &conn,
+            "wallets",
+            "execution_track",
+            "TEXT NOT NULL DEFAULT 'FAST_LANE'",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "shadow_positions",
+            "track",
+            "TEXT NOT NULL DEFAULT 'FAST_LANE'",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "shadow_signals",
+            "track",
+            "TEXT NOT NULL DEFAULT 'FAST_LANE'",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "trade_history",
+            "track",
+            "TEXT NOT NULL DEFAULT 'FAST_LANE'",
+        )?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS execution_intents (
                 intent_id TEXT PRIMARY KEY,
@@ -434,11 +542,18 @@ impl SmartWalletDb {
                 state TEXT NOT NULL,
                 tx_hash TEXT,
                 signature TEXT,
+                nonce INTEGER,
+                recent_blockhash TEXT,
+                last_valid_block_height INTEGER,
+                calldata_hash TEXT,
+                quote_block INTEGER,
+                expiry INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-             CREATE INDEX IF NOT EXISTS idx_execution_intents_state ON execution_intents(state);
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_intents_tx_hash ON execution_intents(tx_hash) WHERE tx_hash IS NOT NULL;",
+            CREATE INDEX IF NOT EXISTS idx_execution_intents_state ON execution_intents(state);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_intents_tx_hash ON execution_intents(tx_hash) WHERE tx_hash IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_intents_signature ON execution_intents(signature) WHERE signature IS NOT NULL;",
         )?;
 
         Ok(Self {
@@ -537,7 +652,8 @@ impl SmartWalletDb {
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
             let track_str: String = row.get(15).unwrap_or_else(|_| "FAST_LANE".to_string());
-            let execution_track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
+            let execution_track =
+                ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             Ok(SmartWallet {
                 id,
@@ -603,7 +719,8 @@ impl SmartWalletDb {
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
             let track_str: String = row.get(15).unwrap_or_else(|_| "FAST_LANE".to_string());
-            let execution_track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
+            let execution_track =
+                ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             Ok(SmartWallet {
                 id,
@@ -666,7 +783,8 @@ impl SmartWalletDb {
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
             let track_str: String = row.get(15).unwrap_or_else(|_| "FAST_LANE".to_string());
-            let execution_track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
+            let execution_track =
+                ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             Ok(SmartWallet {
                 id,
@@ -729,7 +847,8 @@ impl SmartWalletDb {
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
             let track_str: String = row.get(15).unwrap_or_else(|_| "FAST_LANE".to_string());
-            let execution_track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
+            let execution_track =
+                ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             Ok(SmartWallet {
                 id,
@@ -1349,7 +1468,7 @@ impl SmartWalletDb {
     pub fn get_recent_whale_activity_tokens(
         &self,
         limit: usize,
-    ) -> Result<Vec<(String, String, String, u32, f64, Vec<String>)>> {
+    ) -> Result<Vec<RecentWhaleActivityToken>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT token_mint,
@@ -1559,6 +1678,48 @@ impl SmartWalletDb {
             return Err(anyhow::anyhow!("invalid execution intent update"));
         }
         let conn = self.conn.lock().unwrap();
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT state FROM execution_intents WHERE intent_id=?1",
+                params![intent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current =
+            current.ok_or_else(|| anyhow::anyhow!("execution intent not found: {intent_id}"))?;
+        let allowed = match (current.as_str(), state) {
+            (
+                "INTENT",
+                "QUOTED" | "SIMULATED" | "SIGNED" | "BROADCASTED" | "FAILED" | "UNKNOWN",
+            ) => true,
+            ("QUOTED", "SIMULATED" | "SIGNED" | "FAILED" | "UNKNOWN") => true,
+            ("SIMULATED", "SIGNED" | "FAILED" | "UNKNOWN") => true,
+            ("SIGNED", "BROADCASTED" | "FAILED" | "UNKNOWN") => true,
+            ("BROADCASTED", "PENDING_RECONCILIATION" | "CONFIRMED" | "FAILED" | "UNKNOWN") => true,
+            ("PENDING_RECONCILIATION", "CONFIRMED" | "RECONCILED" | "FAILED") => true,
+            ("CONFIRMED", "RECONCILED" | "FAILED") => true,
+            ("RECONCILED", "FAILED") => true,
+            ("FAILED" | "CLOSED", _) => false,
+            _ => false,
+        };
+        if !allowed {
+            return Err(anyhow::anyhow!(
+                "invalid execution intent transition: {current} -> {state}"
+            ));
+        }
+        let existing_hashes: (Option<String>, Option<String>) = conn.query_row(
+            "SELECT tx_hash, signature FROM execution_intents WHERE intent_id=?1",
+            params![intent_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if tx_hash.is_some_and(|value| existing_hashes.0.as_deref().is_some_and(|old| old != value))
+            || signature
+                .is_some_and(|value| existing_hashes.1.as_deref().is_some_and(|old| old != value))
+        {
+            return Err(anyhow::anyhow!(
+                "replacement tx/signature ditolak untuk execution intent: {intent_id}"
+            ));
+        }
         let changed = conn.execute(
             "UPDATE execution_intents
              SET state=?1,tx_hash=coalesce(?2,tx_hash),signature=coalesce(?3,signature),updated_at=?4
@@ -1566,12 +1727,66 @@ impl SmartWalletDb {
             params![state, tx_hash, signature, Utc::now().to_rfc3339(), intent_id],
         )?;
         if changed != 1 {
+            return Err(anyhow::anyhow!(
+                "execution intent update affected no row: {intent_id}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn update_execution_intent_metadata(
+        &self,
+        intent_id: &str,
+        metadata: &ExecutionIntentMetadata,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE execution_intents
+             SET nonce=?1,recent_blockhash=?2,last_valid_block_height=?3,
+                 calldata_hash=?4,quote_block=?5,expiry=?6,updated_at=?7
+             WHERE intent_id=?8",
+            params![
+                metadata.nonce,
+                metadata.recent_blockhash,
+                metadata.last_valid_block_height,
+                metadata.calldata_hash,
+                metadata.quote_block,
+                metadata.expiry,
+                Utc::now().to_rfc3339(),
+                intent_id,
+            ],
+        )?;
+        if changed != 1 {
             return Err(anyhow::anyhow!("execution intent not found: {intent_id}"));
         }
         Ok(())
     }
 
-    pub fn get_execution_intent(&self, intent_id: &str) -> Result<Option<(String, String, Option<String>, Option<String>)>> {
+    pub fn get_execution_intent_metadata(
+        &self,
+        intent_id: &str,
+    ) -> Result<Option<ExecutionIntentMetadata>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT nonce,recent_blockhash,last_valid_block_height,calldata_hash,quote_block,expiry
+                 FROM execution_intents WHERE intent_id=?1",
+                params![intent_id],
+                |row| {
+                    Ok(ExecutionIntentMetadata {
+                        nonce: row.get(0)?,
+                        recent_blockhash: row.get(1)?,
+                        last_valid_block_height: row.get(2)?,
+                        calldata_hash: row.get(3)?,
+                        quote_block: row.get(4)?,
+                        expiry: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn get_execution_intent(&self, intent_id: &str) -> Result<Option<ExecutionIntentSummary>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT state,action,tx_hash,signature FROM execution_intents WHERE intent_id=?1",
@@ -1583,14 +1798,12 @@ impl SmartWalletDb {
             .optional()?)
     }
 
-    pub fn get_pending_execution_intents(
-        &self,
-    ) -> Result<Vec<(String, String, String, String, String, String, Option<String>, Option<String>)>> {
+    pub fn get_pending_execution_intents(&self) -> Result<Vec<PendingExecutionIntent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT intent_id,chain,action,token_mint,wallet_address,state,tx_hash,signature
              FROM execution_intents
-             WHERE state IN ('INTENT','BROADCASTED','PENDING_RECONCILIATION','CONFIRMED','RECONCILED')
+             WHERE state IN ('INTENT','QUOTED','SIMULATED','SIGNED','BROADCASTED','PENDING_RECONCILIATION')
              ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {

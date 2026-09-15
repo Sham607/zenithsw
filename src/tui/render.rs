@@ -91,21 +91,18 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
     } else {
         "DRY RUN 🟡"
     };
-
-    let price_ready = app.sol_price_usd > 0.0 && app.sol_price_usd.is_finite();
-    let calculated_total_equity = if price_ready {
-        Some((app.wallet_sol_balance * app.sol_price_usd) + total_pos_usd)
+    let heartbeat_fresh = app.heartbeat_is_fresh();
+    let sol_value = if heartbeat_fresh && app.sol_price_usd > 0.0 {
+        format!("${:.2}", app.wallet_sol_balance * app.sol_price_usd)
     } else {
-        None
+        "N/A".to_string()
     };
-    let sol_value = calculated_total_equity
-        .map(|equity| equity - total_pos_usd)
-        .map(|value| format!("${value:.2}"))
-        .unwrap_or_else(|| "N/A".to_string());
-    let total_equity = calculated_total_equity
-        .map(|value| format!("${value:.2}"))
-        .unwrap_or_else(|| "N/A".to_string());
-    let realized = if app.is_connected_ipc {
+    let total_equity = if heartbeat_fresh && app.wallet_equity_usd.is_finite() {
+        format!("${:.2}", app.wallet_equity_usd)
+    } else {
+        "N/A".to_string()
+    };
+    let realized = if heartbeat_fresh {
         format!("${:+.2}", app.total_realized_pnl_usd)
     } else {
         "N/A".to_string()
@@ -123,11 +120,7 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
     );
 
     let tabs = Tabs::new(tab_titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(header_title),
-        )
+        .block(Block::default().borders(Borders::ALL).title(header_title))
         .select(app.current_tab)
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
@@ -150,21 +143,17 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
     }
 
     // 3. Footer / Status bar
-    let ipc_status = if app.is_connected_ipc {
-        Span::styled(
-            " [ENGINE: ONLINE 🟢] ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )
+    let (ipc_label, ipc_color) = if app.heartbeat_is_fresh() {
+        (" [ENGINE: ONLINE 🟢] ", Color::Green)
+    } else if app.is_connected_ipc {
+        (" [ENGINE: STALE HEARTBEAT 🔴] ", Color::Red)
     } else {
-        Span::styled(
-            " [ENGINE: STANDALONE/OFFLINE 🟡] ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
+        (" [ENGINE: OFFLINE 🟡] ", Color::Yellow)
     };
+    let ipc_status = Span::styled(
+        ipc_label,
+        Style::default().fg(ipc_color).add_modifier(Modifier::BOLD),
+    );
 
     let sol_count = app
         .wallets
@@ -330,11 +319,15 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![
                 Span::styled(
                     " [STANDBY] ",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     "Multi-Chain Stream Listener Active (Solana & Robinhood)",
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
@@ -395,7 +388,9 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
         let line1 = Line::from(vec![
             Span::styled(
                 track_badge,
-                Style::default().fg(track_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(track_color)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("[{}] ", sig.chain),
@@ -469,11 +464,15 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![
                 Span::styled(
                     " [STANDBY] ",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     "Dual-Track Confluence Filter Ready",
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
@@ -502,7 +501,7 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
 
     let sig_list = List::new(sig_items).block(
         Block::default().borders(Borders::ALL).title(Span::styled(
-            " Shadow Confluence Signals & Decisions ",
+            gating_title,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -905,16 +904,35 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
         })
         .sum();
 
-    let calculated_total_equity = (app.wallet_sol_balance * app.sol_price_usd) + total_pos_usd;
+    let equity_display = if app.heartbeat_is_fresh() && app.wallet_equity_usd.is_finite() {
+        format!("${:.2}", app.wallet_equity_usd)
+    } else {
+        "N/A".to_string()
+    };
+    let sol_display = if app.heartbeat_is_fresh() && app.sol_price_usd > 0.0 {
+        format!("${:.2}", app.wallet_sol_balance * app.sol_price_usd)
+    } else {
+        "N/A".to_string()
+    };
+    let price_display = if app.heartbeat_is_fresh() && app.sol_price_usd > 0.0 {
+        format!("${:.1}", app.sol_price_usd)
+    } else {
+        "N/A".to_string()
+    };
+    let realized_display = if app.heartbeat_is_fresh() {
+        format!("${:+.2}", app.total_realized_pnl_usd)
+    } else {
+        "N/A".to_string()
+    };
 
     let pos_title = format!(
-        " ACTIVE SHADOW POSITIONS • Real Equity: ${:.2} (SOL: {:.4} @ ${:.1} = ${:.2} | Positions: ${:.2} | Realized: ${:+.2}) ",
-        calculated_total_equity,
+        " ACTIVE SHADOW POSITIONS • Engine Equity: {} (SOL: {:.4} @ {} = {} | Shadow Positions: ${:.2} | Engine Realized: {}) ",
+        equity_display,
         app.wallet_sol_balance,
-        app.sol_price_usd,
-        app.wallet_sol_balance * app.sol_price_usd,
+        price_display,
+        sol_display,
         total_pos_usd,
-        app.total_realized_pnl_usd
+        realized_display
     );
 
     let table = Table::new(
@@ -935,14 +953,12 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     )
     .header(header)
     .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                pos_title,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )),
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            pos_title,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
     );
 
     frame.render_widget(table, area);
@@ -990,6 +1006,26 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
         0.0
     };
 
+    let engine_equity_display = if app.heartbeat_is_fresh() && app.wallet_equity_usd.is_finite() {
+        format!("${:.2} USD", app.wallet_equity_usd)
+    } else {
+        "N/A".to_string()
+    };
+    let sol_cash_display = if app.heartbeat_is_fresh() && app.sol_price_usd > 0.0 {
+        format!(
+            "{:.6} SOL (${:.2} USD)",
+            app.wallet_sol_balance,
+            app.wallet_sol_balance * app.sol_price_usd
+        )
+    } else {
+        format!("{:.6} SOL (N/A)", app.wallet_sol_balance)
+    };
+    let realized_pnl_display = if app.heartbeat_is_fresh() {
+        format!("${:+.2} USD", app.total_realized_pnl_usd)
+    } else {
+        "N/A".to_string()
+    };
+
     let mode_desc = if app.is_live_mode {
         format!(
             "LIVE ON-CHAIN 🟢 (Signer: {})",
@@ -1026,11 +1062,7 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::raw(" • Real On-Chain Portfolio: SOL Cash = "),
             Span::styled(
-                format!(
-                    "{:.6} SOL (${:.2} USD)",
-                    app.wallet_sol_balance,
-                    app.wallet_sol_balance * app.sol_price_usd
-                ),
+                sol_cash_display.clone(),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -1044,14 +1076,14 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Span::raw(" | Total Real Equity = "),
             Span::styled(
-                format!("${:.2} USD", (app.wallet_sol_balance * app.sol_price_usd) + total_pos_usd),
+                engine_equity_display.clone(),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | Realized PnL = "),
             Span::styled(
-                format!("${:+.2} USD", app.total_realized_pnl_usd),
+                realized_pnl_display.clone(),
                 Style::default()
                     .fg(if app.total_realized_pnl_usd >= 0.0 {
                         Color::Green
@@ -1088,12 +1120,16 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::raw(" • Network Latencies: Solana RPC = "),
             Span::styled(
-                format!("{} ms", app.solana_latency_ms),
+                if app.solana_latency_ms == 0 {
+                    "N/A".to_string()
+                } else {
+                    format!("{} ms", app.solana_latency_ms)
+                },
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(if app.solana_latency_ms == 0 { Color::Yellow } else { Color::Green })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" | Jito Anti-MEV Bundles: Active 🟢 | Multi-RPC Failover: Active 🟢"),
+            Span::raw(format!(" | Solana RPC {}/{} fail={} 429={} | Robinhood RPC {}/{} fail={} 429={} | Scope qualified={} polled={} global={} candidates={}", app.solana_rpc_successes, app.solana_rpc_requests, app.solana_rpc_failures, app.solana_rpc_rate_limited, app.robinhood_rpc_successes, app.robinhood_rpc_requests, app.robinhood_rpc_failures, app.robinhood_rpc_rate_limited, app.qualified_wallets_count, app.polled_wallets_count, app.global_scanned_wallets_count, app.candidate_wallets_count))
         ]),
         Line::from(vec![
             Span::raw(" • Execution Rules: Position Size = "),

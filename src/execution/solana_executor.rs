@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::db::SmartWalletDb;
+use crate::db::{ExecutionIntentMetadata, SmartWalletDb};
 use crate::models::{is_blacklisted_asset, Chain, ShadowPosition, ShadowSignal};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -81,6 +81,100 @@ impl SolanaExecutor {
         }
     }
 
+    pub async fn get_latest_blockhash(&self) -> Result<(String, u64)> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getLatestBlockhash",
+            "params": [{"commitment": "confirmed"}]
+        });
+        let response = self.post_rpc(&payload).await?;
+        let value = response
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .ok_or_else(|| anyhow!("getLatestBlockhash response missing value"))?;
+        let blockhash = value
+            .get("blockhash")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("getLatestBlockhash response missing blockhash"))?;
+        let last_valid_block_height = value
+            .get("lastValidBlockHeight")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("getLatestBlockhash response missing lastValidBlockHeight"))?;
+        Ok((blockhash.to_string(), last_valid_block_height))
+    }
+
+    fn extract_recent_blockhash(transaction: &[u8]) -> Result<String> {
+        fn read_shortvec(bytes: &[u8], offset: &mut usize) -> Result<usize> {
+            let mut value = 0usize;
+            let mut shift = 0;
+            loop {
+                let byte = *bytes
+                    .get(*offset)
+                    .ok_or_else(|| anyhow!("truncated Solana shortvec"))?;
+                *offset += 1;
+                value |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    return Ok(value);
+                }
+                shift += 7;
+                if shift >= usize::BITS {
+                    return Err(anyhow!("Solana shortvec overflow"));
+                }
+            }
+        }
+
+        let mut offset = 0;
+        let signatures = read_shortvec(transaction, &mut offset)?;
+        let signature_bytes = signatures
+            .checked_mul(64)
+            .ok_or_else(|| anyhow!("Solana signature length overflow"))?;
+        offset = offset
+            .checked_add(signature_bytes)
+            .ok_or_else(|| anyhow!("Solana transaction offset overflow"))?;
+        let first_message_byte = *transaction
+            .get(offset)
+            .ok_or_else(|| anyhow!("missing Solana message header"))?;
+        if first_message_byte & 0x80 != 0 {
+            offset += 1;
+        }
+        offset = offset
+            .checked_add(3)
+            .ok_or_else(|| anyhow!("Solana header offset overflow"))?;
+        let accounts = read_shortvec(transaction, &mut offset)?;
+        let account_bytes = accounts
+            .checked_mul(32)
+            .ok_or_else(|| anyhow!("Solana account length overflow"))?;
+        offset = offset
+            .checked_add(account_bytes)
+            .ok_or_else(|| anyhow!("Solana account offset overflow"))?;
+        let end = offset
+            .checked_add(32)
+            .ok_or_else(|| anyhow!("Solana blockhash offset overflow"))?;
+        let blockhash = transaction
+            .get(offset..end)
+            .ok_or_else(|| anyhow!("missing Solana recent blockhash"))?;
+        Ok(bs58::encode(blockhash).into_string())
+    }
+
+    fn sign_transaction_base64(unsigned_base64: &str, signing_key: &SigningKey) -> Result<String> {
+        let tx_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, unsigned_base64)?;
+        if tx_bytes.len() <= 65 || tx_bytes[0] != 1 {
+            return Err(anyhow!(
+                "Solana transaction must contain exactly one signer"
+            ));
+        }
+        let mut signed = tx_bytes.clone();
+        let signature = signing_key.sign(&tx_bytes[65..]);
+        signed[1..65].copy_from_slice(&signature.to_bytes());
+        Ok(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            signed,
+        ))
+    }
+
     /// Derives Solana SigningKey and Base58 Public Key from private key in config
     pub fn get_keypair(&self) -> Result<(SigningKey, String)> {
         let pk_str = self
@@ -108,26 +202,51 @@ impl SolanaExecutor {
     /// Mengirim satu request read/broadcast ke pool RPC Solana.
     /// Broadcast tetap hanya sekali; caller wajib merekonsiliasi signature.
     pub async fn post_rpc(&self, payload: &Value) -> Result<Value> {
-        let mut rpc_urls: Vec<String> = self.config.solana_rpc_url
-            .split(',').map(str::trim).filter(|url| !url.is_empty())
-            .map(ToOwned::to_owned).collect();
-        for fallback in ["https://solana-rpc.publicnode.com", "https://rpc.ankr.com/solana", "https://api.mainnet-beta.solana.com"] {
-            if !rpc_urls.iter().any(|url| url == fallback) { rpc_urls.push(fallback.to_string()); }
+        let mut rpc_urls: Vec<String> = self
+            .config
+            .solana_rpc_url
+            .split(',')
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        for fallback in [
+            "https://solana-rpc.publicnode.com",
+            "https://rpc.ankr.com/solana",
+            "https://api.mainnet-beta.solana.com",
+        ] {
+            if !rpc_urls.iter().any(|url| url == fallback) {
+                rpc_urls.push(fallback.to_string());
+            }
         }
         let count = rpc_urls.len();
-        if count == 0 { return Err(anyhow!("No Solana RPC endpoints configured")); }
+        if count == 0 {
+            return Err(anyhow!("No Solana RPC endpoints configured"));
+        }
         let is_broadcast = payload.get("method").and_then(Value::as_str) == Some("sendTransaction");
         let start = self.rpc_index.fetch_add(1, Ordering::Relaxed) % count;
         let max_attempts = if is_broadcast { 1 } else { count };
         let mut last_err = anyhow!("All Solana RPC endpoints failed");
         for offset in 0..max_attempts {
             let index = (start + offset) % count;
-            if self.rpc_cooldowns.lock().unwrap()[index].map(|until| until > Instant::now()).unwrap_or(false) { continue; }
+            if self.rpc_cooldowns.lock().unwrap()[index]
+                .map(|until| until > Instant::now())
+                .unwrap_or(false)
+            {
+                continue;
+            }
             self.rpc_requests.fetch_add(1, Ordering::Relaxed);
-            match self.client.post(&rpc_urls[index]).json(payload).send().await {
+            match self
+                .client
+                .post(&rpc_urls[index])
+                .json(payload)
+                .send()
+                .await
+            {
                 Ok(res) if res.status().as_u16() == 429 => {
                     self.rpc_rate_limited.fetch_add(1, Ordering::Relaxed);
-                    self.rpc_cooldowns.lock().unwrap()[index] = Some(Instant::now() + Duration::from_secs(30));
+                    self.rpc_cooldowns.lock().unwrap()[index] =
+                        Some(Instant::now() + Duration::from_secs(30));
                     last_err = anyhow!("Solana RPC endpoint {index} rate-limited");
                 }
                 Ok(res) => match res.json::<Value>().await {
@@ -135,17 +254,36 @@ impl SolanaExecutor {
                         self.rpc_successes.fetch_add(1, Ordering::Relaxed);
                         return Ok(json);
                     }
-                    Ok(json) => { self.rpc_failures.fetch_add(1, Ordering::Relaxed); last_err = anyhow!("Solana RPC endpoint {index} error: {}", json.get("error").unwrap_or(&json)); }
-                    Err(error) => { self.rpc_failures.fetch_add(1, Ordering::Relaxed); last_err = anyhow!("Solana RPC endpoint {index} invalid JSON: {error}"); }
+                    Ok(json) => {
+                        self.rpc_failures.fetch_add(1, Ordering::Relaxed);
+                        last_err = anyhow!(
+                            "Solana RPC endpoint {index} error: {}",
+                            json.get("error").unwrap_or(&json)
+                        );
+                    }
+                    Err(error) => {
+                        self.rpc_failures.fetch_add(1, Ordering::Relaxed);
+                        last_err = anyhow!("Solana RPC endpoint {index} invalid JSON: {error}");
+                    }
                 },
-                Err(error) => { self.rpc_failures.fetch_add(1, Ordering::Relaxed); self.rpc_cooldowns.lock().unwrap()[index] = Some(Instant::now() + Duration::from_secs(15)); last_err = anyhow!("Solana RPC endpoint {index} transport error: {error}"); }
+                Err(error) => {
+                    self.rpc_failures.fetch_add(1, Ordering::Relaxed);
+                    self.rpc_cooldowns.lock().unwrap()[index] =
+                        Some(Instant::now() + Duration::from_secs(15));
+                    last_err = anyhow!("Solana RPC endpoint {index} transport error: {error}");
+                }
             }
         }
         Err(last_err)
     }
 
     pub fn rpc_health_snapshot(&self) -> (u64, u64, u64, u64) {
-        (self.rpc_requests.load(Ordering::Relaxed), self.rpc_successes.load(Ordering::Relaxed), self.rpc_rate_limited.load(Ordering::Relaxed), self.rpc_failures.load(Ordering::Relaxed))
+        (
+            self.rpc_requests.load(Ordering::Relaxed),
+            self.rpc_successes.load(Ordering::Relaxed),
+            self.rpc_rate_limited.load(Ordering::Relaxed),
+            self.rpc_failures.load(Ordering::Relaxed),
+        )
     }
 
     /// Fetches native SOL balance via Solana RPC
@@ -259,9 +397,22 @@ impl SolanaExecutor {
             if let Ok(res) = self.post_rpc(&payload).await {
                 if let Some(accs) = res["result"]["value"].as_array() {
                     for acc in accs {
-                        if let Some(info) = acc.get("account").and_then(|a| a.get("data")).and_then(|d| d.get("parsed")).and_then(|p| p.get("info")) {
-                            let mint = info.get("mint").and_then(|m| m.as_str()).unwrap_or("").to_string();
-                            let ui_amt = info.get("tokenAmount").and_then(|t| t.get("uiAmount")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        if let Some(info) = acc
+                            .get("account")
+                            .and_then(|a| a.get("data"))
+                            .and_then(|d| d.get("parsed"))
+                            .and_then(|p| p.get("info"))
+                        {
+                            let mint = info
+                                .get("mint")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let ui_amt = info
+                                .get("tokenAmount")
+                                .and_then(|t| t.get("uiAmount"))
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
                             if !mint.is_empty() && ui_amt > 0.000001 {
                                 tokens.push((mint, ui_amt));
                             }
@@ -297,13 +448,12 @@ impl SolanaExecutor {
         Ok(json)
     }
 
-    /// Builds and signs a real on-chain transaction via Jupiter Swap API v1
-    pub async fn build_and_sign_jupiter_tx(
+    /// Builds an unsigned transaction and returns it with aggregator expiry.
+    pub async fn build_jupiter_unsigned_tx(
         &self,
         quote_json: Value,
         user_pubkey: &str,
-        signing_key: &SigningKey,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<u64>)> {
         let swap_url = "https://api.jup.ag/swap/v1/swap";
         let payload = serde_json::json!({
             "quoteResponse": quote_json,
@@ -326,32 +476,45 @@ impl SolanaExecutor {
             &swap_resp.swap_transaction,
         )?;
 
-        // Sign the VersionedTransaction payload
-        // In Solana VersionedTransaction, the first byte(s) encode signature count, followed by 64-byte signature slots, followed by the message
-        let signed_tx_base64 = if tx_bytes.len() > 65 {
-            let mut mutable_tx = tx_bytes.clone();
-            // Message offset starts after signature count (1 byte for single-sig) + 64 bytes signature
-            let message_bytes = &tx_bytes[65..];
-            let signature = signing_key.sign(message_bytes);
-            mutable_tx[1..65].copy_from_slice(&signature.to_bytes());
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &mutable_tx)
-        } else {
-            swap_resp.swap_transaction
-        };
-
-        Ok(signed_tx_base64)
+        if tx_bytes.len() <= 65 {
+            return Err(anyhow!("Invalid Jupiter transaction payload received"));
+        }
+        Self::extract_recent_blockhash(&tx_bytes)?;
+        Ok((
+            swap_resp.swap_transaction,
+            swap_resp.last_valid_block_height,
+        ))
     }
 
-    /// Builds and signs a direct Pump.fun bonding curve swap transaction via PumpPortal Lightning Trade API
-    pub async fn build_and_sign_pumpfun_tx(
+    pub fn sign_transaction(
+        &self,
+        unsigned_base64: &str,
+        signing_key: &SigningKey,
+    ) -> Result<String> {
+        Self::sign_transaction_base64(unsigned_base64, signing_key)
+    }
+
+    pub async fn build_and_sign_jupiter_tx(
+        &self,
+        quote_json: Value,
+        user_pubkey: &str,
+        signing_key: &SigningKey,
+    ) -> Result<String> {
+        let (unsigned, _) = self
+            .build_jupiter_unsigned_tx(quote_json, user_pubkey)
+            .await?;
+        Self::sign_transaction_base64(&unsigned, signing_key)
+    }
+
+    /// Builds an unsigned PumpPortal transaction.
+    pub async fn build_pumpfun_unsigned_tx(
         &self,
         action: &str, // "buy" or "sell"
         mint: &str,
         amount: f64, // SOL amount for buy, Token units for sell
         slippage_pct: f64,
         user_pubkey: &str,
-        signing_key: &SigningKey,
-    ) -> Result<String> {
+    ) -> Result<(String, String)> {
         let url = "https://pumpportal.fun/api/trade-local";
         let payload = serde_json::json!({
             "publicKey": user_pubkey,
@@ -376,17 +539,26 @@ impl SolanaExecutor {
             return Err(anyhow!("Invalid PumpPortal transaction payload received"));
         }
 
-        let mut mutable_tx = tx_bytes.to_vec();
-        let message_bytes = &tx_bytes[65..];
-        let signature = signing_key.sign(message_bytes);
-        mutable_tx[1..65].copy_from_slice(&signature.to_bytes());
+        let blockhash = Self::extract_recent_blockhash(&tx_bytes)?;
+        let unsigned_base64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
-        let signed_base64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &mutable_tx,
-        );
+        Ok((unsigned_base64, blockhash))
+    }
 
-        Ok(signed_base64)
+    pub async fn build_and_sign_pumpfun_tx(
+        &self,
+        action: &str,
+        mint: &str,
+        amount: f64,
+        slippage_pct: f64,
+        user_pubkey: &str,
+        signing_key: &SigningKey,
+    ) -> Result<String> {
+        let (unsigned, _) = self
+            .build_pumpfun_unsigned_tx(action, mint, amount, slippage_pct, user_pubkey)
+            .await?;
+        Self::sign_transaction_base64(&unsigned, signing_key)
     }
 
     /// Broadcasts signed transaction via Multi-RPC & Jito Anti-MEV Bundles
@@ -449,9 +621,8 @@ impl SolanaExecutor {
                                     return Ok(false);
                                 }
                             }
-                            if let Some(conf) = status
-                                .get("confirmationStatus")
-                                .and_then(|s| s.as_str())
+                            if let Some(conf) =
+                                status.get("confirmationStatus").and_then(|s| s.as_str())
                             {
                                 if conf == "confirmed" || conf == "finalized" {
                                     println!(
@@ -489,13 +660,12 @@ impl SolanaExecutor {
             return Ok(None);
         }
 
-        let mut entry_price = if signal.current_pool_price.is_finite()
-            && signal.current_pool_price > 0.0
-        {
-            signal.current_pool_price
-        } else {
-            signal.whale_entry_price
-        };
+        let mut entry_price =
+            if signal.current_pool_price.is_finite() && signal.current_pool_price > 0.0 {
+                signal.current_pool_price
+            } else {
+                signal.whale_entry_price
+            };
 
         if !entry_price.is_finite() || entry_price <= 0.0 {
             eprintln!("[SOLANA EXEC ERROR] Cannot open shadow position with 0.0 price!");
@@ -547,11 +717,23 @@ impl SolanaExecutor {
                 )?;
                 if !intent_created {
                     let existing = self.db.get_execution_intent(&position_id)?;
-                    if existing.as_ref().and_then(|(_, _, _, signature)| signature.as_ref()).is_some() {
-                        return Err(anyhow!("Solana BUY intent sudah memiliki signature; menolak broadcast ulang"));
+                    if existing
+                        .as_ref()
+                        .and_then(|(_, _, _, signature)| signature.as_ref())
+                        .is_some()
+                    {
+                        return Err(anyhow!(
+                            "Solana BUY intent sudah memiliki signature; menolak broadcast ulang"
+                        ));
                     }
-                    return Err(anyhow!("Solana BUY intent sudah ada dan belum direkonsiliasi: {}", position_id));
+                    return Err(anyhow!(
+                        "Solana BUY intent sudah ada dan belum direkonsiliasi: {}",
+                        position_id
+                    ));
                 }
+
+                self.db
+                    .update_execution_intent(&position_id, "QUOTED", None, None)?;
 
                 let mut buy_success = false;
                 let is_pump_token = signal.token_mint.ends_with("pump");
@@ -560,27 +742,69 @@ impl SolanaExecutor {
                 if is_pump_token {
                     println!("[PUMPFUN ROUTE ⚡] Token ends with 'pump'. Attempting direct bonding curve buy...");
                     match self
-                        .build_and_sign_pumpfun_tx("buy", &signal.token_mint, amount_native_sol, 15.0, &user_pubkey, &signing_key)
+                        .build_pumpfun_unsigned_tx(
+                            "buy",
+                            &signal.token_mint,
+                            amount_native_sol,
+                            15.0,
+                            &user_pubkey,
+                        )
                         .await
                     {
-                        Ok(signed_pump_tx) => match self.broadcast_tx(&signed_pump_tx).await {
-                            Ok(sig) => {
-                                println!("[PUMPFUN BUY CONFIRMED 🟢] TX Sig: {}", sig);
-                                self.db.update_execution_intent(
-                                    &position_id,
-                                    "BROADCASTED",
-                                    None,
-                                    Some(&sig),
-                                )?;
-                                _onchain_tx_sig = Some(sig);
-                                buy_success = true;
+                        Ok((unsigned_pump_tx, transaction_blockhash)) => {
+                            self.db.update_execution_intent_metadata(
+                                &position_id,
+                                &ExecutionIntentMetadata {
+                                    nonce: None,
+                                    recent_blockhash: Some(transaction_blockhash.clone()),
+                                    last_valid_block_height: None,
+                                    calldata_hash: None,
+                                    quote_block: None,
+                                    expiry: None,
+                                },
+                            )?;
+                            self.db.update_execution_intent(
+                                &position_id,
+                                "SIMULATED",
+                                None,
+                                None,
+                            )?;
+                            let signed_pump_tx =
+                                Self::sign_transaction_base64(&unsigned_pump_tx, &signing_key)?;
+                            let signed_blockhash =
+                                Self::extract_recent_blockhash(&base64::Engine::decode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    &signed_pump_tx,
+                                )?)?;
+                            if signed_blockhash != transaction_blockhash {
+                                return Err(anyhow!(
+                                    "PumpPortal signed transaction blockhash changed"
+                                ));
                             }
-                            Err(e) => {
-                                eprintln!("[PUMPFUN BROADCAST FAILED ⚠️] {}. Falling back to Jupiter...", e);
+                            self.db
+                                .update_execution_intent(&position_id, "SIGNED", None, None)?;
+                            match self.broadcast_tx(&signed_pump_tx).await {
+                                Ok(sig) => {
+                                    println!("[PUMPFUN BUY CONFIRMED 🟢] TX Sig: {}", sig);
+                                    self.db.update_execution_intent(
+                                        &position_id,
+                                        "BROADCASTED",
+                                        None,
+                                        Some(&sig),
+                                    )?;
+                                    _onchain_tx_sig = Some(sig);
+                                    buy_success = true;
+                                }
+                                Err(e) => {
+                                    eprintln!("[PUMPFUN BROADCAST FAILED ⚠️] {}. Falling back to Jupiter...", e);
+                                }
                             }
-                        },
+                        }
                         Err(e) => {
-                            eprintln!("[PUMPFUN BUILD FAILED ⚠️] {}. Falling back to Jupiter...", e);
+                            eprintln!(
+                                "[PUMPFUN BUILD FAILED ⚠️] {}. Falling back to Jupiter...",
+                                e
+                            );
                         }
                     }
                 }
@@ -597,27 +821,72 @@ impl SolanaExecutor {
                         .await
                     {
                         Ok(quote) => {
-                            match self
-                                .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
-                                .await
-                            {
-                                Ok(signed_tx) => match self.broadcast_tx(&signed_tx).await {
-                                    Ok(sig) => {
-                                        println!("[ONCHAIN BUY CONFIRMED 🟢] TX Sig: {}", sig);
-                                        self.db.update_execution_intent(
-                                            &position_id,
-                                            "BROADCASTED",
-                                            None,
-                                            Some(&sig),
-                                        )?;
-                                        _onchain_tx_sig = Some(sig);
-                                        buy_success = true;
+                            match self.build_jupiter_unsigned_tx(quote, &user_pubkey).await {
+                                Ok((unsigned_tx, aggregator_expiry)) => {
+                                    let tx_bytes = base64::Engine::decode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &unsigned_tx,
+                                    )?;
+                                    let transaction_blockhash =
+                                        Self::extract_recent_blockhash(&tx_bytes)?;
+                                    self.db.update_execution_intent_metadata(
+                                        &position_id,
+                                        &ExecutionIntentMetadata {
+                                            nonce: None,
+                                            recent_blockhash: Some(transaction_blockhash.clone()),
+                                            last_valid_block_height: aggregator_expiry
+                                                .map(i64::try_from)
+                                                .transpose()
+                                                .map_err(|_| {
+                                                    anyhow!("lastValidBlockHeight exceeds i64")
+                                                })?,
+                                            calldata_hash: None,
+                                            quote_block: None,
+                                            expiry: None,
+                                        },
+                                    )?;
+                                    self.db.update_execution_intent(
+                                        &position_id,
+                                        "SIMULATED",
+                                        None,
+                                        None,
+                                    )?;
+                                    let signed_tx =
+                                        Self::sign_transaction_base64(&unsigned_tx, &signing_key)?;
+                                    let signed_blockhash =
+                                        Self::extract_recent_blockhash(&base64::Engine::decode(
+                                            &base64::engine::general_purpose::STANDARD,
+                                            &signed_tx,
+                                        )?)?;
+                                    if signed_blockhash != transaction_blockhash {
+                                        return Err(anyhow!(
+                                            "Jupiter signed transaction blockhash changed"
+                                        ));
                                     }
-                                    Err(e) => {
-                                        eprintln!("[ONCHAIN BROADCAST FAILED ❌] {}", e);
-                                        return Ok(None);
+                                    self.db.update_execution_intent(
+                                        &position_id,
+                                        "SIGNED",
+                                        None,
+                                        None,
+                                    )?;
+                                    match self.broadcast_tx(&signed_tx).await {
+                                        Ok(sig) => {
+                                            println!("[ONCHAIN BUY CONFIRMED 🟢] TX Sig: {}", sig);
+                                            self.db.update_execution_intent(
+                                                &position_id,
+                                                "BROADCASTED",
+                                                None,
+                                                Some(&sig),
+                                            )?;
+                                            _onchain_tx_sig = Some(sig);
+                                            buy_success = true;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[ONCHAIN BROADCAST FAILED ❌] {}", e);
+                                            return Ok(None);
+                                        }
                                     }
-                                },
+                                }
                                 Err(e) => {
                                     eprintln!("[JUPITER TX BUILD FAILED ❌] {}", e);
                                     return Ok(None);
@@ -640,14 +909,24 @@ impl SolanaExecutor {
                         .await
                         .unwrap_or(false);
                     if !confirmed {
-                        self.db.update_execution_intent(&position_id, "PENDING_RECONCILIATION", None, Some(tx_signature))?;
+                        self.db.update_execution_intent(
+                            &position_id,
+                            "PENDING_RECONCILIATION",
+                            None,
+                            Some(tx_signature),
+                        )?;
                         eprintln!(
                             "[ONCHAIN BUY REJECTED ❌] Transaction {} was not confirmed; no position will be persisted.",
                             tx_signature
                         );
                         return Ok(None);
                     }
-                    self.db.update_execution_intent(&position_id, "CONFIRMED", None, Some(tx_signature))?;
+                    self.db.update_execution_intent(
+                        &position_id,
+                        "CONFIRMED",
+                        None,
+                        Some(tx_signature),
+                    )?;
 
                     // Reconcile exact token balance from chain before creating OPEN position.
                     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -664,12 +943,19 @@ impl SolanaExecutor {
                     }
                     new_tokens = onchain_bal;
                     entry_price = amount_usd / onchain_bal;
-                    self.db.update_execution_intent(&position_id, "RECONCILED", None, Some(tx_signature))?;
+                    self.db.update_execution_intent(
+                        &position_id,
+                        "RECONCILED",
+                        None,
+                        Some(tx_signature),
+                    )?;
                     println!("[ONCHAIN RECONCILED 📊] Exact Token Units: {:.4} -> Exact Real Entry Price: ${:.6}",
                         onchain_bal, entry_price);
                 }
             } else {
-                eprintln!("[LIVE EXECUTION ERROR ❌] No valid Solana private key found. Refusing trade.");
+                eprintln!(
+                    "[LIVE EXECUTION ERROR ❌] No valid Solana private key found. Refusing trade."
+                );
                 return Ok(None);
             }
         } else {
@@ -706,7 +992,8 @@ impl SolanaExecutor {
                 // Reconcile total balance directly against on-chain wallet state
                 let maybe_pubkey = self.get_keypair().ok().map(|(_, pk)| pk);
                 let total_tokens = if let Some(pk) = maybe_pubkey {
-                    if let Ok(latest_bal) = self.get_ui_token_balance(&pk, &signal.token_mint).await {
+                    if let Ok(latest_bal) = self.get_ui_token_balance(&pk, &signal.token_mint).await
+                    {
                         if latest_bal > prev_tokens {
                             latest_bal
                         } else {
@@ -779,9 +1066,6 @@ impl SolanaExecutor {
         };
 
         self.db.upsert_position(&position)?;
-        if !self.config.dry_run {
-            self.db.update_execution_intent(&position_id, "OPEN", None, _onchain_tx_sig.as_deref())?;
-        }
         Ok(Some(position))
     }
 
@@ -857,19 +1141,28 @@ impl SolanaExecutor {
                             println!("[PUMPFUN SELL ROUTE ⚡] Attempting direct bonding curve sell for {}...", pos.token_symbol);
                             let sell_tokens_float = (sell_units as f64) / 1_000_000.0;
                             match self
-                                .build_and_sign_pumpfun_tx("sell", &pos.token_mint, sell_tokens_float, 15.0, &user_pubkey, &signing_key)
+                                .build_and_sign_pumpfun_tx(
+                                    "sell",
+                                    &pos.token_mint,
+                                    sell_tokens_float,
+                                    15.0,
+                                    &user_pubkey,
+                                    &signing_key,
+                                )
                                 .await
                             {
-                                Ok(signed_pump_tx) => match self.broadcast_tx(&signed_pump_tx).await {
-                                    Ok(sig) => {
-                                        println!("[PUMPFUN SELL CONFIRMED 🟢] TX Sig: {}", sig);
-                                        final_tx_sig = sig;
-                                        sell_broadcasted = true;
+                                Ok(signed_pump_tx) => {
+                                    match self.broadcast_tx(&signed_pump_tx).await {
+                                        Ok(sig) => {
+                                            println!("[PUMPFUN SELL CONFIRMED 🟢] TX Sig: {}", sig);
+                                            final_tx_sig = sig;
+                                            sell_broadcasted = true;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[PUMPFUN SELL BROADCAST FAILED ⚠️] {}. Falling back to Jupiter...", e);
+                                        }
                                     }
-                                    Err(e) => {
-                                        eprintln!("[PUMPFUN SELL BROADCAST FAILED ⚠️] {}. Falling back to Jupiter...", e);
-                                    }
-                                },
+                                }
                                 Err(e) => {
                                     eprintln!("[PUMPFUN SELL BUILD FAILED ⚠️] {}. Falling back to Jupiter...", e);
                                 }
@@ -941,7 +1234,9 @@ impl SolanaExecutor {
                                 "[SELL CONFIRMATION FAILED ❌] On-chain tx {} failed, reverted, or timed out. Position {} will remain OPEN in DB!",
                                 final_tx_sig, position_id
                             );
-                            return Err(anyhow!("On-chain swap transaction reverted or unconfirmed"));
+                            return Err(anyhow!(
+                                "On-chain swap transaction reverted or unconfirmed"
+                            ));
                         }
 
                         println!(
@@ -979,5 +1274,43 @@ impl SolanaExecutor {
     ) -> Result<()> {
         self.execute_partial_shadow_sell(position_id, 100.0, exit_reason, current_price)
             .await
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::SolanaExecutor;
+
+    fn fixture(versioned: bool, blockhash: [u8; 32]) -> Vec<u8> {
+        let mut tx = vec![1u8];
+        tx.extend([0u8; 64]);
+        if versioned {
+            tx.push(0x80);
+        }
+        tx.extend([0u8, 0u8, 0u8]);
+        tx.push(1u8);
+        tx.extend([7u8; 32]);
+        tx.extend(blockhash);
+        tx
+    }
+
+    #[test]
+    fn extracts_blockhash_from_versioned_and_legacy_messages() {
+        let expected = [9u8; 32];
+        let encoded = bs58::encode(expected).into_string();
+        assert_eq!(
+            SolanaExecutor::extract_recent_blockhash(&fixture(true, expected)).unwrap(),
+            encoded
+        );
+        assert_eq!(
+            SolanaExecutor::extract_recent_blockhash(&fixture(false, expected)).unwrap(),
+            encoded
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_and_overflowed_shortvec() {
+        assert!(SolanaExecutor::extract_recent_blockhash(&[]).is_err());
+        assert!(SolanaExecutor::extract_recent_blockhash(&[0x80; 10]).is_err());
     }
 }

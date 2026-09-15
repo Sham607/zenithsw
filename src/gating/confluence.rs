@@ -22,7 +22,13 @@ impl ConfluenceEngine {
         current_pool_price: f64,
         pool_liquidity_usd: f64,
     ) -> Result<ShadowSignal> {
-        self.evaluate_activity_with_mcap(activity, wallet, current_pool_price, pool_liquidity_usd, 0.0)
+        self.evaluate_activity_with_mcap(
+            activity,
+            wallet,
+            current_pool_price,
+            pool_liquidity_usd,
+            0.0,
+        )
     }
 
     pub fn evaluate_activity_with_mcap(
@@ -140,13 +146,12 @@ impl ConfluenceEngine {
         }
 
         // 2. Strict Price Discovery Gate (finite positive values are mandatory)
-        let whale_entry_price = if activity.execution_price_usd.is_finite()
-            && activity.execution_price_usd > 0.0
-        {
-            activity.execution_price_usd
-        } else {
-            current_pool_price
-        };
+        let whale_entry_price =
+            if activity.execution_price_usd.is_finite() && activity.execution_price_usd > 0.0 {
+                activity.execution_price_usd
+            } else {
+                current_pool_price
+            };
 
         if !whale_entry_price.is_finite()
             || whale_entry_price <= 0.0
@@ -246,7 +251,9 @@ impl ConfluenceEngine {
         // Gating Check B: Strict Execution Whitelist Guard
         // 1. Unverified automated sources (only generic auto-indexers without Tier-S reputation) are blocked
         // Tier-S clusters and validated shadow arms are explicitly permitted to execute
-        if wallet.tier != WalletTier::TierS && (wallet.source.contains("INDEXER") || wallet.source.contains("DETECTIVE")) {
+        if wallet.tier != WalletTier::TierS
+            && (wallet.source.contains("INDEXER") || wallet.source.contains("DETECTIVE"))
+        {
             is_passed = false;
             if rejection_reason.is_none() {
                 rejection_reason = Some(format!(
@@ -281,7 +288,7 @@ impl ConfluenceEngine {
             whale_handle: activity.wallet_handle.clone(),
             whale_address: activity.wallet_address.clone(),
             whale_tier: wallet.tier,
-                track: wallet.execution_track,
+            track: wallet.execution_track,
             whale_entry_price: activity.execution_price_usd,
             current_pool_price,
             price_delta_pct,

@@ -238,7 +238,6 @@ impl FomoScraper {
                 };
 
                 let win_rate_pct = (92.0 - (rank as f64 * 0.25)).clamp(68.0, 96.5);
-
                 let smart_wallet = SmartWallet {
                     id: None,
                     address,
@@ -259,7 +258,7 @@ impl FomoScraper {
                 };
                 // Do NOT upsert unverified FOMO scrapings into verified smart_wallets table!
                 // Wallets must come strictly from on-chain verified harvesters.
-                // let _ = self.db.upsert_wallet(&smart_wallet);
+                drop(smart_wallet);
 
                 if let Some(holdings) = item.get("topHoldings").and_then(|h| h.as_array()) {
                     for h in holdings {
@@ -480,13 +479,18 @@ impl FomoScraper {
 
                         // 2. Strict Price & Minimum Liquidity Filter
                         let min_liq_threshold = self.config.min_liquidity_usd;
-                        if price_usd <= 0.0 || (dex_id != "pumpfun" && liquidity_usd < min_liq_threshold) {
+                        if price_usd <= 0.0
+                            || (dex_id != "pumpfun" && liquidity_usd < min_liq_threshold)
+                        {
                             let _ = self.db.delete_tracked_token(&token_addr);
                             continue;
                         }
 
                         // 3. Strict Real Quote Collateral Floor (Anti-CLMM spoof for non-pump pools)
-                        if dex_id != "pumpfun" && liquidity_usd >= 100_000.0 && real_quote_reserve_usd < 5_000.0 {
+                        if dex_id != "pumpfun"
+                            && liquidity_usd >= 100_000.0
+                            && real_quote_reserve_usd < 5_000.0
+                        {
                             let _ = self.db.delete_tracked_token(&token_addr);
                             continue;
                         }
@@ -500,7 +504,7 @@ impl FomoScraper {
                         }
 
                         // 5. Strict Nano/Micro-Cap Radar Filter ($50k - $20M Market Cap)
-                        if market_cap_usd > 20_000_000.0 || market_cap_usd < 50_000.0 {
+                        if !(50_000.0..=20_000_000.0).contains(&market_cap_usd) {
                             let _ = self.db.delete_tracked_token(&token_addr);
                             continue;
                         }
@@ -530,11 +534,11 @@ impl FomoScraper {
                         // Classify Upside Potential (Nano/Micro/Low/Mid Cap)
                         let upside_tier = if market_cap_usd > 0.0 && market_cap_usd < 1_000_000.0 {
                             "NANO_CAP 🚀🚀 (<$1M)".to_string()
-                        } else if market_cap_usd >= 1_000_000.0 && market_cap_usd < 3_000_000.0 {
+                        } else if (1_000_000.0..3_000_000.0).contains(&market_cap_usd) {
                             "MICRO_CAP 🚀 ($1M-$3M)".to_string()
-                        } else if market_cap_usd >= 3_000_000.0 && market_cap_usd < 15_000_000.0 {
+                        } else if (3_000_000.0..15_000_000.0).contains(&market_cap_usd) {
                             "LOW_CAP 💎 ($3M-$15M)".to_string()
-                        } else if market_cap_usd >= 15_000_000.0 && market_cap_usd < 50_000_000.0 {
+                        } else if (15_000_000.0..50_000_000.0).contains(&market_cap_usd) {
                             "SMALL_CAP 💎 ($15M-$50M)".to_string()
                         } else {
                             "MID_LARGE 🛡️ (>$50M)".to_string()
@@ -543,8 +547,7 @@ impl FomoScraper {
                         // Classify Bottom vs Pucuk Status
                         let status = if change_24h_pct > 100.0 || change_6h_pct > 35.0 {
                             "LOCAL_TOP 🔴 (Wait Pullback)".to_string()
-                        } else if change_24h_pct >= -30.0
-                            && change_24h_pct <= 25.0
+                        } else if (-30.0..=25.0).contains(&change_24h_pct)
                             && liquidity_usd >= 15_000.0
                         {
                             "ACCUMULATION_BOTTOM 🟢 (Ready Buy)".to_string()
@@ -672,7 +675,7 @@ impl FomoScraper {
         let top_wallets = self.fetch_top_traders().await?;
         let count = top_wallets.len();
         for wallet in top_wallets {
-            let _ = self.db.upsert_wallet(&wallet)?;
+            self.db.upsert_wallet(&wallet)?;
         }
         Ok(count)
     }

@@ -9,11 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub struct SmartMoneyIndexer {
-    solana_rpc_url: String,
-    robinhood_rpc_url: String,
-    db: Arc<SmartWalletDb>,
-    candidate_db: Arc<CandidateWalletDb>,
-    client: Client,
     profiler: WinnerProfiler,
 }
 
@@ -25,26 +20,9 @@ impl SmartMoneyIndexer {
         candidate_db: Arc<CandidateWalletDb>,
         _scan_interval_secs: u64,
     ) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(12))
-            .build()
-            .unwrap_or_default();
+        let profiler = WinnerProfiler::new(solana_rpc_url, robinhood_rpc_url, db, candidate_db);
 
-        let profiler = WinnerProfiler::new(
-            solana_rpc_url,
-            robinhood_rpc_url,
-            db.clone(),
-            candidate_db.clone(),
-        );
-
-        Self {
-            solana_rpc_url: solana_rpc_url.to_string(),
-            robinhood_rpc_url: robinhood_rpc_url.to_string(),
-            db,
-            candidate_db,
-            client,
-            profiler,
-        }
+        Self { profiler }
     }
 
     /// Perform a full dual-chain scan for newly active smart money
@@ -68,7 +46,12 @@ pub struct WinnerProfiler {
 }
 
 impl WinnerProfiler {
-    pub fn new(helius_rpc_url: &str, robinhood_rpc_url: &str, db: Arc<SmartWalletDb>, candidate_db: Arc<CandidateWalletDb>) -> Self {
+    pub fn new(
+        helius_rpc_url: &str,
+        robinhood_rpc_url: &str,
+        db: Arc<SmartWalletDb>,
+        candidate_db: Arc<CandidateWalletDb>,
+    ) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(12))
             .build()
@@ -200,7 +183,8 @@ impl WinnerProfiler {
 
                         // Auto-discovered DEX buyers are strictly quarantined to Tier-B (Monitor Only)
                         let tier = WalletTier::TierB;
-                        let reputation_score = (40.0 + (eth_bal * 10.0).min(15.0)).clamp(30.0, 55.0);
+                        let reputation_score =
+                            (40.0 + (eth_bal * 10.0).min(15.0)).clamp(30.0, 55.0);
 
                         let handle = format!(
                             "rh_{}_{}",
@@ -326,10 +310,6 @@ impl WinnerProfiler {
                 candidates.push(TrendingTokenCandidate {
                     chain,
                     token_address,
-                    symbol: "EXPLORING".to_string(),
-                    price_usd: 0.0,
-                    volume_24h_usd: 100_000.0,
-                    liquidity_usd: 50_000.0,
                 });
             }
         }
@@ -410,7 +390,11 @@ impl WinnerProfiler {
         let nonce = rpc.get_transaction_count(address, "latest").await?;
         let balance_wei = u128::from_str_radix(balance.trim_start_matches("0x"), 16)?;
         let tx_count = usize::from_str_radix(nonce.trim_start_matches("0x"), 16)?;
-        Ok((balance_wei as f64 / 1_000_000_000_000_000_000.0, tx_count, 0.0))
+        Ok((
+            balance_wei as f64 / 1_000_000_000_000_000_000.0,
+            tx_count,
+            0.0,
+        ))
     }
 
     /// Extract early buyers for Solana mint via Helius RPC
@@ -547,8 +531,4 @@ impl WinnerProfiler {
 struct TrendingTokenCandidate {
     pub chain: Chain,
     pub token_address: String,
-    pub symbol: String,
-    pub price_usd: f64,
-    pub volume_24h_usd: f64,
-    pub liquidity_usd: f64,
 }

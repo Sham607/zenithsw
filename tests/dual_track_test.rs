@@ -4,8 +4,8 @@ use zenithsw::config::Config;
 use zenithsw::db::SmartWalletDb;
 use zenithsw::gating::ConfluenceEngine;
 use zenithsw::models::{
-    ActivityType, Chain, ExecutionTrack, ShadowPosition, SmartWallet, TrackedToken,
-    WalletActivity, WalletTier,
+    ActivityType, Chain, ExecutionTrack, ShadowPosition, SmartWallet, TrackedToken, WalletActivity,
+    WalletTier,
 };
 
 #[tokio::test]
@@ -99,6 +99,7 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         enable_base: false,
         trading_db_path: ":memory:".to_string(),
         wallet_db_path: ":memory:".to_string(),
+        candidate_db_path: ":memory:".to_string(),
         ipc_socket_path: "/tmp/zenithsw_test.sock".to_string(),
     };
 
@@ -122,7 +123,8 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         status: "ACTIVE".to_string(),
         upside_tier: "10X_ALPHA".to_string(),
         last_scanned_at: now,
-    }).unwrap();
+    })
+    .unwrap();
 
     // Activity from Swing Whale
     let act_swing = WalletActivity {
@@ -143,7 +145,9 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         timestamp: now,
     };
 
-    let sig_swing = confluence.evaluate_activity(&act_swing, &w_swing, 0.051, 250000.0).unwrap();
+    let sig_swing = confluence
+        .evaluate_activity(&act_swing, &w_swing, 0.051, 250000.0)
+        .unwrap();
     assert_eq!(sig_swing.track, ExecutionTrack::FastLane);
     assert!(sig_swing.is_passed);
 
@@ -166,7 +170,9 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         timestamp: now,
     };
 
-    let sig_vault = confluence.evaluate_activity(&act_vault, &w_vault, 0.051, 250000.0).unwrap();
+    let sig_vault = confluence
+        .evaluate_activity(&act_vault, &w_vault, 0.051, 250000.0)
+        .unwrap();
     assert_eq!(sig_vault.track, ExecutionTrack::VaultLane);
     assert!(sig_vault.is_passed);
 
@@ -228,13 +234,20 @@ async fn test_dual_track_db_roundtrip_and_routing() {
 
     let active_positions = db.get_active_positions().unwrap();
     assert_eq!(active_positions.len(), 2);
-    let p_fast = active_positions.iter().find(|p| p.id == "pos_fast_01").unwrap();
+    let p_fast = active_positions
+        .iter()
+        .find(|p| p.id == "pos_fast_01")
+        .unwrap();
     assert_eq!(p_fast.track, ExecutionTrack::FastLane);
-    let p_vault = active_positions.iter().find(|p| p.id == "pos_vault_01").unwrap();
+    let p_vault = active_positions
+        .iter()
+        .find(|p| p.id == "pos_vault_01")
+        .unwrap();
     assert_eq!(p_vault.track, ExecutionTrack::VaultLane);
 
     // Close position and verify trade_history retains track
-    db.close_position_portion("pos_fast_01", 100.0, "FAST_TP", 0.06).unwrap();
+    db.close_position_portion("pos_fast_01", 100.0, "FAST_TP", 0.06)
+        .unwrap();
     let trades = db.get_recent_trades(5).unwrap();
     assert_eq!(trades.len(), 1);
     assert_eq!(trades[0].track, ExecutionTrack::FastLane);
