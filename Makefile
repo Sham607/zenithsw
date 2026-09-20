@@ -1,5 +1,4 @@
-RUST_TOOLCHAIN ?= rust@1.94.1
-CARGO = mise exec $(RUST_TOOLCHAIN) -- cargo
+CARGO ?= cargo
 
 .PHONY: all build release test start engine stop restart reset clean help
 

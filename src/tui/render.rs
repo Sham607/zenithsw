@@ -294,6 +294,28 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
             act.token_mint.clone()
         };
 
+        let sig_display = if act.tx_signature.len() > 12 {
+            format!(
+                "{}...{}",
+                &act.tx_signature[..5],
+                &act.tx_signature[act.tx_signature.len() - 4..]
+            )
+        } else if !act.tx_signature.is_empty() {
+            act.tx_signature.clone()
+        } else {
+            "-".to_string()
+        };
+
+        let ver_badge = match act.parser_version.as_deref() {
+            Some(v) if v.starts_with("dex-") => Span::styled(
+                " [VERIFIED]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            _ => Span::styled(" [LEGACY]", Style::default().fg(Color::DarkGray)),
+        };
+
         let line2 = Line::from(vec![
             Span::raw("   └─ Token: "),
             Span::styled(
@@ -302,13 +324,16 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" | Contract: "),
+            Span::raw(" | Mint: "),
             Span::styled(
                 mint_display,
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::UNDERLINED),
             ),
+            Span::raw(" | Tx: "),
+            Span::styled(sig_display, Style::default().fg(Color::Cyan)),
+            ver_badge,
         ]);
 
         act_items.push(ListItem::new(vec![line1, line2]));
@@ -671,115 +696,75 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
     let header = Row::new(vec![
-        "Rank",
-        "Token",
+        "#",
+        "Ticker",
         "Chain",
-        "Contract / Mint Address",
-        "Whale Cluster",
-        "Whale 7d Vol ($)",
-        "MCap & Upside Potential",
-        "Pool Liquidity",
-        "Price (USD)",
-        "24h / 1h",
-        "Market Structure & Action",
+        "Mint",
+        "Pool / DEX",
+        "MCap",
+        "Liquidity",
+        "Price",
+        "24H / 1H",
+        "Whales",
+        "Clusters",
+        "Structure / Price Action",
     ])
     .style(
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
-    )
-    .bottom_margin(1);
+    );
 
     let rows: Vec<Row> = app
-        .tracked_tokens
+        .radar_projections
         .iter()
         .enumerate()
-        .map(|(idx, t)| {
-            let status_color =
-                if t.status.contains("ACCUMULATION_BOTTOM") || t.status.contains("Ready Buy") {
-                    Color::Green
-                } else if t.status.contains("PULLBACK") || t.status.contains("OVERSOLD") {
-                    Color::Yellow
-                } else if t.status.contains("LOCAL_TOP") {
-                    Color::Red
-                } else {
-                    Color::White
-                };
-
-            let upside_style = if t.upside_tier.contains("NANO_CAP") {
-                Style::default()
-                    .fg(Color::LightYellow)
-                    .add_modifier(Modifier::BOLD)
-            } else if t.upside_tier.contains("MICRO_CAP") {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else if t.upside_tier.contains("LOW_CAP") {
-                Style::default().fg(Color::LightBlue)
-            } else if t.upside_tier.contains("SMALL_CAP") {
-                Style::default().fg(Color::Magenta)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            let mint_display = if t.token_mint.len() > 18 {
+        .map(|(idx, projection)| {
+            let token = if projection.token_address.len() > 18 {
                 format!(
                     "{}...{}",
-                    &t.token_mint[..8],
-                    &t.token_mint[t.token_mint.len() - 6..]
+                    &projection.token_address[..8],
+                    &projection.token_address[projection.token_address.len() - 6..]
                 )
             } else {
-                t.token_mint.clone()
+                projection.token_address.clone()
             };
-
-            let mcap_str = if t.market_cap_usd >= 1_000_000.0 {
-                format!("${:.1}M", t.market_cap_usd / 1_000_000.0)
-            } else {
-                format!("${:.0}k", t.market_cap_usd / 1_000.0)
+            let status_color = match projection.status {
+                crate::radar::RadarStatus::HighPriorityRadar => Color::Green,
+                crate::radar::RadarStatus::StructureConfirmed => Color::Yellow,
+                crate::radar::RadarStatus::PortfolioOnly => Color::White,
             };
-
-            let whale_usd_str = if t.total_whale_usd >= 1_000_000.0 {
-                format!("${:.2}M", t.total_whale_usd / 1_000_000.0)
-            } else if t.total_whale_usd >= 1_000.0 {
-                format!("${:.1}k", t.total_whale_usd / 1_000.0)
-            } else {
-                format!("${:.0}", t.total_whale_usd)
-            };
-
-            let liq_str = if t.liquidity_usd >= 1_000_000.0 {
-                format!("${:.2}M", t.liquidity_usd / 1_000_000.0)
-            } else if t.liquidity_usd >= 1_000.0 {
-                format!("${:.1}k", t.liquidity_usd / 1_000.0)
-            } else {
-                format!("${:.0}", t.liquidity_usd)
-            };
-
-            let cluster_display = format!("{} Whales ({})", t.whale_count, t.top_whale_handles);
-            let upside_full = format!("{} [{}]", mcap_str, t.upside_tier);
-
             Row::new(vec![
-                Cell::from(format!("#{}", idx + 1)).style(
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Cell::from(t.token_symbol.clone()).style(
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Cell::from(t.chain.to_string()),
-                Cell::from(mint_display).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(cluster_display),
-                Cell::from(whale_usd_str).style(Style::default().fg(Color::Green)),
-                Cell::from(upside_full).style(upside_style),
-                Cell::from(liq_str),
-                Cell::from(format!("${:.6}", t.price_usd)),
+                Cell::from(format!("#{}", idx + 1)),
+                Cell::from(projection.symbol.as_deref().unwrap_or("UNKNOWN")),
+                Cell::from(projection.chain.to_string()),
+                Cell::from(token).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(format!(
-                    "{:+.1}% / {:+.1}%",
-                    t.change_24h_pct, t.change_1h_pct
+                    "{} / {}",
+                    projection.pool_address.as_deref().unwrap_or("UNKNOWN"),
+                    projection.dex_id.as_deref().unwrap_or("UNKNOWN")
                 )),
-                Cell::from(t.status.clone()).style(Style::default().fg(status_color)),
+                Cell::from(format_usd(projection.market_cap_usd)),
+                Cell::from(format_usd(projection.liquidity_usd)),
+                Cell::from(
+                    projection
+                        .price_usd
+                        .map_or_else(|| "n/a".to_string(), |price| format!("${price:.8}")),
+                ),
+                Cell::from(format_change(
+                    projection.change_24h_pct,
+                    projection.change_1h_pct,
+                )),
+                Cell::from(format!(
+                    "Q:{} C:{}",
+                    projection.qualified_holder_count, projection.candidate_holder_count
+                )),
+                Cell::from(projection.independent_cluster_count.to_string()),
+                Cell::from(format!(
+                    "{} / {}",
+                    projection.market_structure, projection.price_action
+                ))
+                .style(Style::default().fg(status_color)),
             ])
         })
         .collect();
@@ -788,22 +773,26 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Length(4),
-            Constraint::Percentage(9),
-            Constraint::Percentage(7),
-            Constraint::Percentage(14),
+            Constraint::Length(9),
+            Constraint::Length(9),
             Constraint::Percentage(18),
-            Constraint::Percentage(9),
-            Constraint::Percentage(13),
-            Constraint::Percentage(8),
-            Constraint::Percentage(8),
-            Constraint::Percentage(8),
-            Constraint::Percentage(12),
+            Constraint::Percentage(18),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(14),
+            Constraint::Length(17),
+            Constraint::Length(12),
+            Constraint::Length(9),
+            Constraint::Percentage(24),
         ],
     )
     .header(header)
     .block(
         Block::default().borders(Borders::ALL).title(Span::styled(
-            " WHALE GEMS RADAR (TOP 50 7D HOLDINGS • MICRO/SMALL-CAP UPSIDE & BOTTOM CONFIRMATION) ",
+            format!(
+                " WHALE GEMS RADAR — {} PROJECTIONS ",
+                app.radar_projections.len()
+            ),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -811,6 +800,22 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
     );
 
     frame.render_widget(table, area);
+}
+
+fn format_change(change_24h: Option<f64>, change_1h: Option<f64>) -> String {
+    let h24 = change_24h.map_or_else(|| "n/a".to_string(), |value| format!("{value:+.1}%"));
+    let h1 = change_1h.map_or_else(|| "n/a".to_string(), |value| format!("{value:+.1}%"));
+    format!("24H {h24} / 1H {h1}")
+}
+
+fn format_usd(value: f64) -> String {
+    if value >= 1_000_000.0 {
+        format!("${:.2}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("${:.1}k", value / 1_000.0)
+    } else {
+        format!("${value:.0}")
+    }
 }
 
 fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {

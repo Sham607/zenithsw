@@ -352,3 +352,106 @@ Setiap pekerjaan selesai harus menambahkan:
 - hasil numerik,
 - blocker dan risiko yang masih terbuka,
 - status engine/signing/broadcast.
+
+---
+
+### Update 17 Sep 2026 WIB — Integrasi Mekanisme Pertahanan Blueprint Solana (`src/lab.js`) ke ZenithSW
+
+#### Ringkasan Perubahan:
+1. **Dynamic Token Quarantine (`TokenCooldownRegistry`):**
+   - Modul baru `src/gating/cooldown.rs`, diintegrasikan ke `ConfluenceEngine` (`src/gating/confluence.rs`).
+   - Mencegah spam RPC/transmisi pada token yang gagal dieksekusi dengan backoff eksponensial $15 \text{ menit} \times 2^n$ (maks. 4 jam).
+   - Penolakan zero-cost sebelum menembak RPC/DexScreener.
+2. **Realizable Exit Quote Provider & TTL Cache:**
+   - Helper `get_realizable_exit_quote` di `src/execution/solana_executor.rs`.
+   - In-memory cache dengan TTL 60 detik (fallback aman hingga 180 detik jika Jupiter mengalami timeout/429).
+   - Injeksi pemantauan di Task 3 `src/bin/engine.rs` saat posisi Solana mendekati $\ge +10\%$ atau $\le -20\%$.
+3. **Pure Whale Mirror Dump (Zero Kompromi):**
+   - Penegakan dumping 100% instan saat target whale menjual $\ge 95\%$ tanpa delay holding time.
+4. **Attribution Tracking & Automated Wallet Demotion:**
+   - Metode `check_and_demote_underperforming_whale` di `src/db.rs`.
+   - Ditrigger otomatis setelah penutupan posisi di `trade_history`.
+   - Menurunkan wallet ke `TIER-B` dan menonaktifkan (`is_active = 0`) jika membukukan 2 kali kerugian beruntun atau menderita drawdown tunggal $\ge -30\%$.
+
+#### File yang Diubah:
+- `src/gating/cooldown.rs` (baru)
+- `src/gating/mod.rs`
+- `src/gating/confluence.rs`
+- `src/execution/solana_executor.rs`
+- `src/db.rs`
+- `src/bin/engine.rs`
+- `tests/simulation_test.rs`
+
+#### Bukti Pengujian & Kompilasi:
+- `cargo check --locked` → Finished dev profile in 11.39s (0 error, clean).
+- `cargo test --lib gating::cooldown` → **3 passed, 0 failed**.
+- `cargo test --test simulation_test test_gating_token_quarantine_cooldown` → **1 passed, 0 failed**.
+- `cargo test --test simulation_test test_wallet_demotion` → **2 passed, 0 failed**.
+- `cargo test --locked` (Full Suite) → **204 passed, 0 failed, 0 ignored** across unit tests, IPC, runtime harness, and simulation harness.
+
+Status: **DONE — tested/runtime-verified; zero regressions pada codebase.**
+
+---
+
+### Update 17 Sep 2026 WIB — Ekstraksi 100% Parameter Trading ke `.env`
+
+#### Ringkasan Perubahan:
+1. **Config Struct & Parser Hardening (`src/config.rs`):**
+   - Menambahkan 9 variabel baru ke `Config`:
+     - `TAKE_PROFIT_2_PCT` (default: `300.0`%)
+     - `LIQUIDITY_DRAIN_USD` (default: `10000.0` USD)
+     - `PEAK_DRAWDOWN_PCT` (default: `50.0`%)
+     - `PROFIT_LOCK_FLOOR_PCT` (default: `20.0`%)
+     - `WHALE_FULL_DUMP_PCT` (default: `95.0`%)
+     - `QUARANTINE_BASE_MINUTES` (default: `15` min)
+     - `QUARANTINE_MAX_MINUTES` (default: `240` min)
+     - `DEMOTE_CONSECUTIVE_LOSSES` (default: `2` trades)
+     - `DEMOTE_CATASTROPHIC_LOSS_PCT` (default: `30.0`%)
+   - Validasi fail-closed: menolak angka <= 0, infinite/NaN, base > max quarantine, atau pct > 100.
+2. **Dynamic In-Memory Wiring:**
+   - `TokenCooldownRegistry` (`src/gating/cooldown.rs`) menerima `base_mins` dan `max_mins` dari Config.
+   - `SmartWalletDb` (`src/db.rs`) mendukung `set_demote_thresholds` dinamis via atomic configuration.
+   - `src/bin/engine.rs` mengikat seluruh threshold exit dan demotion langsung ke Config tanpa magic numbers.
+3. **Environment Templates:**
+   - `.env.example` dan `.env` diperbarui dengan deskripsi lengkap.
+
+#### Bukti Pengujian & Runtime:
+- `cargo check --locked` → Lulus dev profile (0 error, clean).
+- `cargo test --locked` (Full Suite) → **204 passed, 0 failed, 0 ignored**.
+- `cargo build --bin zenithsw-engine --release --locked` → Sukses.
+- `systemctl --user restart zenithsw-engine.service` → Active (running), PID `1103797`.
+
+Status: **DONE — 100% trading strategy parameters are customizable via `.env`.**
+
+---
+
+### Update 17 Sep 2026 WIB — Startup Physical Position Reconciliation & Orphan Token Recovery (Polymarket Pattern Adaptation)
+
+#### Ringkasan Perubahan:
+1. **Startup Physical SPL Token Scan (`src/execution/solana_executor.rs`):**
+   - Menambahkan method `reconcile_startup_positions(&self) -> Result<(usize, usize)>`.
+   - Mengambil seluruh saldo fisik SPL Token & Token-2022 di wallet on-chain via `getTokenAccountsByOwner`.
+   - Memfilter blacklist asset (USDC, USDT, WSOL).
+2. **Dual-State Reconciliation (On-Chain vs SQLite):**
+   - **Ghost Position Cleanup:** Posisi yang berstatus `status != 'CLOSED'` di SQLite namun saldo on-chain bernilai `0` langsung ditutup dengan exit reason `ORPHAN_AUDIT_ONCHAIN_ZERO`.
+   - **Balance Mismatch Sync:** Posisi aktif di SQLite yang jumlah tokennya berbeda dengan fisik on-chain disinkronisasikan ke saldo aktual.
+   - **Orphan Token Adoption:** Token on-chain dengan saldo `uiAmount > 0` yang tidak tercatat di SQLite otomatis diadopsi sebagai posisi aktif baru (`status = 'OPEN'`, `target_whale_handle = 'ORPHAN_ADOPTED'`, default risk framework aktif).
+3. **Engine Startup Pipeline Integration (`src/bin/engine.rs`):**
+   - Diinjeksi tepat setelah pemulihan intent transaksi dan sebelum worker streaming dimulai.
+   - Berjalan otomatis jika `ENABLE_SOLANA=true`.
+
+#### Bukti Pengujian & Verifikasi:
+- Unit test baru: `startup_reconciliation_logic_filters_blacklisted_and_zero_balances` di `src/execution/solana_executor.rs` → **Passed**.
+- `cargo check --bin zenithsw-engine` → **Passed (0 warning, 0 error)**.
+- `cargo test --test simulation_test` → **16 passed, 0 failed**.
+- `cargo test --test dual_track_test` → **1 passed, 0 failed**.
+
+Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
+
+## [2026-09-20] Eksperimen Mirror 1 Whale: wallet_registry.db di-rebuild dari bunker_wallet.db
+- [x] Backup: data/wallet_registry_backup_20260920_115233.db (integrity_check=ok, 541 wallet lama terjaga)
+- [x] Rebuild tabel wallets = 15 wallet bunker (satu-set identik, terverifikasi SQL), semua TIER-S / is_active=1 / execution_track=FAST_LANE / source=BUNKER_FORENSIC
+- [x] Gate otoritas engine (logika engine.rs:441-458 + db.rs:940): 15/15 PASS
+- [x] Fix 3 address terpotong di bunker+registry via match unik dari /tmp/unipcs_deep_scan.json (AgmLJBMD..., 5Yyz7b37..., C5Rvdk9w...)
+- [x] Verifikasi cross-check bunker vs registry: set identik, semua address 44-char base58
+- Catatan: engine TIDAK dijalankan otomatis; DRY_RUN=true (simulasi virtual). Rollback: copy backup ke wallet_registry.db

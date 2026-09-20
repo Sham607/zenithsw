@@ -9,6 +9,40 @@ use std::time::Duration;
 const ADDRESS_LEN: usize = 42;
 const POOL_MANAGER: &str = "0x8366a39CC670B4001A1121B8F6A443A643e40951";
 const INIT_TOPIC: &str = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
+const USDG: &str = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
+const ERC20_BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
+const ERC20_DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
+
+fn balance_of_calldata(address: &str) -> Result<Vec<u8>> {
+    if address.len() != ADDRESS_LEN || !address.starts_with("0x") {
+        anyhow::bail!("wallet address invalid");
+    }
+    let mut data = ERC20_BALANCE_OF_SELECTOR.to_vec();
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(&hex::decode(&address[2..])?);
+    Ok(data)
+}
+
+fn parse_u128_quantity(value: &Value) -> Result<u128> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("quantity bukan string"))?;
+    u128::from_str_radix(raw.trim_start_matches("0x"), 16)
+        .map_err(|error| anyhow::anyhow!("quantity hex invalid: {error}"))
+}
+
+fn format_units(value: u128, decimals: u32) -> String {
+    if decimals == 0 {
+        return value.to_string();
+    }
+    let scale = 10u128.pow(decimals);
+    let whole = value / scale;
+    let fraction = value % scale;
+    format!("{whole}.{fraction:0width$}", width = decimals as usize)
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
 
 fn address_from_key(raw: &str) -> Result<String> {
     let key = raw.trim_start_matches("0x");
@@ -214,7 +248,19 @@ async fn main() -> Result<()> {
         Some(address) => token_call(&client, &url, address, &[0x06, 0xfd, 0xde, 0x03]).await,
         None => Err(anyhow::anyhow!("token not specified")),
     };
+    let usdg_decimals = token_call(&client, &url, USDG, &ERC20_DECIMALS_SELECTOR).await?;
+    let usdg_decimals_raw = parse_u128_quantity(&usdg_decimals)?;
+    let usdg_decimals = u32::try_from(usdg_decimals_raw)?;
+    let usdg_balance = token_call(&client, &url, USDG, &balance_of_calldata(&wallet)?).await?;
+    let usdg_balance_raw = parse_u128_quantity(&usdg_balance)?;
     println!("chain_id={}", chain.as_str().unwrap_or(""));
+    println!("usdg_contract={}", USDG);
+    println!("usdg_decimals={}", usdg_decimals);
+    println!("usdg_balance_raw={}", usdg_balance_raw);
+    println!(
+        "usdg_balance={}",
+        format_units(usdg_balance_raw, usdg_decimals)
+    );
     println!("latest_block={}", block.as_str().unwrap_or(""));
     println!("wallet_address={}", wallet);
     println!("native_balance={}", balance.as_str().unwrap_or(""));

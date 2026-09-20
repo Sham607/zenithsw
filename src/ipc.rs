@@ -1,6 +1,7 @@
 use crate::models::{
     ShadowPosition, ShadowSignal, SmartWallet, TrackedToken, TradeRecord, WalletActivity,
 };
+use crate::radar::RadarProjection;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -77,6 +78,9 @@ pub enum IpcMessage {
     TrackedTokensUpdate {
         tokens: Vec<TrackedToken>,
     },
+    RadarSync {
+        projections: Vec<RadarProjection>,
+    },
     ActivityBroadcast {
         activity: WalletActivity,
     },
@@ -120,6 +124,10 @@ impl IpcServer {
 
     pub fn get_sender(&self) -> broadcast::Sender<String> {
         self.tx.clone()
+    }
+
+    pub fn receiver_count(&self) -> usize {
+        self.tx.receiver_count()
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -209,5 +217,58 @@ impl IpcClient {
         }
 
         Ok(())
+    }
+
+    async fn connect_and_listen_once<F, C>(&self, mut on_connect: C, mut callback: F) -> Result<()>
+    where
+        C: FnMut() + Send,
+        F: FnMut(IpcMessage) + Send,
+    {
+        let stream = UnixStream::connect(&self.socket_path).await?;
+        on_connect();
+        let reader = BufReader::new(stream);
+        let mut lines = reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(msg) = serde_json::from_str::<IpcMessage>(&line) {
+                callback(msg);
+            }
+        }
+        Ok(())
+    }
+
+    /// Mencoba koneksi ulang dengan batas attempt eksplisit.
+    /// EOF setelah koneksi valid dianggap disconnect dan akan di-retry.
+    pub async fn connect_and_listen_with_retry<F, C>(
+        &self,
+        max_attempts: usize,
+        retry_delay: std::time::Duration,
+        mut on_connect: C,
+        mut callback: F,
+    ) -> Result<()>
+    where
+        C: FnMut() + Send + 'static,
+        F: FnMut(IpcMessage) + Send + 'static,
+    {
+        if max_attempts == 0 {
+            anyhow::bail!("max_attempts IPC harus lebih besar dari nol");
+        }
+        let mut last_error = None;
+        for attempt in 0..max_attempts {
+            match self
+                .connect_and_listen_once(&mut on_connect, &mut callback)
+                .await
+            {
+                Ok(()) => last_error = None,
+                Err(error) => last_error = Some(error),
+            }
+            if attempt + 1 < max_attempts {
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+        if let Some(error) = last_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 }

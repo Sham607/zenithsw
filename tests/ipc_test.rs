@@ -83,6 +83,112 @@ async fn test_ipc_broadcast_and_client_roundtrip() {
 }
 
 #[tokio::test]
+async fn test_ipc_client_reconnects_and_receives_activity_payload() {
+    let socket_path = format!("/tmp/zenithsw_test_reconnect_{}.sock", std::process::id());
+    let server = Arc::new(IpcServer::new(&socket_path));
+    server.start().await.unwrap();
+    let client = IpcClient::new(&socket_path);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    let client_task = tokio::spawn(async move {
+        let _ = client
+            .connect_and_listen_with_retry(
+                4,
+                Duration::from_millis(25),
+                || {},
+                move |msg| {
+                    let _ = tx.try_send(msg);
+                },
+            )
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    server
+        .broadcast(&IpcMessage::Heartbeat {
+            uptime_secs: 1,
+            heartbeat_seq: 7,
+            solana_latency_ms: 1,
+            arbitrum_latency_ms: 0,
+            base_latency_ms: 0,
+            tracked_wallets_count: 1,
+            active_positions_count: 0,
+            wallet_sol_balance: 0.0,
+            sol_price_usd: 0.0,
+            wallet_equity_usd: 0.0,
+            total_realized_pnl_usd: 0.0,
+            min_liquidity_usd: 0.0,
+            max_price_delta_pct: 0.0,
+            position_size_usd: 0.0,
+            stop_loss_pct: 0.0,
+            take_profit_pct: 0.0,
+            min_whale_buy_usd: 0.0,
+            is_live_mode: false,
+            wallet_pubkey: String::new(),
+            heartbeat_timestamp_unix: 1,
+            solana_rpc_requests: 0,
+            solana_rpc_successes: 0,
+            solana_rpc_rate_limited: 0,
+            solana_rpc_failures: 0,
+            robinhood_rpc_requests: 0,
+            robinhood_rpc_successes: 0,
+            robinhood_rpc_rate_limited: 0,
+            robinhood_rpc_failures: 0,
+            qualified_wallets_count: 1,
+            polled_wallets_count: 1,
+            global_scanned_wallets_count: 0,
+            candidate_wallets_count: 0,
+        })
+        .unwrap();
+    let activity = zenithsw::models::WalletActivity {
+        id: None,
+        wallet_handle: "whale-1".to_string(),
+        wallet_address: "Wallet111".to_string(),
+        chain: zenithsw::models::Chain::Solana,
+        activity_type: zenithsw::models::ActivityType::Buy,
+        token_symbol: "TOK".to_string(),
+        token_mint: "Mint111".to_string(),
+        amount_usd: 100.0,
+        token_amount: 10.0,
+        execution_price_usd: 10.0,
+        whale_balance_before: 0.0,
+        whale_balance_after: 10.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "sig-reconnect".to_string(),
+        timestamp: chrono::Utc::now(),
+        source_reference: Some("sig-reconnect".to_string()),
+        parser_version: Some("ipc-fixture-v1".to_string()),
+        finality: Some("UNKNOWN".to_string()),
+    };
+    let heartbeat = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("timeout menunggu heartbeat reconnect")
+        .expect("channel heartbeat tertutup");
+    assert!(matches!(
+        heartbeat,
+        IpcMessage::Heartbeat {
+            heartbeat_seq: 7,
+            ..
+        }
+    ));
+    server
+        .broadcast(&IpcMessage::ActivityBroadcast { activity })
+        .unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("timeout menunggu activity reconnect")
+        .expect("channel activity tertutup");
+    match message {
+        IpcMessage::ActivityBroadcast { activity } => {
+            assert_eq!(activity.tx_signature, "sig-reconnect");
+            assert_eq!(activity.wallet_address, "Wallet111");
+            assert_eq!(activity.token_mint, "Mint111");
+        }
+        other => panic!("expected activity broadcast, got {other:?}"),
+    }
+    client_task.abort();
+    let _ = tokio::fs::remove_file(&socket_path).await;
+}
+
+#[tokio::test]
 async fn test_ipc_client_waits_for_real_heartbeat() {
     let socket_path = "/tmp/zenithsw_test_no_heartbeat.sock";
     let server = Arc::new(IpcServer::new(socket_path));

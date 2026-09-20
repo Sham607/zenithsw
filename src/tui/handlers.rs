@@ -102,6 +102,10 @@ pub fn apply_ipc_message(app: &mut App, msg: IpcMessage, config: &Config) {
             tokens.retain(|token| chain_enabled(token.chain, config));
             app.tracked_tokens = tokens;
         }
+        IpcMessage::RadarSync { mut projections } => {
+            projections.retain(|projection| chain_enabled(projection.chain, config));
+            app.radar_projections = projections;
+        }
         IpcMessage::ActivityBroadcast { activity } => {
             if chain_enabled(activity.chain, config) {
                 app.activities.push(activity);

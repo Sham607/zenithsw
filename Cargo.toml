@@ -21,6 +21,26 @@ path = "src/bin/engine.rs"
 name = "robinhood-dry-run"
 path = "src/bin/robinhood_dry_run.rs"
 
+[[bin]]
+name = "config-audit"
+path = "src/bin/config_audit.rs"
+
+[[bin]]
+name = "radar-migrate-audit"
+path = "src/bin/radar_migrate_audit.rs"
+
+[[bin]]
+name = "radar-readonly-probe"
+path = "src/bin/radar_readonly_probe.rs"
+
+[[bin]]
+name = "robinhood-readonly-audit"
+path = "src/bin/robinhood_readonly_audit.rs"
+
+[[bin]]
+name = "robinhood-tx-audit"
+path = "src/bin/robinhood_tx_audit.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 ratatui = "0.29"

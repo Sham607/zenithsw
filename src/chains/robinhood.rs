@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::dex_adapters::{DexSwapObservation, DexVenue};
+use crate::models::Chain;
+
 pub const ROBINHOOD_CHAIN_ID_HEX: &str = "0x1237";
 pub const POOL_MANAGER_V4: &str = "0x8366a39CC670B4001A1121B8F6A443A643e40951";
 pub const POSITION_MANAGER_V4: &str = "0x58daec3116aae6D93017bAAea7749052E8a04fA7";
@@ -31,6 +34,8 @@ pub const PERMIT2_DOMAIN_NAME: &str = "Permit2";
 pub const ROBINHOOD_ASSETS_API: &str = "https://api.robinhood.com/rhj/assets";
 pub const V4_INITIALIZE_TOPIC: &str =
     "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
+pub const V4_SWAP_TOPIC: &str =
+    "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f";
 pub const PONS_V2_LAUNCH_ROUTER: &str = "0xe33e9e479df8802cb0866d5d05258bec4cf62948";
 pub const PONS_V2_GRADUATION_EXECUTOR: &str = "0xc7819b64a1daecd7ec19856d026cb14efbd89046";
 
@@ -197,6 +202,275 @@ fn is_hex_bytes32(value: &str) -> bool {
     value.starts_with("0x")
         && value.len() == 66
         && value[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V4SwapLog {
+    pub pool_id: String,
+    pub sender: String,
+    pub amount0: i128,
+    pub amount1: i128,
+    pub sqrt_price_x96: String,
+    pub liquidity: u128,
+    pub tick: i32,
+    pub fee: u32,
+}
+
+pub fn decode_v4_swap_log(log: &Value) -> Result<V4SwapLog> {
+    let address = log.get("address").and_then(Value::as_str).unwrap_or("");
+    if !address.eq_ignore_ascii_case(POOL_MANAGER_V4) {
+        bail!("V4 swap log address bukan PoolManager V4");
+    }
+    let topics = log
+        .get("topics")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("V4 swap log missing topics"))?;
+    if topics.len() < 3 {
+        bail!("V4 swap log topics kurang dari 3");
+    }
+    let topic0 = topics[0].as_str().unwrap_or("");
+    if !topic0.eq_ignore_ascii_case(V4_SWAP_TOPIC) {
+        bail!("V4 swap log topic0 tidak cocok");
+    }
+    let pool_id = topics[1].as_str().unwrap_or("").to_lowercase();
+    if !is_hex_bytes32(&pool_id) {
+        bail!("V4 swap log pool_id bukan bytes32 hex valid");
+    }
+    let sender_raw = topics[2].as_str().unwrap_or("");
+    let sender = parse_topic_address(sender_raw)?;
+
+    let data = log
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("V4 swap log missing data"))?;
+    let data_hex = data.strip_prefix("0x").unwrap_or(data);
+    if data_hex.len() != 384 {
+        bail!("V4 swap log data length bukan 192 bytes (384 hex chars)");
+    }
+
+    let amount0 = parse_int128(&data_hex[0..64])?;
+    let amount1 = parse_int128(&data_hex[64..128])?;
+    let sqrt_price_trimmed = data_hex[128..192].trim_start_matches('0');
+    let sqrt_price_x96 = if sqrt_price_trimmed.is_empty() {
+        "0x0".to_string()
+    } else {
+        format!("0x{sqrt_price_trimmed}")
+    };
+    let liquidity = u128::from_str_radix(&data_hex[192..256], 16)?;
+    let tick = parse_int24(&data_hex[256..320])?;
+    let fee = u32::from_str_radix(&data_hex[320..384], 16)?;
+
+    Ok(V4SwapLog {
+        pool_id,
+        sender,
+        amount0,
+        amount1,
+        sqrt_price_x96,
+        liquidity,
+        tick,
+        fee,
+    })
+}
+
+fn parse_topic_address(topic: &str) -> Result<String> {
+    let clean = topic.strip_prefix("0x").unwrap_or(topic);
+    if clean.len() != 64 {
+        bail!("topic length invalid for address");
+    }
+    let addr = format!("0x{}", &clean[24..]);
+    if !is_address(&addr) {
+        bail!("topic does not contain valid address");
+    }
+    Ok(addr.to_lowercase())
+}
+
+fn parse_int128(word: &str) -> Result<i128> {
+    if word.len() != 64 {
+        bail!("word length invalid for int128");
+    }
+    let val = u128::from_str_radix(&word[32..], 16)?;
+    Ok(val as i128)
+}
+
+fn parse_int24(word: &str) -> Result<i32> {
+    if word.len() != 64 {
+        bail!("word length invalid for int24");
+    }
+    let val = u32::from_str_radix(&word[56..], 16)?;
+    Ok(val as i32)
+}
+
+#[derive(Debug, Clone)]
+pub struct RobinhoodV4SwapObservationParams<'a> {
+    pub tx_hash: &'a str,
+    pub log_index: u32,
+    pub swap_log: &'a V4SwapLog,
+    pub target_token: &'a str,
+    pub quote_token: &'a str,
+    pub currency0: &'a str,
+    pub currency1: &'a str,
+    pub wallet_address: &'a str,
+    pub token_balance_before: u128,
+    pub token_balance_after: u128,
+    pub success: bool,
+    pub qualified_wallet: bool,
+}
+
+pub fn v4_swap_to_observation(
+    params: &RobinhoodV4SwapObservationParams<'_>,
+) -> Result<DexSwapObservation> {
+    if !params.success || !params.qualified_wallet {
+        bail!("V4 swap belum memenuhi success/qualified gate");
+    }
+    if !is_address(params.wallet_address) {
+        bail!("wallet address bukan address hex valid");
+    }
+    if !is_address(params.target_token) || !is_address(params.quote_token) {
+        bail!("token atau quote address bukan address hex valid");
+    }
+    if !is_address(params.currency0) || !is_address(params.currency1) {
+        bail!("currency0 atau currency1 bukan address hex valid");
+    }
+    if params.tx_hash.trim().is_empty() {
+        bail!("tx_hash kosong");
+    }
+
+    let target = params.target_token.to_lowercase();
+    let quote = params.quote_token.to_lowercase();
+    let c0 = params.currency0.to_lowercase();
+    let c1 = params.currency1.to_lowercase();
+
+    let (token_delta, quote_delta) = if target == c0 && quote == c1 {
+        (-params.swap_log.amount0, -params.swap_log.amount1)
+    } else if target == c1 && quote == c0 {
+        (-params.swap_log.amount1, -params.swap_log.amount0)
+    } else {
+        bail!("pair (currency0, currency1) tidak cocok dengan target dan quote token");
+    };
+
+    if token_delta == 0 {
+        bail!("token delta tidak boleh nol");
+    }
+
+    if token_delta > 0 {
+        if params.token_balance_after < params.token_balance_before {
+            bail!("buy swap tetapi token balance after lebih kecil dari before");
+        }
+    } else if token_delta < 0 && params.token_balance_after > params.token_balance_before {
+        bail!("sell swap tetapi token balance after lebih besar dari before");
+    }
+
+    Ok(DexSwapObservation {
+        chain: Chain::Robinhood,
+        venue: DexVenue::RobinhoodUniswapV4,
+        wallet: params.wallet_address.to_lowercase(),
+        token: target,
+        quote_asset: quote,
+        pool: params.swap_log.pool_id.clone(),
+        tx_id: params.tx_hash.to_lowercase(),
+        event_index: params.log_index,
+        token_delta,
+        quote_delta,
+        token_balance_before: params.token_balance_before,
+        token_balance_after: params.token_balance_after,
+        success: params.success,
+        qualified_wallet: params.qualified_wallet,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct PonsCurveSwapObservationParams<'a> {
+    pub tx_hash: &'a str,
+    pub log_index: u32,
+    pub target_token: &'a str,
+    pub quote_token: &'a str,
+    pub router_address: &'a str,
+    pub wallet_address: &'a str,
+    pub token_in: &'a str,
+    pub token_out: &'a str,
+    pub amount_in: u128,
+    pub amount_out: u128,
+    pub token_balance_before: u128,
+    pub token_balance_after: u128,
+    pub success: bool,
+    pub qualified_wallet: bool,
+}
+
+pub fn pons_curve_swap_to_observation(
+    params: &PonsCurveSwapObservationParams<'_>,
+) -> Result<DexSwapObservation> {
+    if !params.success || !params.qualified_wallet {
+        bail!("Pons curve swap belum memenuhi success/qualified gate");
+    }
+    if !params
+        .router_address
+        .eq_ignore_ascii_case(PONS_V2_LAUNCH_ROUTER)
+    {
+        bail!("router address bukan Pons V2 Launch Router resmi");
+    }
+    if !is_address(params.wallet_address) {
+        bail!("wallet address bukan address hex valid");
+    }
+    if !is_address(params.target_token) || !is_address(params.quote_token) {
+        bail!("target token atau quote token bukan address hex valid");
+    }
+    if !is_address(params.token_in) || !is_address(params.token_out) {
+        bail!("token_in atau token_out bukan address hex valid");
+    }
+    if params.tx_hash.trim().is_empty() {
+        bail!("tx_hash kosong");
+    }
+    if params.amount_in == 0 || params.amount_out == 0 {
+        bail!("amount_in atau amount_out tidak boleh nol");
+    }
+
+    let target = params.target_token.to_lowercase();
+    let quote = params.quote_token.to_lowercase();
+    let t_in = params.token_in.to_lowercase();
+    let t_out = params.token_out.to_lowercase();
+
+    let (token_delta, quote_delta) = if t_in == quote && t_out == target {
+        if params.token_balance_after < params.token_balance_before {
+            bail!("buy swap tetapi token balance after lebih kecil dari before");
+        }
+        let t_delta = i128::try_from(params.amount_out)
+            .map_err(|_| anyhow::anyhow!("token delta overflow"))?;
+        let q_delta = i128::try_from(params.amount_in)
+            .map_err(|_| anyhow::anyhow!("quote delta overflow"))?
+            .checked_neg()
+            .ok_or_else(|| anyhow::anyhow!("quote delta overflow"))?;
+        (t_delta, q_delta)
+    } else if t_in == target && t_out == quote {
+        if params.token_balance_after > params.token_balance_before {
+            bail!("sell swap tetapi token balance after lebih besar dari before");
+        }
+        let t_delta = i128::try_from(params.amount_in)
+            .map_err(|_| anyhow::anyhow!("token delta overflow"))?
+            .checked_neg()
+            .ok_or_else(|| anyhow::anyhow!("token delta overflow"))?;
+        let q_delta = i128::try_from(params.amount_out)
+            .map_err(|_| anyhow::anyhow!("quote delta overflow"))?;
+        (t_delta, q_delta)
+    } else {
+        bail!("pair (token_in, token_out) tidak cocok dengan target dan quote token");
+    };
+
+    Ok(DexSwapObservation {
+        chain: Chain::Robinhood,
+        venue: DexVenue::RobinhoodPons,
+        wallet: params.wallet_address.to_lowercase(),
+        token: target,
+        quote_asset: quote,
+        pool: params.router_address.to_lowercase(),
+        tx_id: params.tx_hash.to_lowercase(),
+        event_index: params.log_index,
+        token_delta,
+        quote_delta,
+        token_balance_before: params.token_balance_before,
+        token_balance_after: params.token_balance_after,
+        success: params.success,
+        qualified_wallet: params.qualified_wallet,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2331,5 +2605,280 @@ mod tests {
         let mut q = quote(200);
         q.amount_out = "0x0".to_string();
         assert!(q.validate(100).is_err());
+    }
+
+    #[test]
+    fn v4_swap_log_decodes_real_robinhood_transaction_fixture() {
+        let fixture = json!({
+            "address": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+            "topics": [
+                "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f",
+                "0x20e156ba336270341c908ad196cd4f05abe1dd6530f8fb355cc5d9b30d8c3808",
+                "0x000000000000000000000000111116053f09d34a7eae8102887004445176ca11"
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000467851acb6507fd9e6fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa99b0000000000000000000000000000000000000000000000045765e89cd0634e80500000000000000000000000000000000000000000000000000e213d3e195880efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa865f0000000000000000000000000000000000000000000000000000000000009a26"
+        });
+
+        let decoded = decode_v4_swap_log(&fixture).expect("decode real v4 swap log");
+        assert_eq!(
+            decoded.pool_id,
+            "0x20e156ba336270341c908ad196cd4f05abe1dd6530f8fb355cc5d9b30d8c3808"
+        );
+        assert_eq!(decoded.sender, "0x111116053f09d34a7eae8102887004445176ca11");
+        assert_eq!(decoded.amount0, 1299941985816368110054);
+        assert_eq!(decoded.amount1, -353872);
+        assert_eq!(decoded.sqrt_price_x96, "0x45765e89cd0634e805");
+        assert_eq!(decoded.liquidity, 63635145480308750);
+        assert_eq!(decoded.tick, -358817);
+        assert_eq!(decoded.fee, 39462);
+    }
+
+    #[test]
+    fn v4_swap_log_rejects_wrong_pool_manager_address() {
+        let fixture = json!({
+            "address": "0x1111111111111111111111111111111111111111",
+            "topics": [
+                "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f",
+                "0x20e156ba336270341c908ad196cd4f05abe1dd6530f8fb355cc5d9b30d8c3808",
+                "0x000000000000000000000000111116053f09d34a7eae8102887004445176ca11"
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000467851acb6507fd9e6fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa99b00000000000000000000000000000000000000000000000045765e89cd0634e80500000000000000000000000000000000000000000000000000e213d3e195880efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa865f0000000000000000000000000000000000000000000000000000000000009a26"
+        });
+        assert!(decode_v4_swap_log(&fixture).is_err());
+    }
+
+    #[test]
+    fn v4_swap_log_rejects_wrong_topic0() {
+        let fixture = json!({
+            "address": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+            "topics": [
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "0x20e156ba336270341c908ad196cd4f05abe1dd6530f8fb355cc5d9b30d8c3808",
+                "0x000000000000000000000000111116053f09d34a7eae8102887004445176ca11"
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000467851acb6507fd9e6fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa99b00000000000000000000000000000000000000000000000045765e89cd0634e80500000000000000000000000000000000000000000000000000e213d3e195880efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa865f0000000000000000000000000000000000000000000000000000000000009a26"
+        });
+        assert!(decode_v4_swap_log(&fixture).is_err());
+    }
+
+    #[test]
+    fn v4_swap_log_rejects_truncated_data() {
+        let fixture = json!({
+            "address": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+            "topics": [
+                "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f",
+                "0x20e156ba336270341c908ad196cd4f05abe1dd6530f8fb355cc5d9b30d8c3808",
+                "0x000000000000000000000000111116053f09d34a7eae8102887004445176ca11"
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000467851acb6507fd9e6"
+        });
+        assert!(decode_v4_swap_log(&fixture).is_err());
+    }
+
+    #[test]
+    fn v4_swap_to_observation_and_materialize_buy_swap() {
+        use crate::dex_adapters::{
+            classify_swap, materialize_wallet_activity, SwapDirection, WalletActivityMetadata,
+        };
+        use crate::models::ActivityType;
+        use chrono::Utc;
+
+        let fixture = json!({
+            "address": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+            "topics": [
+                "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f",
+                "0x20e156ba336270341c908ad196cd4f05abe1dd6530f8fb355cc5d9b30d8c3808",
+                "0x000000000000000000000000111116053f09d34a7eae8102887004445176ca11"
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000467851acb6507fd9e6fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa99b0000000000000000000000000000000000000000000000045765e89cd0634e80500000000000000000000000000000000000000000000000000e213d3e195880efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa865f0000000000000000000000000000000000000000000000000000000000009a26"
+        });
+
+        let swap_log = decode_v4_swap_log(&fixture).expect("decode v4 swap log");
+        let wallet = "0x111116053f09d34a7eae8102887004445176ca11";
+        let target_token = "0x1cdb289befdfac8af945a288bcdccc382cb34d32";
+        let quote_token = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
+
+        let params = RobinhoodV4SwapObservationParams {
+            tx_hash: "0x3a6c97cd0f64112ec3097747d07297c439b004e039c4fdb716c8d85bb133f2c1",
+            log_index: 2,
+            swap_log: &swap_log,
+            target_token,
+            quote_token,
+            currency0: quote_token,
+            currency1: target_token,
+            wallet_address: wallet,
+            token_balance_before: 0,
+            token_balance_after: 353872,
+            success: true,
+            qualified_wallet: true,
+        };
+
+        let obs = v4_swap_to_observation(&params).expect("build observation");
+        assert_eq!(obs.chain, Chain::Robinhood);
+        assert_eq!(obs.venue, DexVenue::RobinhoodUniswapV4);
+        assert_eq!(obs.token_delta, 353872);
+        assert_eq!(obs.quote_delta, -1299941985816368110054);
+        assert!(obs.qualified_wallet);
+        assert!(obs.success);
+
+        let direction = classify_swap(&obs).expect("classify direction");
+        assert_eq!(direction, SwapDirection::Buy);
+
+        let metadata = WalletActivityMetadata {
+            wallet_handle: "RH_WHALE_01".to_string(),
+            token_address: target_token.to_string(),
+            quote_asset: quote_token.to_string(),
+            token_symbol: "XL".to_string(),
+            token_decimals: 18,
+            quote_decimals: 18,
+            quote_price_usd: 1.0,
+            observed_at: Utc::now(),
+        };
+
+        let materialized =
+            materialize_wallet_activity(&obs, &metadata).expect("materialize activity");
+        assert_eq!(materialized.wallet_address, wallet.to_lowercase());
+        assert_eq!(materialized.activity_type, ActivityType::Buy);
+        assert_eq!(materialized.token_symbol, "XL");
+    }
+
+    #[test]
+    fn v4_swap_to_observation_rejects_unqualified_or_failed() {
+        let fixture = json!({
+            "address": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+            "topics": [
+                "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f",
+                "0x20e156ba336270341c908ad196cd4f05abe1dd6530f8fb355cc5d9b30d8c3808",
+                "0x000000000000000000000000111116053f09d34a7eae8102887004445176ca11"
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000467851acb6507fd9e6fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa99b0000000000000000000000000000000000000000000000045765e89cd0634e80500000000000000000000000000000000000000000000000000e213d3e195880efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa865f0000000000000000000000000000000000000000000000000000000000009a26"
+        });
+        let swap_log = decode_v4_swap_log(&fixture).unwrap();
+        let target_token = "0x1cdb289befdfac8af945a288bcdccc382cb34d32";
+        let quote_token = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
+
+        let mut params = RobinhoodV4SwapObservationParams {
+            tx_hash: "0x3a6c97cd0f64112ec3097747d07297c439b004e039c4fdb716c8d85bb133f2c1",
+            log_index: 2,
+            swap_log: &swap_log,
+            target_token,
+            quote_token,
+            currency0: quote_token,
+            currency1: target_token,
+            wallet_address: "0x111116053f09d34a7eae8102887004445176ca11",
+            token_balance_before: 0,
+            token_balance_after: 353872,
+            success: true,
+            qualified_wallet: false, // unqualified
+        };
+        assert!(v4_swap_to_observation(&params).is_err());
+
+        params.qualified_wallet = true;
+        params.success = false; // failed tx
+        assert!(v4_swap_to_observation(&params).is_err());
+    }
+
+    #[test]
+    fn pons_curve_swap_to_observation_buy_and_sell() {
+        use crate::dex_adapters::{
+            classify_swap, materialize_wallet_activity, SwapDirection, WalletActivityMetadata,
+        };
+        use crate::models::ActivityType;
+        use chrono::Utc;
+
+        let wallet = "0x111116053f09d34a7eae8102887004445176ca11";
+        let target_token = "0x1cdb289befdfac8af945a288bcdccc382cb34d32";
+        let quote_token = USDG;
+
+        // Buy: quote_in -> target_out
+        let buy_params = PonsCurveSwapObservationParams {
+            tx_hash: "0x3a6c97cd0f64112ec3097747d07297c439b004e039c4fdb716c8d85bb133f2c1",
+            log_index: 1,
+            target_token,
+            quote_token,
+            router_address: PONS_V2_LAUNCH_ROUTER,
+            wallet_address: wallet,
+            token_in: quote_token,
+            token_out: target_token,
+            amount_in: 500_000_000_000_000_000_000,
+            amount_out: 1_000_000_000_000_000_000,
+            token_balance_before: 0,
+            token_balance_after: 1_000_000_000_000_000_000,
+            success: true,
+            qualified_wallet: true,
+        };
+
+        let obs = pons_curve_swap_to_observation(&buy_params).expect("buy observation");
+        assert_eq!(obs.chain, Chain::Robinhood);
+        assert_eq!(obs.venue, DexVenue::RobinhoodPons);
+        assert_eq!(obs.token_delta, 1_000_000_000_000_000_000);
+        assert_eq!(obs.quote_delta, -500_000_000_000_000_000_000);
+        assert_eq!(classify_swap(&obs).unwrap(), SwapDirection::Buy);
+
+        let metadata = WalletActivityMetadata {
+            wallet_handle: "WHALE_01".to_string(),
+            token_address: target_token.to_string(),
+            quote_asset: quote_token.to_string(),
+            token_symbol: "MEME".to_string(),
+            token_decimals: 18,
+            quote_decimals: 18,
+            quote_price_usd: 1.0,
+            observed_at: Utc::now(),
+        };
+
+        let act = materialize_wallet_activity(&obs, &metadata).expect("materialize activity");
+        assert_eq!(act.activity_type, ActivityType::Buy);
+
+        // Sell: target_in -> quote_out
+        let sell_params = PonsCurveSwapObservationParams {
+            tx_hash: "0x3a6c97cd0f64112ec3097747d07297c439b004e039c4fdb716c8d85bb133f2c1",
+            log_index: 2,
+            target_token,
+            quote_token,
+            router_address: PONS_V2_LAUNCH_ROUTER,
+            wallet_address: wallet,
+            token_in: target_token,
+            token_out: quote_token,
+            amount_in: 500_000_000_000_000_000,
+            amount_out: 300_000_000_000_000_000_000,
+            token_balance_before: 1_000_000_000_000_000_000,
+            token_balance_after: 500_000_000_000_000_000,
+            success: true,
+            qualified_wallet: true,
+        };
+
+        let sell_obs = pons_curve_swap_to_observation(&sell_params).expect("sell observation");
+        assert_eq!(sell_obs.token_delta, -500_000_000_000_000_000);
+        assert_eq!(sell_obs.quote_delta, 300_000_000_000_000_000_000);
+        assert_eq!(classify_swap(&sell_obs).unwrap(), SwapDirection::Sell);
+    }
+
+    #[test]
+    fn pons_curve_swap_rejects_unauthorized_router_or_mismatched_tokens() {
+        let wallet = "0x111116053f09d34a7eae8102887004445176ca11";
+        let target_token = "0x1cdb289befdfac8af945a288bcdccc382cb34d32";
+        let quote_token = USDG;
+
+        let mut params = PonsCurveSwapObservationParams {
+            tx_hash: "0x3a6c97cd0f64112ec3097747d07297c439b004e039c4fdb716c8d85bb133f2c1",
+            log_index: 1,
+            target_token,
+            quote_token,
+            router_address: "0x1111111111111111111111111111111111111111", // wrong router
+            wallet_address: wallet,
+            token_in: quote_token,
+            token_out: target_token,
+            amount_in: 500,
+            amount_out: 1000,
+            token_balance_before: 0,
+            token_balance_after: 1000,
+            success: true,
+            qualified_wallet: true,
+        };
+        assert!(pons_curve_swap_to_observation(&params).is_err());
+
+        params.router_address = PONS_V2_LAUNCH_ROUTER;
+        params.token_in = "0x2222222222222222222222222222222222222222"; // mismatched token
+        assert!(pons_curve_swap_to_observation(&params).is_err());
     }
 }

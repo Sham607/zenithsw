@@ -17,9 +17,7 @@ pub struct Config {
     pub robinhood_api_key: Option<String>,
     pub evm_private_key: Option<String>,
 
-    // FOMO Auth & Ingestion settings
-    pub fomo_auth_token: Option<String>,
-    pub fomo_sync_interval_sec: u64,
+    // Stream settings
     pub stream_poll_interval_ms: u64,
 
     // Gating parameters
@@ -33,9 +31,19 @@ pub struct Config {
     pub trailing_stop_pct: f64,   // 10% trailing stop
     pub stop_loss_pct: f64,       // 15% stop loss
     pub take_profit_pct: f64,     // 100% take profit trigger (50% partial exit)
+    pub take_profit_2_pct: f64,   // Tier 2 take profit (e.g. 300% / 4x)
+    pub liquidity_drain_usd: f64, // Floor for emergency exit on liquidity collapse
+    pub peak_drawdown_pct: f64,   // Max drop % from peak for moonbag exit (e.g. 50%)
+    pub profit_lock_floor_pct: f64, // Minimum positive profit floor on moonbag (e.g. 20%)
+    pub whale_full_dump_pct: f64, // Whale sell % triggering 100% mirror dump (e.g. 95%)
+    pub quarantine_base_minutes: u64, // Base cooldown duration for failed tokens
+    pub quarantine_max_minutes: u64,  // Maximum cooldown cap for failed tokens
+    pub demote_consecutive_losses: u32, // Number of consecutive losses to demote whale
+    pub demote_catastrophic_loss_pct: f64, // Single-trade loss % to trigger demotion
     pub shadow_exit_enabled: bool, // Mirror sell when whale dumps
     pub confluence_mode: String,  // "TIER_S_OR_DUAL_A"
     pub dry_run: bool,
+    pub sim_initial_balance: f64, // Virtual cash balance in dry_run mode
     /// Live Robinhood gate tambahan; tidak cukup sendiri untuk broadcast.
     pub live_robinhood_enabled: bool,
 
@@ -43,8 +51,18 @@ pub struct Config {
     pub enable_solana: bool,
     pub enable_robinhood: bool,
     pub enable_base: bool,
+    /// Collector DEX canonical tetap opt-in; metadata runtime wajib lengkap.
+    pub enable_solana_dex_worker: bool,
 
     // Persistence & IPC
+
+    // Metadata scope untuk collector DEX Solana. Tidak ada fallback sintetis.
+    pub solana_dex_token_address: Option<String>,
+    pub solana_dex_quote_asset: Option<String>,
+    pub solana_dex_token_symbol: Option<String>,
+    pub solana_dex_token_decimals: Option<u8>,
+    pub solana_dex_quote_decimals: Option<u8>,
+    pub solana_dex_quote_price_usd: Option<f64>,
     pub trading_db_path: String,
     pub wallet_db_path: String,
     pub candidate_db_path: String,
@@ -121,6 +139,44 @@ fn validate_url(name: &str, value: &str, schemes: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn optional_positive_u8(name: &str) -> Result<Option<u8>> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .trim()
+                .parse::<u8>()
+                .map_err(|error| anyhow::anyhow!("{name} tidak valid: {error}"))?;
+            if parsed == 0 {
+                anyhow::bail!("{name} harus lebih besar dari nol");
+            }
+            Ok(Some(parsed))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn optional_positive_f64(name: &str) -> Result<Option<f64>> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .trim()
+                .parse::<f64>()
+                .map_err(|error| anyhow::anyhow!("{name} tidak valid: {error}"))?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                anyhow::bail!("{name} harus finite dan lebih besar dari nol");
+            }
+            Ok(Some(parsed))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn optional_positive_u64(name: &str) -> Result<()> {
     if let Ok(value) = env::var(name) {
         let parsed = value
@@ -188,11 +244,7 @@ impl Config {
         let robinhood_ws_url = required("ROBINHOOD_WS_URL")?;
         validate_url("ROBINHOOD_WS_URL", &robinhood_ws_url, &["ws://", "wss://"])?;
 
-        let fomo_sync_interval_sec = parse_value("FOMO_SYNC_INTERVAL_SEC", 5u64)?;
         let stream_poll_interval_ms = parse_value("STREAM_POLL_INTERVAL_MS", 500u64)?;
-        if fomo_sync_interval_sec == 0 {
-            anyhow::bail!("FOMO_SYNC_INTERVAL_SEC harus lebih besar dari nol");
-        }
         if stream_poll_interval_ms == 0 {
             anyhow::bail!("STREAM_POLL_INTERVAL_MS harus lebih besar dari nol");
         }
@@ -206,6 +258,16 @@ impl Config {
         let trailing_stop_pct = parse_value("TRAILING_STOP_PCT", 10.0f64)?;
         let stop_loss_pct = parse_value("STOP_LOSS_PCT", 15.0f64)?;
         let take_profit_pct = parse_value("TAKE_PROFIT_PCT", 100.0f64)?;
+        let take_profit_2_pct = parse_value("TAKE_PROFIT_2_PCT", 300.0f64)?;
+        let liquidity_drain_usd = parse_value("LIQUIDITY_DRAIN_USD", 10000.0f64)?;
+        let peak_drawdown_pct = parse_value("PEAK_DRAWDOWN_PCT", 50.0f64)?;
+        let profit_lock_floor_pct = parse_value("PROFIT_LOCK_FLOOR_PCT", 20.0f64)?;
+        let whale_full_dump_pct = parse_value("WHALE_FULL_DUMP_PCT", 95.0f64)?;
+        let quarantine_base_minutes = parse_value("QUARANTINE_BASE_MINUTES", 15u64)?;
+        let quarantine_max_minutes = parse_value("QUARANTINE_MAX_MINUTES", 240u64)?;
+        let demote_consecutive_losses = parse_value("DEMOTE_CONSECUTIVE_LOSSES", 2u32)?;
+        let demote_catastrophic_loss_pct = parse_value("DEMOTE_CATASTROPHIC_LOSS_PCT", 30.0f64)?;
+
         for (name, value) in [
             ("MAX_PRICE_DELTA_PCT", max_price_delta_pct),
             ("MIN_LIQUIDITY_USD", min_liquidity_usd),
@@ -217,20 +279,66 @@ impl Config {
             ("TRAILING_STOP_PCT", trailing_stop_pct),
             ("STOP_LOSS_PCT", stop_loss_pct),
             ("TAKE_PROFIT_PCT", take_profit_pct),
+            ("TAKE_PROFIT_2_PCT", take_profit_2_pct),
+            ("LIQUIDITY_DRAIN_USD", liquidity_drain_usd),
+            ("PEAK_DRAWDOWN_PCT", peak_drawdown_pct),
+            ("PROFIT_LOCK_FLOOR_PCT", profit_lock_floor_pct),
+            ("WHALE_FULL_DUMP_PCT", whale_full_dump_pct),
+            ("DEMOTE_CATASTROPHIC_LOSS_PCT", demote_catastrophic_loss_pct),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 anyhow::bail!("{name} harus finite dan lebih besar dari nol");
             }
+        }
+        if quarantine_base_minutes == 0 {
+            anyhow::bail!("QUARANTINE_BASE_MINUTES harus lebih besar dari nol");
+        }
+        if quarantine_max_minutes == 0 {
+            anyhow::bail!("QUARANTINE_MAX_MINUTES harus lebih besar dari nol");
+        }
+        if quarantine_base_minutes > quarantine_max_minutes {
+            anyhow::bail!("QUARANTINE_BASE_MINUTES tidak boleh melebihi QUARANTINE_MAX_MINUTES");
+        }
+        if demote_consecutive_losses == 0 {
+            anyhow::bail!("DEMOTE_CONSECUTIVE_LOSSES harus lebih besar dari nol");
+        }
+        if peak_drawdown_pct > 100.0 {
+            anyhow::bail!("PEAK_DRAWDOWN_PCT tidak boleh melebihi 100.0");
+        }
+        if whale_full_dump_pct > 100.0 {
+            anyhow::bail!("WHALE_FULL_DUMP_PCT tidak boleh melebihi 100.0");
         }
         if min_market_cap_usd > max_market_cap_usd {
             anyhow::bail!("MIN_MARKET_CAP_USD tidak boleh melebihi MAX_MARKET_CAP_USD");
         }
 
         let dry_run = parse_bool("DRY_RUN", true)?;
+        let sim_initial_balance = parse_value("SIM_INITIAL_BALANCE", 100.0f64)?;
+        if sim_initial_balance <= 0.0 {
+            anyhow::bail!("SIM_INITIAL_BALANCE harus lebih besar dari 0");
+        }
         let live_robinhood_enabled = parse_bool("LIVE_ROBINHOOD_ENABLED", false)?;
         let enable_solana = parse_bool("ENABLE_SOLANA", true)?;
         let enable_robinhood = parse_bool("ENABLE_ROBINHOOD", false)?;
         let enable_base = parse_bool("ENABLE_BASE", false)?;
+        let enable_solana_dex_worker = parse_bool("ENABLE_SOLANA_DEX_WORKER", false)?;
+        let solana_dex_token_address = optional_env("SOLANA_DEX_TOKEN_ADDRESS");
+        let solana_dex_quote_asset = optional_env("SOLANA_DEX_QUOTE_ASSET");
+        let solana_dex_token_symbol = optional_env("SOLANA_DEX_TOKEN_SYMBOL");
+        let solana_dex_token_decimals = optional_positive_u8("SOLANA_DEX_TOKEN_DECIMALS")?;
+        let solana_dex_quote_decimals = optional_positive_u8("SOLANA_DEX_QUOTE_DECIMALS")?;
+        let solana_dex_quote_price_usd = optional_positive_f64("SOLANA_DEX_QUOTE_PRICE_USD")?;
+        if enable_solana_dex_worker
+            && (!enable_solana
+                || solana_dex_token_address.is_none()
+                || solana_dex_quote_asset.is_none()
+                || solana_dex_token_symbol.is_none()
+                || solana_dex_token_decimals.is_none()
+                || solana_dex_quote_decimals.is_none()
+                || solana_dex_quote_price_usd.is_none())
+        {
+            anyhow::bail!("ENABLE_SOLANA_DEX_WORKER membutuhkan metadata token/quote lengkap");
+        }
         if enable_base {
             anyhow::bail!("ENABLE_BASE=true ditolak: hanya Solana dan Robinhood yang didukung");
         }
@@ -250,10 +358,6 @@ impl Config {
             evm_private_key: env::var("ROBINHOOD_PRIVATE_KEY")
                 .ok()
                 .or_else(|| env::var("EVM_PRIVATE_KEY").ok()),
-            fomo_auth_token: env::var("FOMO_AUTH_TOKEN")
-                .ok()
-                .filter(|v| !v.trim().is_empty()),
-            fomo_sync_interval_sec,
             stream_poll_interval_ms,
             max_price_delta_pct,
             min_liquidity_usd,
@@ -265,14 +369,31 @@ impl Config {
             trailing_stop_pct,
             stop_loss_pct,
             take_profit_pct,
+            take_profit_2_pct,
+            liquidity_drain_usd,
+            peak_drawdown_pct,
+            profit_lock_floor_pct,
+            whale_full_dump_pct,
+            quarantine_base_minutes,
+            quarantine_max_minutes,
+            demote_consecutive_losses,
+            demote_catastrophic_loss_pct,
             shadow_exit_enabled: parse_bool("SHADOW_EXIT_ENABLED", true)?,
             confluence_mode: env::var("CONFLUENCE_MODE")
                 .unwrap_or_else(|_| "TIER_S_OR_DUAL_A".to_string()),
             dry_run,
+            sim_initial_balance,
             live_robinhood_enabled,
             enable_solana,
             enable_robinhood,
             enable_base,
+            enable_solana_dex_worker,
+            solana_dex_token_address,
+            solana_dex_quote_asset,
+            solana_dex_token_symbol,
+            solana_dex_token_decimals,
+            solana_dex_quote_decimals,
+            solana_dex_quote_price_usd,
             trading_db_path: absolute_path("TRADING_DB_PATH", "data/trading_state.db")?,
             wallet_db_path: absolute_path("WALLET_DB_PATH", "data/wallet_registry.db")?,
             candidate_db_path: absolute_path(
@@ -355,11 +476,6 @@ mod tests {
 
     #[test]
     fn rejects_zero_runtime_intervals() {
-        std::env::set_var("FOMO_SYNC_INTERVAL_SEC", "0");
-        let result = Config::load();
-        std::env::remove_var("FOMO_SYNC_INTERVAL_SEC");
-        assert!(result.is_err());
-
         std::env::set_var("STREAM_POLL_INTERVAL_MS", "0");
         let result = Config::load();
         std::env::remove_var("STREAM_POLL_INTERVAL_MS");

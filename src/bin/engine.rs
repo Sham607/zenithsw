@@ -55,15 +55,22 @@ use tokio::time::sleep;
 use zenithsw::chains::robinhood::{validate_receipt_transaction_hash, RobinhoodRpc};
 use zenithsw::config::Config;
 use zenithsw::db::SmartWalletDb;
+use zenithsw::dex_adapters::{
+    drain_activity_ipc_outbox, resolve_solana_activity_metadata, DexVenue,
+    NormalizedActivityMaterializationContext,
+};
 use zenithsw::execution::evm_executor::EvmExecutor;
 use zenithsw::execution::solana_executor::SolanaExecutor;
 use zenithsw::gating::confluence::ConfluenceEngine;
 use zenithsw::indexer::SmartMoneyIndexer;
-use zenithsw::ingestion::fomo_scraper::FomoScraper;
 use zenithsw::ipc::{IpcMessage, IpcServer};
 use zenithsw::models::{ActivityType, Chain, SmartWallet, WalletActivity, WalletTier};
+use zenithsw::radar_rpc::{
+    poll_and_persist_solana_activity_read_only_for_venue, ReadOnlyRpcClient,
+    SolanaActivityPersistenceContext,
+};
+use zenithsw::radar_runtime::RadarRuntime;
 use zenithsw::streams::evm_stream::EvmStreamListener;
-use zenithsw::streams::fomo_api_stream::FomoApiStreamListener;
 use zenithsw::streams::solana_stream::SolanaStreamListener;
 
 #[tokio::main]
@@ -93,22 +100,122 @@ async fn main() -> Result<()> {
         &config.candidate_db_path,
     )?);
 
-    // Initial seed: Only populate if database is completely empty.
-    let existing_wallets = db.get_active_wallets()?;
-    if existing_wallets.is_empty() {
-        let default_seeds = FomoScraper::get_default_seed_traders();
-        println!(
-            "[INIT] Database is empty. Syncing {} initial verified smart wallets...",
-            default_seeds.len()
-        );
-        for seed in &default_seeds {
-            db.upsert_wallet(seed)?;
-        }
-    }
+    // wallet_registry.db is authoritative and read-only for engine startup.
+    // Empty or unavailable qualified scope must remain empty, not be seeded.
 
     // Initialize IPC Server
     let ipc_server = Arc::new(IpcServer::new(&config.ipc_socket_path));
     ipc_server.start().await?;
+
+    // Pulihkan delivery activity tertunda sebelum worker lain dimulai.
+    // Batas eksplisit menjaga startup tetap bounded; item sisanya tetap QUEUED.
+    const STARTUP_OUTBOX_DRAIN_LIMIT: usize = 128;
+    if ipc_server.receiver_count() > 0 {
+        let recovered = drain_activity_ipc_outbox(&db, &ipc_server, STARTUP_OUTBOX_DRAIN_LIMIT)
+            .map_err(|error| anyhow::anyhow!("startup outbox recovery gagal: {error}"))?;
+        println!("[IPC OUTBOX] startup recovered={recovered} limit={STARTUP_OUTBOX_DRAIN_LIMIT}");
+    } else {
+        println!("[IPC OUTBOX] startup menunggu client untuk recovery");
+    }
+
+    let radar_runtime = Arc::new(RadarRuntime::new(
+        config.clone(),
+        db.clone(),
+        ipc_server.clone(),
+    )?);
+    let radar_worker = radar_runtime.clone();
+    tokio::spawn(async move {
+        radar_worker.run_loop().await;
+    });
+
+    // Canonical Solana DEX collector worker (opt-in via ENABLE_SOLANA_DEX_WORKER).
+    // When enabled, it supersedes legacy Solana stream/WS polling to eliminate duplicate activity.
+    if config.enable_solana_dex_worker {
+        let dex_client = Arc::new(ReadOnlyRpcClient::new(&config.solana_rpc_url)?);
+        let dex_db = db.clone();
+        let dex_ipc = ipc_server.clone();
+        let dex_config = config.clone();
+        tokio::spawn(async move {
+            println!(
+                "[DEX WORKER] Canonical Solana DEX collector online (Venue: SolanaRaydiumAmm)"
+            );
+            let poll_interval = Duration::from_millis(dex_config.stream_poll_interval_ms.max(2000));
+            let mut interval = tokio::time::interval(poll_interval);
+            loop {
+                interval.tick().await;
+                let addresses = match dex_db.get_qualified_scan_addresses() {
+                    Ok(addresses) => addresses
+                        .into_iter()
+                        .filter(|address| address.chain == Chain::Solana)
+                        .collect::<Vec<_>>(),
+                    Err(error) => {
+                        eprintln!("[DEX WORKER SCOPE ERROR] qualified wallet scope gagal: {error}");
+                        continue;
+                    }
+                };
+                for address in addresses {
+                    let (wallet, metadata) = match resolve_solana_activity_metadata(
+                        &dex_db,
+                        &dex_config,
+                        &address.address,
+                        Utc::now(),
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            eprintln!(
+                                "[DEX WORKER METADATA ERROR] address={} error={error}",
+                                address.address
+                            );
+                            continue;
+                        }
+                    };
+                    let materialization = NormalizedActivityMaterializationContext {
+                        wallet: &wallet,
+                        token_symbol: &metadata.token_symbol,
+                        token_decimals: metadata.token_decimals,
+                        quote_decimals: metadata.quote_decimals,
+                        quote_price_usd: metadata.quote_price_usd,
+                    };
+                    let context = SolanaActivityPersistenceContext {
+                        client: &dex_client,
+                        db: &dex_db,
+                        ipc: &dex_ipc,
+                        address: &address,
+                        token_address: &metadata.token_address,
+                        quote_asset: &metadata.quote_asset,
+                        cursor: None,
+                        history_limit: 10,
+                        max_batch: 10,
+                        materialization,
+                        scope_key: &address.address,
+                    };
+                    match poll_and_persist_solana_activity_read_only_for_venue(
+                        context,
+                        DexVenue::SolanaRaydiumAmm,
+                    )
+                    .await
+                    {
+                        Ok(report) => {
+                            if report.persisted_activities > 0 {
+                                println!(
+                                    "[DEX WORKER ACTIVITY] address={} persisted={} cursor_advanced={}",
+                                    address.address,
+                                    report.persisted_activities,
+                                    report.cursor_advanced
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[DEX WORKER POLL ERROR] address={} error={error}",
+                                address.address
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Initialize Stream Listeners
     let sol_listener = Arc::new(SolanaStreamListener::new(&config.solana_rpc_url));
@@ -116,7 +223,59 @@ async fn main() -> Result<()> {
         &config.robinhood_rpc_url,
         Chain::Robinhood,
     ));
-    let fomo_listener = Arc::new(FomoApiStreamListener::new(Arc::new(config.clone())));
+
+    // Radar event detector Solana: read-only logsSubscribe dengan reconnect.
+    // Ditangguhkan bila canonical DEX worker aktif untuk mencegah duplikasi event.
+    if config.enable_solana && !config.enable_solana_dex_worker {
+        let sol_ws_listener = sol_listener.clone();
+        let sol_ws_db = db.clone();
+        let sol_ws_url = config.solana_ws_url.clone();
+        tokio::spawn(async move {
+            let mut ws_failures = 0u32;
+            loop {
+                let wallets = match sol_ws_db.get_qualified_scan_addresses() {
+                    Ok(addresses) => addresses
+                        .into_iter()
+                        .filter(|address| address.chain == Chain::Solana)
+                        .collect(),
+                    Err(error) => {
+                        eprintln!("[SOLANA WS SCOPE ERROR] qualified wallet scope gagal: {error}");
+                        Vec::new()
+                    }
+                };
+                match sol_ws_listener
+                    .run_websocket_monitor(&sol_ws_url, wallets, sol_ws_db.clone())
+                    .await
+                {
+                    Ok(()) => ws_failures = 0,
+                    Err(error) => {
+                        ws_failures = ws_failures.saturating_add(1);
+                        let error_text = error.to_string();
+                        let provider_rate_limited = error_text.contains("429")
+                            || error_text
+                                .to_ascii_lowercase()
+                                .contains("too many requests");
+                        let backoff_secs =
+                            2u64.saturating_mul(2u64.saturating_pow(ws_failures.min(5)));
+                        eprintln!(
+                            "[SOLANA WS ERROR] {error}; reconnect dalam {}s",
+                            backoff_secs.min(60)
+                        );
+                        if provider_rate_limited || ws_failures >= 5 {
+                            eprintln!(
+                                "[SOLANA WS DISABLED] provider={} consecutive_failures={}; gunakan bounded HTTP polling",
+                                if provider_rate_limited { "rate_limited" } else { "unstable" },
+                                ws_failures
+                            );
+                            break;
+                        }
+                        sleep(Duration::from_secs(backoff_secs.min(60))).await;
+                    }
+                }
+            }
+        });
+    }
+
     if config.enable_robinhood {
         arb_listener.validate_robinhood_chain().await?;
         let robinhood_rpc = RobinhoodRpc::new(&robinhood_primary_rpc)?;
@@ -124,6 +283,12 @@ async fn main() -> Result<()> {
         robinhood_rpc.validate_deployments().await?;
         println!("[ROBINHOOD RPC ✅] Chain ID 4663 and official Uniswap V4 deployments validated");
     }
+
+    // Set configurable demote thresholds
+    db.set_demote_thresholds(
+        config.demote_consecutive_losses,
+        config.demote_catastrophic_loss_pct,
+    );
 
     // Initialize Gating & Executors
     let confluence = Arc::new(ConfluenceEngine::new(config.clone(), db.clone()));
@@ -223,6 +388,21 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Startup Physical On-Chain Position Reconciliation & Orphan Recovery (Zero-Guessing)
+    if config.enable_solana {
+        match sol_exec.reconcile_startup_positions().await {
+            Ok((ghost_closed, orphans_adopted)) => {
+                println!(
+                    "[STARTUP AUDIT ✅] Solana physical reconciliation complete: ghost_closed={} orphans_adopted={}",
+                    ghost_closed, orphans_adopted
+                );
+            }
+            Err(error) => {
+                eprintln!("[STARTUP AUDIT ERROR ⚠️] Solana physical reconciliation failed: {error}");
+            }
+        }
+    }
+
     // Task 1: Direct On-Chain DEX Graph Indexer Worker (Every 10 minutes)
     let indexer = Arc::new(SmartMoneyIndexer::new(
         &config.solana_rpc_url,
@@ -237,39 +417,15 @@ async fn main() -> Result<()> {
         indexer_worker.run_background_loop().await;
     });
 
-    // Task 2: Whale Portfolio & Radar Harvester Worker (Top 50 7D Whales + Micro/Small Cap Bottom Classifier)
-    let fomo_scraper = Arc::new(FomoScraper::new(Arc::new(config.clone()), db.clone()));
-    let fomo_scraper_worker = fomo_scraper.clone();
-    let ipc_radar = ipc_server.clone();
-    tokio::spawn(async move {
-        println!("[RADAR WORKER] Whale Portfolio & Gems Harvester online (Scanning Top 50 7D Leaderboard)...");
-        loop {
-            match fomo_scraper_worker
-                .harvest_7d_whale_holdings_and_radar()
-                .await
-            {
-                Ok(tokens) => {
-                    println!("[RADAR HARVEST 💎] Successfully analyzed and tracked {} whale conviction tokens", tokens.len());
-                    if let Err(error) =
-                        ipc_radar.broadcast(&IpcMessage::TrackedTokensUpdate { tokens })
-                    {
-                        eprintln!("[IPC ERROR] TrackedTokensUpdate gagal: {error}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[RADAR HARVEST ⚠️] Error harvesting whale holdings: {}", e);
-                }
-            }
-            sleep(Duration::from_secs(60)).await; // Dynamic re-scan every 60 seconds
-        }
-    });
+    // Legacy FOMO Radar worker intentionally disabled. Gems Radar output must
+    // come only from the read-only on-chain pipeline; until its runtime
+    // collector is wired, the authoritative tracked-token snapshot is empty.
 
     // Task 3: High-Speed Paced Stream Ingestion Worker (Zero 429 Drop, 200ms per wallet)
     let db_stream = db.clone();
     let config_stream = Arc::new(config.clone());
     let sol_listener_stream = sol_listener.clone();
     let arb_listener_stream = arb_listener.clone();
-    let fomo_listener_stream = fomo_listener.clone();
     let confluence_stream = confluence.clone();
     let sol_exec_stream = sol_exec.clone();
     let evm_exec_stream = evm_exec.clone();
@@ -286,7 +442,9 @@ async fn main() -> Result<()> {
                 // Filter only enabled chains
                 wallets.retain(|w| {
                     let chain_enabled = match w.chain {
-                        Chain::Solana => config_stream.enable_solana,
+                        Chain::Solana => {
+                            config_stream.enable_solana && !config_stream.enable_solana_dex_worker
+                        }
                         Chain::Robinhood => config_stream.enable_robinhood,
                         Chain::Base => config_stream.enable_base,
                         _ => false,
@@ -359,27 +517,9 @@ async fn main() -> Result<()> {
                     stream::iter(wallets.into_iter())
                         .map(|w| {
                             let sol_listener = sol_listener_stream.clone();
-                            let fomo_listener = fomo_listener_stream.clone();
                             let db = db_stream.clone();
                             async move {
-                                let mut activity_opt =
-                                    if w.source == "FOMO" && w.tier == WalletTier::TierS {
-                                        match fomo_listener
-                                            .check_trader_swaps(&w.handle, &w.address, db.clone())
-                                            .await
-                                        {
-                                            Ok(activity) => activity,
-                                            Err(error) => {
-                                                eprintln!("[POLL ERROR] FOMO wallet={} address={} error={error}", w.handle, w.address);
-                                                None
-                                            }
-                                        }
-                                    } else {
-                                        None
-                                    };
-
-                                if activity_opt.is_none() {
-                                    activity_opt = match w.chain {
+                                let activity_opt = match w.chain {
                                         Chain::Solana => match sol_listener
                                             .check_recent_txs(&w.handle, &w.address, db.clone())
                                             .await
@@ -394,7 +534,6 @@ async fn main() -> Result<()> {
                                         Chain::Robinhood | Chain::Arbitrum => None,
                                         _ => None,
                                     };
-                                }
                                 activity_opt.map(|act| (act, w))
                             }
                         })
@@ -467,8 +606,8 @@ async fn main() -> Result<()> {
                                             let effective_sell_ratio =
                                                 (raw_sell_ratio * whale_weight).clamp(1.0, 100.0);
 
-                                            if raw_sell_ratio >= 95.0 && whale_count <= 1.0 {
-                                                println!("[SHADOW FULL EXIT 🔴] Target @{} sold 100% of {} -> Closing position completely!", act.wallet_handle, pos.token_symbol);
+                                            if raw_sell_ratio >= config_stream.whale_full_dump_pct && whale_count <= 1.0 {
+                                                println!("[SHADOW FULL EXIT 🔴] Target @{} sold {:.0}% (>= {:.0}%) of {} -> Closing position completely!", act.wallet_handle, raw_sell_ratio, config_stream.whale_full_dump_pct, pos.token_symbol);
                                                 match pos.chain {
                                                     Chain::Solana => {
                                                         if let Err(error) = sol_exec_stream
@@ -593,17 +732,25 @@ async fn main() -> Result<()> {
                                 let pos_opt = match sig.chain {
                                     Chain::Solana => {
                                         match sol_exec_stream.execute_shadow_buy(&sig).await {
-                                            Ok(position) => position,
+                                            Ok(position) => {
+                                                confluence.cooldowns.clear_cooldown(&sig.token_mint);
+                                                position
+                                            }
                                             Err(error) => {
-                                                eprintln!("[EXECUTION ERROR] Solana shadow buy token={} error={error}", sig.token_mint);
+                                                let dur = confluence.cooldowns.record_failure(&sig.token_mint);
+                                                eprintln!("[EXECUTION ERROR] Solana shadow buy token={} error={} -> Quarantined for {:?}", sig.token_mint, error, dur);
                                                 None
                                             }
                                         }
                                     }
                                     _ => match evm_exec_stream.execute_shadow_buy(&sig).await {
-                                        Ok(position) => position,
+                                        Ok(position) => {
+                                            confluence.cooldowns.clear_cooldown(&sig.token_mint);
+                                            position
+                                        }
                                         Err(error) => {
-                                            eprintln!("[EXECUTION ERROR] EVM shadow buy token={} error={error}", sig.token_mint);
+                                            let dur = confluence.cooldowns.record_failure(&sig.token_mint);
+                                            eprintln!("[EXECUTION ERROR] EVM shadow buy token={} error={} -> Quarantined for {:?}", sig.token_mint, error, dur);
                                             None
                                         }
                                     },
@@ -700,6 +847,23 @@ async fn main() -> Result<()> {
                         }
                         pos.last_update = Utc::now();
 
+                        // Realizable Jupiter Quote check for Solana positions nearing TP (+10%) or SL (-20%)
+                        if pos.chain == Chain::Solana
+                            && (pos.unrealized_pnl_pct >= 10.0 || pos.unrealized_pnl_pct <= -20.0)
+                        {
+                            if let Ok(quote) = sol_exec_pos
+                                .get_realizable_exit_quote(&pos.token_mint, 0)
+                                .await
+                            {
+                                if quote.price_impact_pct > 15.0 {
+                                    eprintln!(
+                                        "[REALIZABLE EXIT GUARD ⚠️] Token {} Jupiter price impact is severe ({:.1}%). Realizable out: {:.4} SOL",
+                                        pos.token_symbol, quote.price_impact_pct, quote.estimated_out_sol
+                                    );
+                                }
+                            }
+                        }
+
                         // Persist every valid tick so current_price, PnL, and last_update
                         // remain recoverable after a restart, even when the price is flat.
                         // The TUI receives the same fresh snapshot below via IPC.
@@ -711,14 +875,14 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        // Liquidity Drain Guard (Rug-pull trap protection: exit immediately if pool liquidity collapses below $10k)
+                        // Liquidity Drain Guard (Rug-pull trap protection: exit immediately if pool liquidity collapses below floor)
                         if live_liquidity > 0.0
-                            && live_liquidity < 10000.0
+                            && live_liquidity < config_pos.liquidity_drain_usd
                             && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
                         {
                             println!(
-                                "[LIQUIDITY DRAIN GUARD 🚨] Position {} ({}) pool liquidity dropped to ${:.0} (<$10k)! Emergency dumping to avoid rug-pull trap!",
-                                pos.id, pos.token_symbol, live_liquidity
+                                "[LIQUIDITY DRAIN GUARD 🚨] Position {} ({}) pool liquidity dropped to ${:.0} (<${:.0})! Emergency dumping to avoid rug-pull trap!",
+                                pos.id, pos.token_symbol, live_liquidity, config_pos.liquidity_drain_usd
                             );
                             match pos.chain {
                                 Chain::Solana => {
@@ -786,8 +950,8 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // 2. Tier 2 Moonbag Take Profit (Sell 25% of initial at +300% PnL / 4x price, leaving 25% runner)
-                        let tp2_target_pnl = 300.0;
+                        // 2. Tier 2 Moonbag Take Profit (Sell 25% of initial at configured TP2 PnL, leaving runner)
+                        let tp2_target_pnl = config_pos.take_profit_2_pct;
                         if pos.unrealized_pnl_pct >= tp2_target_pnl
                             && pos.status == "PARTIAL_EXIT"
                             && pos.remaining_portion_pct > 35.0
@@ -826,14 +990,15 @@ async fn main() -> Result<()> {
                         }
 
                         // 3. Tier 3 Catastrophic Peak Drawdown Guard on Runner / Moonbag
-                        // If price drops > 50% from peak after a 2x+ pump, dump remaining portion to prevent roundtripping to zero
+                        // If price drops beyond configured % from peak after a 2x+ pump, dump remaining portion to prevent roundtripping to zero
+                        let peak_drawdown_ratio = 1.0 - (config_pos.peak_drawdown_pct / 100.0);
                         if pos.status == "PARTIAL_EXIT"
                             && pos.peak_price >= pos.entry_price * 2.0
-                            && pos.current_price <= pos.peak_price * 0.50
+                            && pos.current_price <= pos.peak_price * peak_drawdown_ratio
                             && pos.remaining_portion_pct <= 55.0
                         {
-                            println!("[PEAK DRAWDOWN GUARD 🛡️] Position {} ({}) dropped >50% from peak (${:.6} -> ${:.6})! Dumping remaining {:.0}% to lock profit!",
-                                pos.id, pos.token_symbol, pos.peak_price, pos.current_price, pos.remaining_portion_pct);
+                            println!("[PEAK DRAWDOWN GUARD 🛡️] Position {} ({}) dropped >{:.0}% from peak (${:.6} -> ${:.6})! Dumping remaining {:.0}% to lock profit!",
+                                pos.id, pos.token_symbol, config_pos.peak_drawdown_pct, pos.peak_price, pos.current_price, pos.remaining_portion_pct);
                             match pos.chain {
                                 Chain::Solana => {
                                     if let Err(error) = sol_exec_pos
@@ -862,16 +1027,16 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // 4. Profit-Lock Floor on Moonbag (+100% -> Floor +20.0%)
+                        // 4. Profit-Lock Floor on Moonbag (locked once profit reaches the configured floor)
                         // STRICT SAFETY: Must have reached at least +100% PnL initially and current PnL must be positive (> +5.0%)
                         if pos.status == "PARTIAL_EXIT"
                             && pos.peak_price >= pos.entry_price * 2.0
-                            && pos.unrealized_pnl_pct <= 20.0
+                            && pos.unrealized_pnl_pct <= config_pos.profit_lock_floor_pct
                             && pos.unrealized_pnl_pct >= 5.0
                             && pos.remaining_portion_pct <= 55.0
                         {
-                            println!("[PROFIT-LOCK FLOOR 🛡️] Position {} ({}) moonbag dropped to +{:.1}%! Closing remaining portion to guarantee green trade!",
-                                pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
+                            println!("[PROFIT-LOCK FLOOR 🛡️] Position {} ({}) moonbag dropped to +{:.1}% (<= +{:.0}%)! Closing remaining portion to guarantee green trade!",
+                                pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.profit_lock_floor_pct);
                             match pos.chain {
                                 Chain::Solana => {
                                     if let Err(error) = sol_exec_pos
@@ -968,6 +1133,94 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Shared metrics state for Heartbeat to prevent RPC network latency spikes
+    // from blocking or delaying the 2-second IPC Heartbeat pulse.
+    #[derive(Default, Clone)]
+    struct HeartbeatMetrics {
+        wallet_pubkey: String,
+        wallet_sol_balance: f64,
+        sol_price_usd: f64,
+        solana_latency_ms: u64,
+        robinhood_latency_ms: u64,
+        total_tokens_usd: f64,
+    }
+
+    let shared_metrics = Arc::new(tokio::sync::RwLock::new(HeartbeatMetrics::default()));
+    let shared_metrics_worker = shared_metrics.clone();
+    let sol_exec_metrics = sol_exec_hb.clone();
+    let robinhood_rpc_metrics = robinhood_rpc_hb.clone();
+
+    // Background worker for async on-chain balance & latency polling
+    tokio::spawn(async move {
+        loop {
+            let (wallet_pubkey, wallet_sol_balance) =
+                if let Ok((_, pubkey)) = sol_exec_metrics.get_keypair() {
+                    let bal = sol_exec_metrics
+                        .get_native_balance(&pubkey)
+                        .await
+                        .unwrap_or(0.0);
+                    (pubkey, bal)
+                } else {
+                    (String::new(), 0.0)
+                };
+
+            let sol_price_usd = sol_exec_metrics.get_sol_price().await.unwrap_or(0.0);
+
+            let solana_latency_start = Instant::now();
+            let onchain_tokens = if wallet_pubkey.is_empty() {
+                Vec::new()
+            } else {
+                sol_exec_metrics
+                    .get_all_wallet_token_balances(&wallet_pubkey)
+                    .await
+            };
+            let solana_latency_ms =
+                u64::try_from(solana_latency_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            let mut total_tokens_usd = 0.0;
+            for (mint, amt) in onchain_tokens {
+                match SolanaStreamListener::fetch_token_price(&mint).await {
+                    Ok((_, price, _, _)) if price > 0.0 => {
+                        total_tokens_usd += amt * price;
+                    }
+                    Ok((_, price, _, _)) => {
+                        eprintln!("[HEARTBEAT PRICE SKIP] mint={mint} price={price} — tidak dihitung ke equity");
+                    }
+                    Err(error) => {
+                        eprintln!("[HEARTBEAT PRICE FAILED] mint={mint} error={error}");
+                    }
+                }
+            }
+
+            let robinhood_latency_start = Instant::now();
+            let robinhood_latency_result = match robinhood_rpc_metrics.as_ref() {
+                Some(rpc) => Some(rpc.chain_id().await),
+                None => None,
+            };
+            let robinhood_latency_ms = match robinhood_latency_result {
+                Some(Ok(_)) => {
+                    u64::try_from(robinhood_latency_start.elapsed().as_millis()).unwrap_or(u64::MAX)
+                }
+                _ => 0,
+            };
+
+            {
+                let mut lock = shared_metrics_worker.write().await;
+                *lock = HeartbeatMetrics {
+                    wallet_pubkey,
+                    wallet_sol_balance,
+                    sol_price_usd,
+                    solana_latency_ms,
+                    robinhood_latency_ms,
+                    total_tokens_usd,
+                };
+            }
+
+            sleep(Duration::from_secs(3)).await;
+        }
+    });
+
     let start_time = Utc::now();
     tokio::spawn(async move {
         loop {
@@ -1007,58 +1260,18 @@ async fn main() -> Result<()> {
             };
             let active_positions_count = active_positions.len();
 
-            // Calculate real on-chain wallet balances & portfolio USD
-            let (wallet_pubkey, wallet_sol_balance) =
-                if let Ok((_, pubkey)) = sol_exec_hb.get_keypair() {
-                    let bal = sol_exec_hb.get_native_balance(&pubkey).await.unwrap_or(0.0);
-                    (pubkey, bal)
-                } else {
-                    (String::new(), 0.0)
-                };
-
-            let sol_price_usd = sol_exec_hb.get_sol_price().await.unwrap_or(0.0);
+            // Read asynchronously cached metrics without blocking the 2s heartbeat cycle
+            let metrics = {
+                let lock = shared_metrics.read().await;
+                lock.clone()
+            };
+            let wallet_pubkey = metrics.wallet_pubkey;
+            let wallet_sol_balance = metrics.wallet_sol_balance;
+            let sol_price_usd = metrics.sol_price_usd;
             let sol_usd_val = wallet_sol_balance * sol_price_usd;
-
-            // Measure actual Solana request latency and refresh on-chain token valuation
-            // from the same live wallet balance request (0 = unavailable).
-            let solana_latency_start = Instant::now();
-            let onchain_tokens = if wallet_pubkey.is_empty() {
-                Vec::new()
-            } else {
-                sol_exec_hb
-                    .get_all_wallet_token_balances(&wallet_pubkey)
-                    .await
-            };
-            let solana_latency_ms =
-                u64::try_from(solana_latency_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-            let mut total_tokens_usd = 0.0;
-            for (mint, amt) in onchain_tokens {
-                match SolanaStreamListener::fetch_token_price(&mint).await {
-                    Ok((_, price, _, _)) if price > 0.0 => {
-                        total_tokens_usd += amt * price;
-                    }
-                    Ok((_, price, _, _)) => {
-                        eprintln!("[HEARTBEAT PRICE SKIP] mint={mint} price={price} — tidak dihitung ke equity");
-                    }
-                    Err(error) => {
-                        eprintln!("[HEARTBEAT PRICE FAILED] mint={mint} error={error}");
-                    }
-                }
-            }
-
-            // Measure actual Robinhood request latency from a live chain id request (0 = unavailable).
-            let robinhood_latency_start = Instant::now();
-            let robinhood_latency_result = match robinhood_rpc_hb.as_ref() {
-                Some(rpc) => Some(rpc.chain_id().await),
-                None => None,
-            };
-            let robinhood_latency_ms = match robinhood_latency_result {
-                Some(Ok(_)) => {
-                    u64::try_from(robinhood_latency_start.elapsed().as_millis()).unwrap_or(u64::MAX)
-                }
-                _ => 0,
-            };
+            let solana_latency_ms = metrics.solana_latency_ms;
+            let robinhood_latency_ms = metrics.robinhood_latency_ms;
+            let total_tokens_usd = metrics.total_tokens_usd;
 
             let open_positions_usd: f64 = if total_tokens_usd > 0.0 {
                 total_tokens_usd
@@ -1187,6 +1400,30 @@ async fn main() -> Result<()> {
                     }
                     Err(error) => {
                         eprintln!("[HEARTBEAT DB ERROR] Tracked tokens unavailable: {error}");
+                    }
+                }
+                match db_heartbeat.get_radar_projections(50) {
+                    Ok(projections) => {
+                        if let Err(error) =
+                            ipc_heartbeat.broadcast(&IpcMessage::RadarSync { projections })
+                        {
+                            eprintln!("[IPC ERROR] RadarSync gagal: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[HEARTBEAT DB ERROR] Radar projections unavailable: {error}");
+                    }
+                }
+                // Reconnect recovery: hanya drain bila client sudah terhubung.
+                // Item tetap QUEUED bila belum ada consumer IPC.
+                const RECONNECT_OUTBOX_DRAIN_LIMIT: usize = 128;
+                if ipc_heartbeat.receiver_count() > 0 {
+                    if let Err(error) = drain_activity_ipc_outbox(
+                        &db_heartbeat,
+                        &ipc_heartbeat,
+                        RECONNECT_OUTBOX_DRAIN_LIMIT,
+                    ) {
+                        eprintln!("[IPC OUTBOX ERROR] reconnect recovery gagal: {error}");
                     }
                 }
             }

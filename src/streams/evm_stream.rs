@@ -604,7 +604,7 @@ impl EvmStreamListener {
     pub async fn scan_global_wallet_activity(
         &self,
         wallets: &[(String, String)],
-        db: Arc<SmartWalletDb>,
+        _db: Arc<SmartWalletDb>,
     ) -> Result<Vec<WalletActivity>> {
         use crate::chains::robinhood::{
             classify_robinhood_receipt, RobinhoodVenue, ERC20_TRANSFER_TOPIC,
@@ -629,25 +629,40 @@ impl EvmStreamListener {
             return Ok(Vec::new());
         }
         let mut logs = Vec::new();
-        for topics in [
-            json!([ERC20_TRANSFER_TOPIC, wallet_topics, Value::Null]),
-            json!([ERC20_TRANSFER_TOPIC, Value::Null, wallet_topics]),
-        ] {
-            let result = self
-                .rpc_call(
-                    "eth_getLogs",
-                    json!([{
-                        "fromBlock": format!("0x{from:x}"),
-                        "toBlock": format!("0x{latest_n:x}"),
-                        "topics": topics,
-                    }]),
-                )
-                .await?;
-            if let Some(values) = result.as_array() {
-                logs.extend(values.iter().cloned());
+        let mut query_failures = 0usize;
+        for wallet_topic in &wallet_topics {
+            for topics in [
+                json!([ERC20_TRANSFER_TOPIC, wallet_topic, Value::Null]),
+                json!([ERC20_TRANSFER_TOPIC, Value::Null, wallet_topic]),
+            ] {
+                let result = match self
+                    .rpc_call(
+                        "eth_getLogs",
+                        json!([{
+                            "fromBlock": format!("0x{from:x}"),
+                            "toBlock": format!("0x{latest_n:x}"),
+                            "topics": topics,
+                        }]),
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        query_failures += 1;
+                        continue;
+                    }
+                };
+                if let Some(values) = result.as_array() {
+                    logs.extend(values.iter().cloned());
+                }
             }
         }
-        let mut activities = Vec::new();
+        if query_failures > 0 {
+            eprintln!(
+                "[SCANNER RPC DEGRADED] Robinhood global scan skipped {} filtered query(ies); valid query results retained",
+                query_failures
+            );
+        }
         let mut seen = HashSet::new();
         for log in logs {
             let tx_hash = match log.get("transactionHash").and_then(Value::as_str) {
@@ -665,17 +680,13 @@ impl EvmStreamListener {
             }
             let from_addr = format!("0x{}", &from_topic[26..]).to_lowercase();
             let to_addr = format!("0x{}", &to_topic[26..]).to_lowercase();
-            let (wallet_address, incoming) = if address_to_handle.contains_key(&to_addr) {
-                (to_addr, true)
+            let wallet_address = if address_to_handle.contains_key(&to_addr) {
+                to_addr
             } else if address_to_handle.contains_key(&from_addr) {
-                (from_addr, false)
+                from_addr
             } else {
                 continue;
             };
-            let handle = address_to_handle
-                .get(&wallet_address)
-                .cloned()
-                .unwrap_or_default();
             let receipt = self
                 .rpc_call("eth_getTransactionReceipt", json!([tx_hash]))
                 .await?;
@@ -689,49 +700,12 @@ impl EvmStreamListener {
             {
                 continue;
             }
-            let token = log
-                .get("address")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let raw_amount =
-                parse_hex_quantity(log.get("data").and_then(Value::as_str).unwrap_or("0x0"))?;
-            if !is_evm_address(&token) || raw_amount == 0 {
-                continue;
-            }
-            let decimals = self.erc20_uint(&token, "0x313ce567").await.unwrap_or(18);
-            let symbol = self
-                .erc20_string(&token, "0x95d89b41")
-                .await
-                .unwrap_or_else(|_| "TOKEN".to_string());
-            if crate::models::is_blacklisted_asset(&token, &symbol) {
-                continue;
-            }
-            let activity = WalletActivity {
-                id: None,
-                wallet_handle: handle,
-                wallet_address,
-                chain: self.chain,
-                activity_type: if incoming {
-                    ActivityType::Buy
-                } else {
-                    ActivityType::Sell
-                },
-                token_symbol: symbol,
-                token_mint: token,
-                amount_usd: 0.0,
-                token_amount: raw_amount as f64 / 10f64.powi(decimals as i32),
-                execution_price_usd: 0.0,
-                whale_balance_before: 0.0,
-                whale_balance_after: 0.0,
-                sell_ratio_pct: if incoming { 0.0 } else { 100.0 },
-                tx_signature: tx_hash,
-                timestamp: Utc::now(),
-            };
-            db.insert_activity(&activity)?;
-            activities.push(activity);
+            // Transfer logs saja belum menyediakan quote delta, harga USD, atau
+            // saldo before/after. Menolak event di sini mencegah activity palsu.
+            // Decoder venue-specific wajib mengisi seluruh metadata tersebut.
+            continue;
         }
-        Ok(activities)
+        Ok(Vec::new())
     }
 
     /// Pulls recent wallet Transfer logs, then classifies the complete receipt.
@@ -893,6 +867,9 @@ impl EvmStreamListener {
                 sell_ratio_pct: if incoming { 0.0 } else { 100.0 },
                 tx_signature: tx_hash.clone(),
                 timestamp: now,
+                source_reference: None,
+                parser_version: None,
+                finality: None,
             };
             self.processed_hashes.lock().unwrap().insert(tx_hash);
             let _ = db.insert_activity(&activity);

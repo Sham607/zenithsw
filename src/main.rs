@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -215,49 +215,56 @@ async fn main() -> Result<()> {
     // Initialize Terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    loop {
-        // Draw TUI frame
-        if let Ok(state) = app.lock() {
-            terminal.draw(|f| render_ui(f, &state))?;
-            if state.should_quit {
-                break;
-            }
-        }
+    // Set panic hook so terminal is restored if a panic occurs
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        original_hook(panic_info);
+    }));
 
-        // Handle user input
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if let Ok(mut state) = app.lock() {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                            state.should_quit = true;
+    let run_res = (|| -> Result<()> {
+        loop {
+            // Draw TUI frame
+            if let Ok(state) = app.lock() {
+                terminal.draw(|f| render_ui(f, &state))?;
+                if state.should_quit {
+                    break;
+                }
+            }
+
+            // Handle user input
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    if let Ok(mut state) = app.lock() {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                                state.should_quit = true;
+                            }
+                            KeyCode::Char('1') => state.current_tab = 0,
+                            KeyCode::Char('2') => state.current_tab = 1,
+                            KeyCode::Char('3') => state.current_tab = 2,
+                            KeyCode::Char('4') => state.current_tab = 3,
+                            KeyCode::Char('5') => state.current_tab = 4,
+                            KeyCode::Tab => state.next_tab(),
+                            KeyCode::BackTab => state.prev_tab(),
+                            _ => {}
                         }
-                        KeyCode::Char('1') => state.current_tab = 0,
-                        KeyCode::Char('2') => state.current_tab = 1,
-                        KeyCode::Char('3') => state.current_tab = 2,
-                        KeyCode::Char('4') => state.current_tab = 3,
-                        KeyCode::Char('5') => state.current_tab = 4,
-                        KeyCode::Tab => state.next_tab(),
-                        KeyCode::BackTab => state.prev_tab(),
-                        _ => {}
                     }
                 }
             }
         }
-    }
+        Ok(())
+    })();
 
     // Restore terminal cleanly
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    Ok(())
+    run_res
 }

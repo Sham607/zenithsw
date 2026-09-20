@@ -77,8 +77,6 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         robinhood_ws_url: "ws://127.0.0.1:8546".to_string(),
         robinhood_api_key: None,
         evm_private_key: None,
-        fomo_auth_token: None,
-        fomo_sync_interval_sec: 5,
         stream_poll_interval_ms: 500,
         max_price_delta_pct: 5.0,
         min_liquidity_usd: 30000.0,
@@ -90,13 +88,30 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         trailing_stop_pct: 10.0,
         stop_loss_pct: 15.0,
         take_profit_pct: 100.0,
+        take_profit_2_pct: 300.0,
+        liquidity_drain_usd: 10000.0,
+        peak_drawdown_pct: 50.0,
+        profit_lock_floor_pct: 20.0,
+        whale_full_dump_pct: 95.0,
+        quarantine_base_minutes: 15,
+        quarantine_max_minutes: 240,
+        demote_consecutive_losses: 2,
+        demote_catastrophic_loss_pct: 30.0,
         shadow_exit_enabled: true,
         confluence_mode: "TIER_S_OR_DUAL_A".to_string(),
         dry_run: true,
+        sim_initial_balance: 100.0,
         live_robinhood_enabled: false,
         enable_solana: true,
         enable_robinhood: false,
         enable_base: false,
+        enable_solana_dex_worker: false,
+        solana_dex_token_address: None,
+        solana_dex_quote_asset: None,
+        solana_dex_token_symbol: None,
+        solana_dex_token_decimals: None,
+        solana_dex_quote_decimals: None,
+        solana_dex_quote_price_usd: None,
         trading_db_path: ":memory:".to_string(),
         wallet_db_path: ":memory:".to_string(),
         candidate_db_path: ":memory:".to_string(),
@@ -143,6 +158,9 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_swing_buy_01".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     let sig_swing = confluence
@@ -168,6 +186,9 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_vault_buy_01".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     let sig_vault = confluence
@@ -207,6 +228,7 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         entry_time: now,
         last_update: now,
         status: "OPEN".to_string(),
+        is_dry_run: true,
     };
     db.upsert_position(&fast_pos).unwrap();
 
@@ -229,6 +251,7 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         entry_time: now,
         last_update: now,
         status: "OPEN".to_string(),
+        is_dry_run: true,
     };
     db.upsert_position(&vault_pos).unwrap();
 

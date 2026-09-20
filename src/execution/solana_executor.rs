@@ -1,15 +1,27 @@
 use crate::config::Config;
 use crate::db::{ExecutionIntentMetadata, SmartWalletDb};
-use crate::models::{is_blacklisted_asset, Chain, ShadowPosition, ShadowSignal};
+use crate::models::{is_blacklisted_asset, Chain, ExecutionTrack, ShadowPosition, ShadowSignal};
+use crate::streams::solana_stream::SolanaStreamListener;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone)]
+pub struct CachedRealizableQuote {
+    pub token_mint: String,
+    pub token_amount_raw: u64,
+    pub estimated_out_lamports: u64,
+    pub estimated_out_sol: f64,
+    pub price_impact_pct: f64,
+    pub fetched_at: Instant,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JupiterQuoteResponse {
@@ -44,6 +56,7 @@ pub struct SolanaExecutor {
     rpc_successes: AtomicU64,
     rpc_rate_limited: AtomicU64,
     rpc_failures: AtomicU64,
+    quote_cache: Mutex<HashMap<String, CachedRealizableQuote>>,
 }
 
 impl SolanaExecutor {
@@ -78,6 +91,7 @@ impl SolanaExecutor {
             rpc_successes: AtomicU64::new(0),
             rpc_rate_limited: AtomicU64::new(0),
             rpc_failures: AtomicU64::new(0),
+            quote_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -424,6 +438,116 @@ impl SolanaExecutor {
         tokens
     }
 
+    /// Startup Reconciliation & Orphan Token Recovery:
+    /// Reconciles on-chain physical SPL token balances with DB shadow positions.
+    /// Closes ghost DB positions where on-chain balance is 0.
+    /// Adopts on-chain orphan token holdings as trackable shadow positions.
+    pub async fn reconcile_startup_positions(&self) -> Result<(usize, usize)> {
+        if self.config.dry_run {
+            println!("[STARTUP RECONCILIATION SKIP 🧪] DRY_RUN=true. Simulation mode does not adopt real on-chain wallet balances.");
+            return Ok((0, 0));
+        }
+
+        let (_, wallet_pubkey) = match self.get_keypair() {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("[STARTUP RECONCILIATION SKIP] Keypair not configured or invalid: {e}");
+                return Ok((0, 0));
+            }
+        };
+
+        println!("[STARTUP RECONCILIATION 🔍] Scanning physical on-chain SPL holdings for {}...", wallet_pubkey);
+        let onchain_tokens = self.get_all_wallet_token_balances(&wallet_pubkey).await;
+        let mut onchain_map: HashMap<String, f64> = HashMap::new();
+        for (mint, amt) in onchain_tokens {
+            if !is_blacklisted_asset(&mint, "") {
+                onchain_map.insert(mint, amt);
+            }
+        }
+
+        let mut db_positions = self.db.get_active_positions()?;
+        db_positions.retain(|p| p.chain == Chain::Solana);
+
+        let mut ghost_closed = 0usize;
+        let mut orphans_adopted = 0usize;
+
+        // 1. Check existing DB positions against physical on-chain balance
+        for pos in &db_positions {
+            if let Some(&physical_amt) = onchain_map.get(&pos.token_mint) {
+                if (pos.amount_native - physical_amt).abs() > 0.000001 {
+                    let mut updated = pos.clone();
+                    updated.amount_native = physical_amt;
+                    updated.last_update = Utc::now();
+                    if let Err(e) = self.db.upsert_position(&updated) {
+                        eprintln!("[STARTUP RECONCILIATION ERROR] Failed updating amount_native for {}: {e}", pos.token_mint);
+                    } else {
+                        println!(
+                            "[STARTUP RECONCILIATION ⚖️] Reconciled {} balance: DB {:.4} -> Physical {:.4}",
+                            pos.token_symbol, pos.amount_native, physical_amt
+                        );
+                    }
+                }
+                // Token accounted for
+                onchain_map.remove(&pos.token_mint);
+            } else {
+                // Ghost position: DB says active, but physical on-chain balance is zero
+                if let Err(e) = self.db.close_position(&pos.id, "ORPHAN_AUDIT_ONCHAIN_ZERO", 0.0) {
+                    eprintln!("[STARTUP RECONCILIATION ERROR] Failed closing ghost position {}: {e}", pos.id);
+                } else {
+                    ghost_closed += 1;
+                    println!(
+                        "[STARTUP RECONCILIATION 👻] Ghost position closed for {} (id: {}) — on-chain balance is 0",
+                        pos.token_symbol, pos.id
+                    );
+                }
+            }
+        }
+
+        // 2. Any remaining items in onchain_map are orphan holdings (on-chain balance > 0, but no active DB position)
+        for (orphan_mint, orphan_amt) in onchain_map {
+            // Attempt to resolve symbol & current price via Solana resolver
+            let (symbol, price, _, _) = match SolanaStreamListener::fetch_token_price(&orphan_mint).await {
+                Ok(res) => res,
+                Err(_) => ("UNKNOWN".to_string(), 0.0, 0.0, 0.0),
+            };
+
+            let approx_usd = if price > 0.0 { orphan_amt * price } else { 0.0 };
+            let orphan_pos = ShadowPosition {
+                id: format!("orphan_{}", &orphan_mint[..orphan_mint.len().min(12)]),
+                chain: Chain::Solana,
+                token_symbol: if symbol.is_empty() { "ORPHAN".to_string() } else { symbol },
+                token_mint: orphan_mint.clone(),
+                target_whale_handle: "ORPHAN_ADOPTED".to_string(),
+                target_whale_address: wallet_pubkey.clone(),
+                track: ExecutionTrack::FastLane,
+                entry_price: price,
+                current_price: price,
+                peak_price: price,
+                amount_native: orphan_amt,
+                amount_usd: approx_usd,
+                remaining_portion_pct: 100.0,
+                unrealized_pnl_pct: 0.0,
+                realized_pnl_usd: 0.0,
+                entry_time: Utc::now(),
+                last_update: Utc::now(),
+                status: "OPEN".to_string(),
+                is_dry_run: false, // On-chain adopted orphan is a real physical holding
+            };
+
+            if let Err(e) = self.db.upsert_position(&orphan_pos) {
+                eprintln!("[STARTUP RECONCILIATION ERROR] Failed adopting orphan token {}: {e}", orphan_mint);
+            } else {
+                orphans_adopted += 1;
+                println!(
+                    "[STARTUP RECONCILIATION 🐣] Adopted orphan token {} ({}) balance: {:.4} (${:.2})",
+                    orphan_pos.token_symbol, orphan_mint, orphan_amt, approx_usd
+                );
+            }
+        }
+
+        Ok((ghost_closed, orphans_adopted))
+    }
+
     /// Fetches a Jupiter Swap quote (v1)
     pub async fn fetch_jupiter_quote(
         &self,
@@ -446,6 +570,89 @@ impl SolanaExecutor {
 
         let json = res.json::<Value>().await?;
         Ok(json)
+    }
+
+    /// Fetches a realizable exit quote from Jupiter (token -> WSOL).
+    /// Uses in-memory cache with TTL 60 seconds to avoid hammering Jupiter rate-limits.
+    /// Falls back to cache if fresh fetch fails and cached quote is < 180 seconds old.
+    pub async fn get_realizable_exit_quote(
+        &self,
+        token_mint: &str,
+        token_amount_raw: u64,
+    ) -> Result<CachedRealizableQuote> {
+        let wsol_mint = "So11111111111111111111111111111111111111112";
+        let now = Instant::now();
+
+        // 1. Check cache freshness (< 60 seconds)
+        {
+            let guard = self
+                .quote_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = guard.get(token_mint) {
+                if now.duration_since(cached.fetched_at) < Duration::from_secs(60) {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
+        // Amount must be positive; if 0, use normalized sample (1_000_000 raw units) for evaluation
+        let amount = if token_amount_raw > 0 {
+            token_amount_raw
+        } else {
+            1_000_000
+        };
+
+        // 2. Fetch fresh quote from Jupiter
+        match self
+            .fetch_jupiter_quote(token_mint, wsol_mint, amount, 300)
+            .await
+        {
+            Ok(val) => {
+                let out_amount_str = val
+                    .get("outAmount")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("Jupiter quote missing outAmount"))?;
+                let out_lamports = out_amount_str
+                    .parse::<u64>()
+                    .map_err(|e| anyhow!("Failed to parse outAmount {}: {}", out_amount_str, e))?;
+                let estimated_out_sol = out_lamports as f64 / 1_000_000_000.0;
+                let price_impact_pct = val
+                    .get("priceImpactPct")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+
+                let quote = CachedRealizableQuote {
+                    token_mint: token_mint.to_string(),
+                    token_amount_raw: amount,
+                    estimated_out_lamports: out_lamports,
+                    estimated_out_sol,
+                    price_impact_pct,
+                    fetched_at: now,
+                };
+
+                let mut guard = self
+                    .quote_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.insert(token_mint.to_string(), quote.clone());
+                Ok(quote)
+            }
+            Err(err) => {
+                // Fallback to cache if < 180 seconds old
+                let guard = self
+                    .quote_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(cached) = guard.get(token_mint) {
+                    if now.duration_since(cached.fetched_at) < Duration::from_secs(180) {
+                        return Ok(cached.clone());
+                    }
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Builds an unsigned transaction and returns it with aggregator expiry.
@@ -934,6 +1141,30 @@ impl SolanaExecutor {
                 return Ok(None);
             }
         } else {
+            // Realistic AMM Fill Simulation for Solana (Jupiter / Raydium Quote)
+            if let Ok(sol_price) = self.get_sol_price().await {
+                if sol_price > 0.0 {
+                    let sim_sol = amount_usd / sol_price;
+                    let sim_lamports = (sim_sol * 1_000_000_000.0) as u64;
+                    if let Ok(quote) = self.fetch_jupiter_quote(wsol_mint, &signal.token_mint, sim_lamports, 150).await {
+                        let impact_pct = quote.get("priceImpactPct")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        if impact_pct > 15.0 {
+                            eprintln!(
+                                "[SIMULATION REJECT ❌] Excessive price impact on AMM ({:.2}% > 15.0%) for {}. Simulation trade canceled.",
+                                impact_pct, signal.token_symbol
+                            );
+                            return Ok(None);
+                        }
+                        println!(
+                            "[SIMULATION AMM QUOTE 🪐] Jupiter quote confirmed for {}: Price Impact {:.2}%",
+                            signal.token_symbol, impact_pct
+                        );
+                    }
+                }
+            }
             println!(
                 "[SIMULATION MODE 🧪] DRY_RUN=true. Shadow buy for {} (${:.2}) recorded in DB.",
                 signal.token_symbol, amount_usd
@@ -1038,6 +1269,7 @@ impl SolanaExecutor {
             entry_time: now,
             last_update: now,
             status: "OPEN".to_string(),
+            is_dry_run: self.config.dry_run,
         };
 
         self.db.upsert_position(&position)?;
@@ -1287,5 +1519,20 @@ mod transaction_tests {
     fn rejects_truncated_and_overflowed_shortvec() {
         assert!(SolanaExecutor::extract_recent_blockhash(&[]).is_err());
         assert!(SolanaExecutor::extract_recent_blockhash(&[0x80; 10]).is_err());
+    }
+
+    #[test]
+    fn startup_reconciliation_logic_filters_blacklisted_and_zero_balances() {
+        use crate::models::is_blacklisted_asset;
+        let mut onchain_tokens = vec![
+            ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(), 100.0), // USDC -> Blacklisted
+            ("So11111111111111111111111111111111111111112".to_string(), 2.5),  // WSOL -> Blacklisted
+            ("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".to_string(), 1500.0), // BONK -> Valid
+        ];
+
+        onchain_tokens.retain(|(mint, _)| !is_blacklisted_asset(mint, ""));
+        assert_eq!(onchain_tokens.len(), 1);
+        assert_eq!(onchain_tokens[0].0, "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263");
+        assert_eq!(onchain_tokens[0].1, 1500.0);
     }
 }

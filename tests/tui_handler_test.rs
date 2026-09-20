@@ -16,10 +16,8 @@ fn test_config() -> Config {
         solana_private_key: None,
         robinhood_api_key: None,
         evm_private_key: None,
-        fomo_auth_token: None,
         robinhood_rpc_url: "http://127.0.0.1:1".to_string(),
         robinhood_ws_url: "ws://127.0.0.1:1".to_string(),
-        fomo_sync_interval_sec: 60,
         stream_poll_interval_ms: 500,
         max_price_delta_pct: 5.0,
         min_liquidity_usd: 30000.0,
@@ -31,6 +29,16 @@ fn test_config() -> Config {
         trailing_stop_pct: 10.0,
         stop_loss_pct: 15.0,
         take_profit_pct: 50.0,
+        take_profit_2_pct: 300.0,
+        liquidity_drain_usd: 10000.0,
+        peak_drawdown_pct: 50.0,
+        profit_lock_floor_pct: 20.0,
+        whale_full_dump_pct: 95.0,
+        quarantine_base_minutes: 15,
+        quarantine_max_minutes: 240,
+        demote_consecutive_losses: 2,
+        demote_catastrophic_loss_pct: 30.0,
+        sim_initial_balance: 100.0,
         shadow_exit_enabled: true,
         confluence_mode: "TIER_S_OR_DUAL_A".to_string(),
         dry_run: true,
@@ -38,6 +46,13 @@ fn test_config() -> Config {
         enable_solana: true,
         enable_robinhood: false,
         enable_base: false,
+        enable_solana_dex_worker: false,
+        solana_dex_token_address: None,
+        solana_dex_quote_asset: None,
+        solana_dex_token_symbol: None,
+        solana_dex_token_decimals: None,
+        solana_dex_quote_decimals: None,
+        solana_dex_quote_price_usd: None,
         trading_db_path: "/tmp/zenithsw_test_trading.db".to_string(),
         wallet_db_path: "/tmp/zenithsw_test_wallet.db".to_string(),
         candidate_db_path: "/tmp/zenithsw_test_candidate.db".to_string(),
@@ -103,6 +118,9 @@ fn activity(chain: Chain) -> WalletActivity {
         sell_ratio_pct: 0.0,
         tx_signature: "sig-activity".to_string(),
         timestamp: chrono::Utc::now(),
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     }
 }
 
@@ -129,6 +147,7 @@ fn signal(chain: Chain) -> ShadowSignal {
 fn position(chain: Chain, status: &str) -> ShadowPosition {
     ShadowPosition {
         id: "pos-1".to_string(),
+        is_dry_run: true,
         chain,
         token_symbol: "TKN".to_string(),
         token_mint: "mint-token".to_string(),
@@ -356,4 +375,117 @@ fn handler_is_shareable_across_threads_like_production_tui() {
     };
     handle.join().expect("thread tidak boleh panic");
     assert_eq!(app.lock().unwrap().wallets.len(), 1);
+}
+
+#[test]
+fn radar_snapshot_replaces_state_and_filters_disabled_chain() {
+    let config = test_config();
+    let mut app = App::new();
+    let solana_projection = zenithsw::radar::RadarProjection {
+        chain: Chain::Solana,
+        token_address: "Mint111".to_string(),
+        symbol: Some("TEST".to_string()),
+        pool_address: Some("Pool111".to_string()),
+        dex_id: Some("test-dex".to_string()),
+        market_cap_usd: 1_000_000.0,
+        liquidity_usd: 50_000.0,
+        price_usd: Some(1.0),
+        change_24h_pct: None,
+        change_6h_pct: None,
+        change_1h_pct: None,
+        market_structure: "UNAVAILABLE_OHLCV".to_string(),
+        price_action: "UNAVAILABLE_OHLCV".to_string(),
+        qualified_holder_count: 1,
+        candidate_holder_count: 0,
+        independent_cluster_count: 1,
+        direct_accumulator_count: 1,
+        status: zenithsw::radar::RadarStatus::PortfolioOnly,
+    };
+    let robinhood_projection = zenithsw::radar::RadarProjection {
+        chain: Chain::Robinhood,
+        token_address: "0x1111111111111111111111111111111111111111".to_string(),
+        symbol: Some("TEST".to_string()),
+        pool_address: Some("Pool111".to_string()),
+        dex_id: Some("test-dex".to_string()),
+        market_cap_usd: 1_000_000.0,
+        liquidity_usd: 50_000.0,
+        price_usd: Some(1.0),
+        change_24h_pct: None,
+        change_6h_pct: None,
+        change_1h_pct: None,
+        market_structure: "UNAVAILABLE_OHLCV".to_string(),
+        price_action: "UNAVAILABLE_OHLCV".to_string(),
+        qualified_holder_count: 1,
+        candidate_holder_count: 0,
+        independent_cluster_count: 1,
+        direct_accumulator_count: 1,
+        status: zenithsw::radar::RadarStatus::StructureConfirmed,
+    };
+
+    apply_ipc_message(
+        &mut app,
+        IpcMessage::RadarSync {
+            projections: vec![solana_projection, robinhood_projection],
+        },
+        &config,
+    );
+    assert_eq!(app.radar_projections.len(), 1);
+    assert_eq!(app.radar_projections[0].chain, Chain::Solana);
+
+    apply_ipc_message(
+        &mut app,
+        IpcMessage::RadarSync {
+            projections: vec![],
+        },
+        &config,
+    );
+    assert!(app.radar_projections.is_empty());
+}
+
+#[test]
+fn activity_broadcast_preserves_provenance_and_verification_tag() {
+    let mut app = App::new();
+    let config = test_config();
+    let now = chrono::Utc::now();
+
+    let verified_act = WalletActivity {
+        id: None,
+        wallet_handle: "whale-dex".to_string(),
+        wallet_address: "Qualified111".to_string(),
+        chain: Chain::Solana,
+        activity_type: ActivityType::Buy,
+        token_symbol: "TOK".to_string(),
+        token_mint: "Token111".to_string(),
+        amount_usd: 1500.0,
+        token_amount: 100.0,
+        execution_price_usd: 15.0,
+        whale_balance_before: 0.0,
+        whale_balance_after: 100.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "SigHarness12345678".to_string(),
+        timestamp: now,
+        source_reference: Some("SigHarness12345678".to_string()),
+        parser_version: Some("dex-materializer-v1".to_string()),
+        finality: Some("UNKNOWN".to_string()),
+    };
+
+    apply_ipc_message(
+        &mut app,
+        IpcMessage::ActivityBroadcast {
+            activity: verified_act.clone(),
+        },
+        &config,
+    );
+
+    assert_eq!(app.activities.len(), 1);
+    let stored = &app.activities[0];
+    assert_eq!(stored.tx_signature, "SigHarness12345678");
+    assert_eq!(
+        stored.parser_version.as_deref(),
+        Some("dex-materializer-v1")
+    );
+    assert_eq!(
+        stored.source_reference.as_deref(),
+        Some("SigHarness12345678")
+    );
 }

@@ -25,7 +25,7 @@ Engine dan TUI berbagi:
 - `WALLET_DB_PATH` untuk registry wallet;
 - `IPC_SOCKET_PATH` untuk heartbeat, activity, signal, position update, trade sync, dan log.
 
-TUI juga melakukan refresh database berkala. Status IPC harus dibedakan dari snapshot SQLite; data dashboard tidak boleh dianggap bukti transaksi live tanpa verifikasi on-chain.
+TUI juga melakukan refresh database berkala. Status IPC harus dibedakan dari snapshot SQLite; data dashboard tidak boleh dianggap bukti transaksi live tanpa verifikasi on-chain. Posisi fisik wallet yang diadopsi saat startup (`ORPHAN_ADOPTED`) diproteksi otomatis dan dibedakan dari posisi simulasi melalui flag database `is_dry_run`.
 
 ## Chain yang didukung
 
@@ -87,7 +87,10 @@ Default konfigurasi aman yang diuji:
 
 ```text
 DRY_RUN=true
+SIM_INITIAL_BALANCE=100.0
 LIVE_ROBINHOOD_ENABLED=false
+ENABLE_SOLANA=true
+ENABLE_ROBINHOOD=false
 ENABLE_BASE=false
 IPC_SOCKET_PATH=/tmp/zenithsw.sock
 ```
@@ -215,7 +218,7 @@ mise exec rust@1.94.1 -- cargo build --release --locked
 git diff --check
 ```
 
-Verifikasi terbaru: **76 test lulus, 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
+Verifikasi terbaru: **173 library tests & 17 integration tests lulus (total 190 test), 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
 
 ## Credential dan keamanan
 

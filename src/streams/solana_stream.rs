@@ -2,12 +2,14 @@ use crate::db::SmartWalletDb;
 use crate::models::{ActivityType, Chain, WalletActivity};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 type PriceCacheEntry = (String, f64, f64, f64, Instant);
 type PriceCache = RwLock<HashMap<String, PriceCacheEntry>>;
@@ -74,48 +76,55 @@ impl SolanaStreamListener {
         address: &str,
         db: Arc<SmartWalletDb>,
     ) -> Result<Option<WalletActivity>> {
+        self.check_transaction_for_signature(handle, address, None, db)
+            .await
+    }
+
+    async fn check_transaction_for_signature(
+        &self,
+        handle: &str,
+        address: &str,
+        notified_signature: Option<&str>,
+        db: Arc<SmartWalletDb>,
+    ) -> Result<Option<WalletActivity>> {
         if self.rpc_urls.is_empty() {
             return Ok(None);
         }
 
-        // 1. Get latest signature via getSignaturesForAddress with RPC failover
-        let sig_payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [
-                address,
-                { "limit": 1 }
-            ]
-        });
-
-        let mut sig_items = None;
-        for _ in 0..self.rpc_urls.len() {
-            let rpc = self.get_rpc_url();
-            match self.client.post(&rpc).json(&sig_payload).send().await {
-                Ok(res) if res.status().is_success() => {
-                    if let Ok(sig_json) = res.json::<Value>().await {
-                        if let Some(arr) = sig_json["result"].as_array() {
-                            sig_items = Some(arr.clone());
-                            break;
+        // 1. Event WebSocket memberi signature langsung; polling mengambil signature terbaru.
+        let (signature, block_time) = if let Some(notified) = notified_signature {
+            (notified.to_string(), 0i64)
+        } else {
+            let sig_payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [address, { "limit": 1 }]
+            });
+            let mut sig_items = None;
+            for _ in 0..self.rpc_urls.len() {
+                let rpc = self.get_rpc_url();
+                match self.client.post(&rpc).json(&sig_payload).send().await {
+                    Ok(res) if res.status().is_success() => {
+                        if let Ok(sig_json) = res.json::<Value>().await {
+                            if let Some(arr) = sig_json["result"].as_array() {
+                                sig_items = Some(arr.clone());
+                                break;
+                            }
                         }
                     }
-                }
-                _ => {
-                    self.rotate_rpc(); // Failover to next RPC on 429 / timeout
+                    _ => self.rotate_rpc(),
                 }
             }
-        }
-
-        let sig_items = match sig_items {
-            Some(arr) if !arr.is_empty() => arr,
-            _ => return Ok(None),
+            let Some(arr) = sig_items.filter(|arr| !arr.is_empty()) else {
+                return Ok(None);
+            };
+            let item = &arr[0];
+            (
+                item["signature"].as_str().unwrap_or("").to_string(),
+                item["blockTime"].as_i64().unwrap_or(0),
+            )
         };
-
-        let latest_sig_obj = &sig_items[0];
-        let signature = latest_sig_obj["signature"].as_str().unwrap_or("");
-        let block_time = latest_sig_obj["blockTime"].as_i64().unwrap_or(0);
-
         if signature.is_empty() {
             return Ok(None);
         }
@@ -131,7 +140,7 @@ impl SolanaStreamListener {
         {
             let mut last_map = self.last_signatures.lock().unwrap();
             if let Some(last_sig) = last_map.get(address) {
-                if last_sig == signature {
+                if last_sig == &signature {
                     return Ok(None); // No new transaction, skip
                 }
             } else {
@@ -146,7 +155,7 @@ impl SolanaStreamListener {
 
         {
             let mut processed = self.processed_signatures.lock().unwrap();
-            if processed.contains(signature) {
+            if processed.contains(&signature) {
                 return Ok(None);
             }
             processed.insert(signature.to_string());
@@ -334,10 +343,137 @@ impl SolanaStreamListener {
             sell_ratio_pct,
             tx_signature: signature.to_string(),
             timestamp: tx_time,
+            source_reference: None,
+            parser_version: None,
+            finality: None,
         };
 
         let _ = db.insert_activity(&activity);
         Ok(Some(activity))
+    }
+
+    /// Mengambil signature dan slot dari `logsNotification` Solana.
+    /// Hanya notifikasi sukses yang dikembalikan; detail transaksi tetap diverifikasi
+    /// melalui `getTransaction` oleh collector HTTP yang sudah ada.
+    pub fn parse_logs_notification(message: &str) -> Option<(String, u64)> {
+        let value: Value = serde_json::from_str(message).ok()?;
+        if value.get("method")?.as_str()? != "logsNotification" {
+            return None;
+        }
+        let result = value.get("params")?.get("result")?;
+        let slot = result.get("context")?.get("slot")?.as_u64()?;
+        let notification = result.get("value")?;
+        if !notification.get("err")?.is_null() {
+            return None;
+        }
+        let signature = notification.get("signature")?.as_str()?.trim();
+        if signature.is_empty() {
+            return None;
+        }
+        Some((signature.to_string(), slot))
+    }
+
+    /// Memantau wallet qualified melalui Solana `logsSubscribe` secara read-only.
+    /// Notifikasi hanya memicu verifikasi `getTransaction`; transfer mentah tidak
+    /// langsung dianggap sebagai whale entry.
+    pub async fn run_websocket_monitor(
+        &self,
+        websocket_url: &str,
+        wallets: Vec<crate::db::WalletScanAddress>,
+        db: Arc<SmartWalletDb>,
+    ) -> Result<()> {
+        if !websocket_url.starts_with("ws://") && !websocket_url.starts_with("wss://") {
+            anyhow::bail!("SOLANA_WS_URL harus memakai ws:// atau wss://");
+        }
+        if wallets.is_empty() {
+            return Ok(());
+        }
+        // Handle resmi dari registry: address tidak boleh dipakai sebagai handle,
+        // agar confluence (dedupe identitas) tidak terpecah palsu.
+        let handle_by_address: std::collections::HashMap<String, String> = db
+            .get_active_wallets()
+            .map(|list| {
+                list.into_iter()
+                    .map(|w| (w.address.clone(), w.handle))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut socket = connect_async(websocket_url)
+            .await
+            .map_err(|error| anyhow::anyhow!("Solana WebSocket connect gagal: {error}"))?
+            .0;
+        let mut request_id = 1u64;
+        let mut subscriptions = HashMap::new();
+        for wallet in wallets {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "logsSubscribe",
+                "params": [{ "mentions": [wallet.address] }, { "commitment": "confirmed" }]
+            });
+            socket
+                .send(Message::Text(request.to_string()))
+                .await
+                .map_err(|error| anyhow::anyhow!("Solana WebSocket subscribe gagal: {error}"))?;
+            let request_wallet = request_id;
+            request_id += 1;
+            subscriptions.insert(request_wallet, wallet);
+        }
+        let mut subscription_to_wallet = HashMap::new();
+        while let Some(frame) = socket.next().await {
+            let frame =
+                frame.map_err(|error| anyhow::anyhow!("Solana WebSocket read gagal: {error}"))?;
+            let Message::Text(text) = frame else { continue };
+            let value: Value = match serde_json::from_str(&text) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if let (Some(request), Some(subscription)) = (
+                value.get("id").and_then(Value::as_u64),
+                value.get("result").and_then(Value::as_u64),
+            ) {
+                if let Some(wallet) = subscriptions.remove(&request) {
+                    subscription_to_wallet.insert(subscription, wallet);
+                }
+                continue;
+            }
+            let subscription = value
+                .get("params")
+                .and_then(|params| params.get("subscription"))
+                .and_then(Value::as_u64);
+            let Some(subscription) = subscription else {
+                continue;
+            };
+            let Some(wallet) = subscription_to_wallet.get(&subscription) else {
+                continue;
+            };
+            let Some((signature, slot)) = Self::parse_logs_notification(&text) else {
+                continue;
+            };
+            let resolved_handle = handle_by_address
+                .get(&wallet.address)
+                .cloned()
+                .unwrap_or_else(|| wallet.address.clone());
+            println!(
+                "[SOLANA WS] wallet={} slot={} signature={}",
+                wallet.address, slot, signature
+            );
+            if let Err(error) = self
+                .check_transaction_for_signature(
+                    &resolved_handle,
+                    &wallet.address,
+                    Some(&signature),
+                    db.clone(),
+                )
+                .await
+            {
+                eprintln!(
+                    "[SOLANA WS VERIFY ERROR] wallet={} signature={} error={error}",
+                    wallet.address, signature
+                );
+            }
+        }
+        anyhow::bail!("Solana WebSocket disconnected")
     }
 
     /// Fetches live price & aggregated liquidity with multi-pool scanning & in-memory TTL caching (DexScreener + Search Fallback)
@@ -539,5 +675,39 @@ impl SolanaStreamListener {
         }
 
         Ok(("UNKNOWN".to_string(), 0.0, 0.0, 0.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SolanaStreamListener;
+
+    #[test]
+    fn logs_notification_accepts_successful_event() {
+        let message = r#"{"jsonrpc":"2.0","method":"logsNotification","params":{"result":{"context":{"slot":3557},"value":{"signature":"sig-1","err":null,"logs":[]}},"subscription":14}}"#;
+        assert_eq!(
+            SolanaStreamListener::parse_logs_notification(message),
+            Some(("sig-1".to_string(), 3557))
+        );
+    }
+
+    #[test]
+    fn logs_notification_rejects_failed_event() {
+        let message = r#"{"method":"logsNotification","params":{"result":{"context":{"slot":3557},"value":{"signature":"sig-1","err":{"InstructionError":[0,"Custom"]}}}}}"#;
+        assert_eq!(SolanaStreamListener::parse_logs_notification(message), None);
+    }
+
+    #[test]
+    fn logs_notification_rejects_wrong_method_or_missing_fields() {
+        assert_eq!(
+            SolanaStreamListener::parse_logs_notification(r#"{"method":"accountNotification"}"#),
+            None
+        );
+        assert_eq!(
+            SolanaStreamListener::parse_logs_notification(
+                r#"{"method":"logsNotification","params":{"result":{"context":{"slot":0},"value":{"signature":"","err":null}}}}"#
+            ),
+            None
+        );
     }
 }

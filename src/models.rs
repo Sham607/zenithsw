@@ -3,7 +3,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Chain {
     Solana,
     Robinhood,
@@ -285,6 +285,12 @@ pub struct WalletActivity {
     pub sell_ratio_pct: f64, // 0.0 for Buy, 0.0-100.0 for Sell (e.g. 50.0% partial, 100.0% full)
     pub tx_signature: String,
     pub timestamp: DateTime<Utc>,
+    #[serde(default)]
+    pub source_reference: Option<String>,
+    #[serde(default)]
+    pub parser_version: Option<String>,
+    #[serde(default)]
+    pub finality: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +336,12 @@ pub struct ShadowPosition {
     pub entry_time: DateTime<Utc>,
     pub last_update: DateTime<Utc>,
     pub status: String, // "OPEN" | "PARTIAL_EXIT" | "CLOSED"
+    #[serde(default = "default_is_dry_run")]
+    pub is_dry_run: bool,
+}
+
+pub fn default_is_dry_run() -> bool {
+    true
 }
 
 pub fn default_portion() -> f64 {

@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::db::SmartWalletDb;
+use crate::gating::cooldown::TokenCooldownRegistry;
 use crate::models::{ActivityType, ShadowSignal, SmartWallet, WalletActivity, WalletTier};
 use anyhow::Result;
 use chrono::Utc;
@@ -8,11 +9,32 @@ use std::sync::Arc;
 pub struct ConfluenceEngine {
     config: Config,
     db: Arc<SmartWalletDb>,
+    pub cooldowns: TokenCooldownRegistry,
 }
 
 impl ConfluenceEngine {
     pub fn new(config: Config, db: Arc<SmartWalletDb>) -> Self {
-        Self { config, db }
+        let cooldowns = TokenCooldownRegistry::with_params(
+            config.quarantine_base_minutes,
+            config.quarantine_max_minutes,
+        );
+        Self {
+            config,
+            db,
+            cooldowns,
+        }
+    }
+
+    pub fn new_with_cooldowns(
+        config: Config,
+        db: Arc<SmartWalletDb>,
+        cooldowns: TokenCooldownRegistry,
+    ) -> Self {
+        Self {
+            config,
+            db,
+            cooldowns,
+        }
     }
 
     pub fn evaluate_activity(
@@ -82,6 +104,30 @@ impl ConfluenceEngine {
                 rejection_reason: Some(format!(
                     "REJECTED_BASE_ASSET_OR_STABLECOIN ({})",
                     activity.token_symbol
+                )),
+                confluence_count: 0,
+                timestamp: now,
+            });
+        }
+
+        // 1b-2. Check Token Cooldown Registry (Staggered Quarantine Backoff)
+        if let Some(remaining_secs) = self.cooldowns.check_cooldown(&activity.token_mint) {
+            return Ok(ShadowSignal {
+                chain: activity.chain,
+                token_symbol: activity.token_symbol.clone(),
+                token_mint: activity.token_mint.clone(),
+                whale_handle: activity.wallet_handle.clone(),
+                whale_address: activity.wallet_address.clone(),
+                whale_tier: wallet.tier,
+                track: wallet.execution_track,
+                whale_entry_price: activity.execution_price_usd,
+                current_pool_price,
+                price_delta_pct: 0.0,
+                pool_liquidity_usd,
+                is_passed: false,
+                rejection_reason: Some(format!(
+                    "REJECTED_TOKEN_IN_QUARANTINE ({}s remaining)",
+                    remaining_secs
                 )),
                 confluence_count: 0,
                 timestamp: now,
@@ -264,14 +310,17 @@ impl ConfluenceEngine {
         }
 
         // 2. Multi-Wallet Confluence Rule:
-        // Tier-S & Tier-A: Direct copy execution
-        // Tier-B: Passive monitoring only, requires >= 2 multi-wallet confluence
+        // By default ("TIER_S_OR_DUAL_A"): Tier-S & Tier-A solo direct execution; Tier-B requires >= 2 multi-wallet confluence
+        // If "ALL_TIERS_SOLO" or "ALLOW_ALL": Tier-B is also allowed to trigger solo
         let confluence_count = self
             .db
             .count_recent_buyers_for_mint(&activity.token_mint, 300)
             .unwrap_or(1);
 
-        if wallet.tier == WalletTier::TierB && confluence_count < 2 {
+        let allow_solo = self.config.confluence_mode.eq_ignore_ascii_case("ALL_TIERS_SOLO")
+            || self.config.confluence_mode.eq_ignore_ascii_case("ALLOW_ALL");
+
+        if !allow_solo && wallet.tier == WalletTier::TierB && confluence_count < 2 {
             is_passed = false;
             if rejection_reason.is_none() {
                 rejection_reason = Some(format!(

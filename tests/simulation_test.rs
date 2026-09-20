@@ -5,7 +5,7 @@ use zenithsw::db::SmartWalletDb;
 use zenithsw::execution::SolanaExecutor;
 use zenithsw::gating::ConfluenceEngine;
 use zenithsw::indexer::scoring::ReputationScorer;
-use zenithsw::ingestion::{FomoScraper, WalletResolver};
+use zenithsw::ingestion::WalletResolver;
 use zenithsw::models::{
     ActivityType, Chain, ExecutionTrack, ShadowPosition, ShadowSignal, SmartWallet, TrackedToken,
     WalletActivity, WalletTier,
@@ -47,8 +47,6 @@ fn get_mock_config() -> Config {
         robinhood_ws_url: "wss://robinhood-rpc.test".to_string(),
         robinhood_api_key: None,
         evm_private_key: None,
-        fomo_auth_token: None,
-        fomo_sync_interval_sec: 60,
         stream_poll_interval_ms: 500,
         max_price_delta_pct: 5.0,
         min_liquidity_usd: 30000.0,
@@ -60,13 +58,30 @@ fn get_mock_config() -> Config {
         trailing_stop_pct: 10.0,
         stop_loss_pct: 15.0,
         take_profit_pct: 50.0,
+        take_profit_2_pct: 300.0,
+        liquidity_drain_usd: 10000.0,
+        peak_drawdown_pct: 50.0,
+        profit_lock_floor_pct: 20.0,
+        whale_full_dump_pct: 95.0,
+        quarantine_base_minutes: 15,
+        quarantine_max_minutes: 240,
+        demote_consecutive_losses: 2,
+        demote_catastrophic_loss_pct: 30.0,
         shadow_exit_enabled: true,
         confluence_mode: "TIER_S_OR_DUAL_A".to_string(),
         dry_run: true,
+        sim_initial_balance: 100.0,
         live_robinhood_enabled: false,
         enable_solana: true,
         enable_robinhood: false,
         enable_base: false,
+        enable_solana_dex_worker: false,
+        solana_dex_token_address: None,
+        solana_dex_quote_asset: None,
+        solana_dex_token_symbol: None,
+        solana_dex_token_decimals: None,
+        solana_dex_quote_decimals: None,
+        solana_dex_quote_price_usd: None,
         trading_db_path: ":memory:".to_string(),
         wallet_db_path: ":memory:".to_string(),
         candidate_db_path: ":memory:".to_string(),
@@ -120,6 +135,9 @@ async fn test_database_wallet_and_activity_crud() {
         sell_ratio_pct: 0.0,
         tx_signature: "sig123".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     db.insert_activity(&activity).unwrap();
@@ -170,6 +188,9 @@ async fn test_gating_price_delta_max_5_pct() {
         sell_ratio_pct: 0.0,
         tx_signature: "sig_alpha".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     // Case 1: Current Price = 1.03 (+3.0% delta) -> Should PASS (<= +5.0%)
@@ -240,6 +261,9 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
         sell_ratio_pct: 0.0,
         tx_signature: "sig_beta".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     // Case 1: Low Liquidity $15,000 < $30,000 -> Should REJECT
@@ -286,6 +310,9 @@ async fn test_gating_liquidity_floor_and_tier_confluence() {
         sell_ratio_pct: 0.0,
         tx_signature: "sig_beta2".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
     db.insert_activity(&activity).unwrap();
     db.insert_activity(&activity2).unwrap();
@@ -372,12 +399,7 @@ fn test_indexer_reputation_scoring() {
 }
 
 #[test]
-fn test_fomo_seed_traders_and_resolver() {
-    let seeds = FomoScraper::get_default_seed_traders();
-    assert!(seeds.len() >= 15);
-    assert_eq!(seeds[0].handle, "unipcs");
-    assert_eq!(seeds[0].chain, Chain::Solana);
-
+fn test_wallet_resolver() {
     let res_sol = WalletResolver::resolve_chain_and_address("ether_monk").unwrap();
     assert_eq!(res_sol.0, Chain::Solana);
     assert_eq!(res_sol.1, "EZcv4WSEmX7WopTJc2bfrdaYovpKcxk81s9zXiQ3Zm9i");
@@ -577,6 +599,9 @@ async fn test_multi_whale_averaging_and_same_whale_reentry_accumulation() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_buy_1".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     let sig1 = confluence
@@ -607,6 +632,9 @@ async fn test_multi_whale_averaging_and_same_whale_reentry_accumulation() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_buy_repeat".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     let sig1_repeat = confluence
@@ -653,6 +681,9 @@ async fn test_multi_whale_averaging_and_same_whale_reentry_accumulation() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_buy_2".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     let sig2 = confluence
@@ -720,6 +751,9 @@ async fn test_min_whale_buy_and_price_impact_gating() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_dust".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     let sig_dust = confluence
@@ -751,6 +785,9 @@ async fn test_min_whale_buy_and_price_impact_gating() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_high_impact".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     let sig_high_impact = confluence
@@ -785,6 +822,9 @@ async fn test_min_whale_buy_and_price_impact_gating() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_valid".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     seed_test_token(
@@ -866,6 +906,9 @@ async fn test_market_cap_range_gating_50k_to_20m() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_low_mc".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     let sig_low = confluence
@@ -913,6 +956,9 @@ async fn test_market_cap_range_gating_50k_to_20m() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_high_mc".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     let sig_high = confluence
@@ -960,6 +1006,9 @@ async fn test_market_cap_range_gating_50k_to_20m() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_sweet".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
 
     let sig_sweet = confluence
@@ -1078,6 +1127,9 @@ async fn test_wrapped_btc_blacklist_and_market_cap_fail_closed() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_cbbtc_blacklist".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
     let cb_signal = confluence
         .evaluate_activity(&cb_btc, &whale, 77_053.28, 1_000_000.0)
@@ -1149,6 +1201,9 @@ fn test_clmm_single_sided_spoofed_liquidity_gating() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_genuine".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
     let genuine_sig = confluence
         .evaluate_activity(&genuine_act, &whale, 1.0, 50_000.0)
@@ -1172,6 +1227,9 @@ fn test_clmm_single_sided_spoofed_liquidity_gating() {
         sell_ratio_pct: 0.0,
         tx_signature: "tx_fake_clmm".to_string(),
         timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
     };
     // When effective liquidity is clamped to real quote ($31.11 * 2 = $62.22), it must be rejected by gating
     let fake_sig = confluence
@@ -1182,4 +1240,224 @@ fn test_clmm_single_sided_spoofed_liquidity_gating() {
         .rejection_reason
         .unwrap()
         .contains("LIQUIDITY_TOO_LOW"));
+}
+
+#[tokio::test]
+async fn test_gating_token_quarantine_cooldown() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let config = get_mock_config();
+    let confluence = ConfluenceEngine::new(config, db.clone());
+    let now = Utc::now();
+
+    let failing_mint = "TokenInQuarantine111111111111111111111111111";
+    // Record execution failure to trigger quarantine backoff
+    confluence.cooldowns.record_failure(failing_mint);
+
+    let whale = SmartWallet {
+        id: None,
+        rank: 1,
+        name: "TestWhale".to_string(),
+        handle: "test_whale".to_string(),
+        chain: Chain::Solana,
+        address: "EZcv4WSEmX7WopTJc2bfrdaYovpKcxk81s9zXiQ3Zm9i".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 10000.0,
+        win_rate_pct: 80.0,
+        total_trades: 20,
+        source: "FOMO".to_string(),
+        execution_track: ExecutionTrack::FastLane,
+        reputation_score: 90.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: now,
+    };
+
+    let activity = WalletActivity {
+        id: None,
+        wallet_handle: "test_whale".to_string(),
+        wallet_address: "EZcv4WSEmX7WopTJc2bfrdaYovpKcxk81s9zXiQ3Zm9i".to_string(),
+        chain: Chain::Solana,
+        activity_type: ActivityType::Buy,
+        token_symbol: "FAIL".to_string(),
+        token_mint: failing_mint.to_string(),
+        amount_usd: 1000.0,
+        token_amount: 1000.0,
+        execution_price_usd: 1.0,
+        whale_balance_before: 0.0,
+        whale_balance_after: 1000.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "tx_quarantine".to_string(),
+        timestamp: now,
+        source_reference: None,
+        parser_version: None,
+        finality: None,
+    };
+
+    let sig = confluence
+        .evaluate_activity(&activity, &whale, 1.0, 50000.0)
+        .unwrap();
+    assert!(!sig.is_passed);
+    assert!(sig
+        .rejection_reason
+        .unwrap()
+        .contains("REJECTED_TOKEN_IN_QUARANTINE"));
+}
+
+#[tokio::test]
+async fn test_wallet_demotion_on_consecutive_losses() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let now = Utc::now();
+
+    let whale = SmartWallet {
+        id: None,
+        rank: 1,
+        name: "LosingWhale".to_string(),
+        handle: "losing_whale".to_string(),
+        chain: Chain::Solana,
+        address: "WhaleLossAddress11111111111111111111111111".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 1000.0,
+        win_rate_pct: 70.0,
+        total_trades: 10,
+        source: "FOMO".to_string(),
+        execution_track: ExecutionTrack::FastLane,
+        reputation_score: 85.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: now,
+    };
+    db.upsert_wallet(&whale).unwrap();
+
+    // Verify initially TierS and active
+    let w_initial = db
+        .get_wallet_by_address("WhaleLossAddress11111111111111111111111111")
+        .unwrap()
+        .unwrap();
+    assert_eq!(w_initial.tier, WalletTier::TierS);
+    assert!(w_initial.is_active);
+
+    // 1st Trade: -10% loss
+    let pos1 = ShadowPosition {
+        id: "POS-1".to_string(),
+        chain: Chain::Solana,
+        token_symbol: "LOSER1".to_string(),
+        token_mint: "Mint111111111111111111111111111111111111111".to_string(),
+        target_whale_handle: "losing_whale".to_string(),
+        target_whale_address: "WhaleLossAddress11111111111111111111111111".to_string(),
+        track: ExecutionTrack::FastLane,
+        entry_price: 1.0,
+        current_price: 0.9,
+        peak_price: 1.0,
+        amount_native: 100.0,
+        amount_usd: 100.0,
+        remaining_portion_pct: 100.0,
+        unrealized_pnl_pct: -10.0,
+        realized_pnl_usd: 0.0,
+        entry_time: now,
+        last_update: now,
+        status: "OPEN".to_string(),
+        is_dry_run: true,
+    };
+    db.upsert_position(&pos1).unwrap();
+    db.close_position("POS-1", "CUTLOSS", 0.9).unwrap();
+
+    // After 1st loss: should still be TierS (requires 2 consecutive losses)
+    let w_after1 = db
+        .get_wallet_by_address("WhaleLossAddress11111111111111111111111111")
+        .unwrap()
+        .unwrap();
+    assert_eq!(w_after1.tier, WalletTier::TierS);
+    assert!(w_after1.is_active);
+
+    // 2nd Trade: -15% loss
+    let pos2 = ShadowPosition {
+        id: "POS-2".to_string(),
+        chain: Chain::Solana,
+        token_symbol: "LOSER2".to_string(),
+        token_mint: "Mint222222222222222222222222222222222222222".to_string(),
+        target_whale_handle: "losing_whale".to_string(),
+        target_whale_address: "WhaleLossAddress11111111111111111111111111".to_string(),
+        track: ExecutionTrack::FastLane,
+        entry_price: 2.0,
+        current_price: 1.7,
+        peak_price: 2.0,
+        amount_native: 50.0,
+        amount_usd: 100.0,
+        remaining_portion_pct: 100.0,
+        unrealized_pnl_pct: -15.0,
+        realized_pnl_usd: 0.0,
+        entry_time: now,
+        last_update: now,
+        status: "OPEN".to_string(),
+        is_dry_run: true,
+    };
+    db.upsert_position(&pos2).unwrap();
+    db.close_position("POS-2", "CUTLOSS", 1.7).unwrap();
+
+    // After 2 consecutive losses: must be demoted to TIER-B and is_active = false
+    let w_demoted = db
+        .get_wallet_by_address("WhaleLossAddress11111111111111111111111111")
+        .unwrap()
+        .unwrap();
+    assert_eq!(w_demoted.tier, WalletTier::TierB);
+    assert!(!w_demoted.is_active);
+}
+
+#[tokio::test]
+async fn test_wallet_demotion_on_catastrophic_loss() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let now = Utc::now();
+
+    let whale = SmartWallet {
+        id: None,
+        rank: 2,
+        name: "CatastrophicWhale".to_string(),
+        handle: "cat_whale".to_string(),
+        chain: Chain::Solana,
+        address: "WhaleCatAddress11111111111111111111111111".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 50000.0,
+        win_rate_pct: 90.0,
+        total_trades: 50,
+        source: "FOMO".to_string(),
+        execution_track: ExecutionTrack::FastLane,
+        reputation_score: 95.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: now,
+    };
+    db.upsert_wallet(&whale).unwrap();
+
+    // Single catastrophic trade: -35% loss (entry 1.0 -> exit 0.65)
+    let pos = ShadowPosition {
+        id: "POS-CAT".to_string(),
+        chain: Chain::Solana,
+        token_symbol: "RUG".to_string(),
+        token_mint: "MintRug1111111111111111111111111111111111111".to_string(),
+        target_whale_handle: "cat_whale".to_string(),
+        target_whale_address: "WhaleCatAddress11111111111111111111111111".to_string(),
+        track: ExecutionTrack::FastLane,
+        entry_price: 1.0,
+        current_price: 0.65,
+        peak_price: 1.0,
+        amount_native: 100.0,
+        amount_usd: 100.0,
+        remaining_portion_pct: 100.0,
+        unrealized_pnl_pct: -35.0,
+        realized_pnl_usd: 0.0,
+        entry_time: now,
+        last_update: now,
+        status: "OPEN".to_string(),
+        is_dry_run: true,
+    };
+    db.upsert_position(&pos).unwrap();
+    db.close_position("POS-CAT", "STOP_LOSS", 0.65).unwrap();
+
+    // Must be demoted immediately on catastrophic drawdown >= 30%
+    let w_demoted = db
+        .get_wallet_by_address("WhaleCatAddress11111111111111111111111111")
+        .unwrap()
+        .unwrap();
+    assert_eq!(w_demoted.tier, WalletTier::TierB);
+    assert!(!w_demoted.is_active);
 }
