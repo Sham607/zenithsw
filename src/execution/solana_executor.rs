@@ -1176,8 +1176,10 @@ impl SolanaExecutor {
             if let Some(mut existing) = active_pos.into_iter().find(|p| {
                 p.token_mint.eq_ignore_ascii_case(&signal.token_mint) && p.chain == Chain::Solana
             }) {
-                // SAME-WHALE RE-ENTRY GUARD: jika whale ini sudah berkontribusi ke posisi ini,
-                // tolak averaging — satu whale hanya boleh satu kontribusi per posisi terbuka.
+                // MULTI-LOT AKUMULASI: whale yang sama BOLEH menambah lot (mengikuti
+                // pembelian berkala whale). Tiap lot = POSITION_SIZE_USD; avg gabungan
+                // dihitung ulang di bawah (weighted_avg_entry). Cap per-mint tetap
+                // dijaga gating MAX_TOKEN_EXPOSURE ($50).
                 let whale_addr_lower = signal.whale_address.trim().to_lowercase();
                 let whale_already_in = existing
                     .target_whale_address
@@ -1186,14 +1188,17 @@ impl SolanaExecutor {
                     .any(|a| a == whale_addr_lower);
                 if whale_already_in {
                     eprintln!(
-                        "[SAME-WHALE REENTRY BLOCKED 🛡️] @{} ({}) sudah berkontribusi ke posisi {} ({}). Averaging diblokir.",
-                        signal.whale_handle, &signal.whale_address[..10.min(signal.whale_address.len())],
-                        existing.id, existing.token_symbol
+                        "[WHALE ACCUMULATION ➕] @{} menambah lot ke posisi {} ({}). Avg gabungan akan dihitung ulang.",
+                        signal.whale_handle, existing.id, existing.token_symbol
                     );
-                    return Ok(None);
                 }
-                let prev_usd = existing.amount_usd;
-                let prev_tokens = existing.amount_native;
+                // Basis yang benar-benar masih dipegang: partial exit mengurangi
+                // remaining_portion_pct (bukan amount_usd), jadi skala dulu
+                // sebelum digabung dengan lot baru — kalau tidak, avg & total
+                // posisi overstate setelah partial-exit-then-add.
+                let rem_frac = (existing.remaining_portion_pct / 100.0).clamp(0.0, 1.0);
+                let prev_usd = existing.amount_usd * rem_frac;
+                let prev_tokens = existing.amount_native * rem_frac;
                 let total_usd = prev_usd + amount_usd;
                 // Reconcile total balance directly against on-chain wallet state
                 let maybe_pubkey = self.get_keypair().ok().map(|(_, pk)| pk);

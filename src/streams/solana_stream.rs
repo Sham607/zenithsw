@@ -16,6 +16,44 @@ type PriceCache = RwLock<HashMap<String, PriceCacheEntry>>;
 
 static PRICE_CACHE: OnceLock<PriceCache> = OnceLock::new();
 
+/// Quote/collateral mints yang dipakai whale untuk membayar.
+pub fn is_collateral_mint(mint: &str) -> bool {
+    mint == "So11111111111111111111111111111111111111112"
+        || mint == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        || mint == "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+        || mint == "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo"
+}
+
+/// Klasifikasi arah pergerakan token utk target wallet.
+/// Buy/Sell hanya jika ada pembayaran: stables (USDC/USDT/PYUSD, ~$1/unit) atau SOL
+/// bergerak BERLAWANAN arah di wallet yang sama. Ambang SOL -0.001 memisahkan
+/// pembayaran swap dari biaya gas (~0.000005). Tanpa aliran pembayaran = transfer.
+pub fn classify_token_movement(
+    delta_token: f64,
+    delta_stables_usd: f64,
+    delta_sol: f64,
+) -> ActivityType {
+    const STABLE_PAYMENT_USD: f64 = 0.01;
+    const SOL_PAYMENT: f64 = 0.001;
+    let paid = delta_stables_usd < -STABLE_PAYMENT_USD || delta_sol < -SOL_PAYMENT;
+    let received = delta_stables_usd > STABLE_PAYMENT_USD || delta_sol > SOL_PAYMENT;
+    if delta_token > 0.0 {
+        if paid {
+            ActivityType::Buy
+        } else {
+            ActivityType::Transfer
+        }
+    } else if delta_token < 0.0 {
+        if received {
+            ActivityType::Sell
+        } else {
+            ActivityType::Transfer
+        }
+    } else {
+        ActivityType::Transfer
+    }
+}
+
 fn get_price_cache() -> &'static PriceCache {
     PRICE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
@@ -176,7 +214,7 @@ impl SolanaStreamListener {
                 signature,
                 {
                     "encoding": "jsonParsed",
-                    "maxSupportedTransactionVersion": 0
+                    "maxSupportedTransactionVersion": 1
                 }
             ]
         });
@@ -216,7 +254,7 @@ impl SolanaStreamListener {
 
         let mut token_mint = "".to_string();
         let mut token_symbol = "UNKNOWN".to_string();
-        let mut activity_type = ActivityType::Buy;
+        let mut activity_type = ActivityType::Transfer;
         let mut token_amount = 0.0;
         let mut whale_balance_before = 0.0;
         let mut whale_balance_after = 0.0;
@@ -244,58 +282,57 @@ impl SolanaStreamListener {
                 }
             }
 
-            // Find changing SPL token (excluding native WSOL/USDC/USDT)
+            // Pilih target mint non-collateral dengan |delta| terbesar,
+            // termasuk mint yang HILANG dari post_map (exit/transfer penuh).
+            let mut best: Option<(String, f64, f64, f64)> = None; // (mint, delta, bal_before, bal_after)
             for (mint, post_amt) in &post_map {
-                let is_collateral = mint == "So11111111111111111111111111111111111111112"
-                    || mint == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-                    || mint == "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
-
-                if is_collateral {
+                if is_collateral_mint(mint) {
                     continue;
                 }
-
                 let pre_amt = pre_map.get(mint).copied().unwrap_or(0.0);
-                if (post_amt - pre_amt).abs() > 0.000001 {
-                    token_mint = mint.clone();
-                    whale_balance_before = pre_amt;
-                    whale_balance_after = *post_amt;
-
-                    if *post_amt > pre_amt {
-                        activity_type = ActivityType::Buy;
-                        token_amount = *post_amt - pre_amt;
-                        sell_ratio_pct = 0.0;
-                    } else {
-                        activity_type = ActivityType::Sell;
-                        token_amount = pre_amt - *post_amt;
-                        sell_ratio_pct = if pre_amt > 0.0 {
-                            ((token_amount / pre_amt) * 100.0).clamp(1.0, 100.0)
-                        } else {
-                            100.0
-                        };
-                    }
-                    break;
+                let delta = post_amt - pre_amt;
+                if delta.abs() > 0.000001
+                    && best
+                        .as_ref()
+                        .map(|(_, bd, _, _)| delta.abs() > bd.abs())
+                        .unwrap_or(true)
+                {
+                    best = Some((mint.clone(), delta, pre_amt, *post_amt));
+                }
+            }
+            for (mint, pre_amt) in &pre_map {
+                if post_map.contains_key(mint) || is_collateral_mint(mint) || *pre_amt <= 0.000001 {
+                    continue;
+                }
+                if best
+                    .as_ref()
+                    .map(|(_, bd, _, _)| *pre_amt > bd.abs())
+                    .unwrap_or(true)
+                {
+                    best = Some((mint.clone(), -*pre_amt, *pre_amt, 0.0));
                 }
             }
 
-            // Check if sold 100% (present in pre_map, missing in post_map)
-            if token_mint.is_empty() {
-                for (mint, pre_amt) in &pre_map {
-                    let is_collateral = mint == "So11111111111111111111111111111111111111112"
-                        || mint == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-                        || mint == "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
-                    if is_collateral {
-                        continue;
-                    }
+            if let Some((mint, delta, bal_before, bal_after)) = best {
+                // Delta quote asset di wallet yang sama = bukti pembayaran swap.
+                let q = |m: &str| {
+                    post_map.get(m).copied().unwrap_or(0.0)
+                        - pre_map.get(m).copied().unwrap_or(0.0)
+                };
+                let delta_sol = q("So11111111111111111111111111111111111111112");
+                let delta_stables_usd = q("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+                    + q("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
+                    + q("2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo");
 
-                    if !post_map.contains_key(mint) && *pre_amt > 0.0 {
-                        token_mint = mint.clone();
-                        activity_type = ActivityType::Sell;
-                        token_amount = *pre_amt;
-                        whale_balance_before = *pre_amt;
-                        whale_balance_after = 0.0;
-                        sell_ratio_pct = 100.0;
-                        break;
-                    }
+                activity_type = classify_token_movement(delta, delta_stables_usd, delta_sol);
+                token_mint = mint;
+                whale_balance_before = bal_before;
+                whale_balance_after = bal_after;
+                token_amount = delta.abs();
+                if activity_type == ActivityType::Sell && bal_before > 0.0 {
+                    sell_ratio_pct = ((token_amount / bal_before) * 100.0).clamp(1.0, 100.0);
+                } else {
+                    sell_ratio_pct = 0.0;
                 }
             }
         }
@@ -680,7 +717,85 @@ impl SolanaStreamListener {
 
 #[cfg(test)]
 mod tests {
-    use super::SolanaStreamListener;
+    use super::{classify_token_movement, is_collateral_mint, SolanaStreamListener};
+    use crate::models::ActivityType;
+
+    #[test]
+    fn buy_with_usdc_payment() {
+        // Kasus nyata 21 Sep: +632.260 QUEEF dibayar 1.923 USDC
+        assert_eq!(
+            classify_token_movement(632_260.0, -1_923.0, 0.0),
+            ActivityType::Buy
+        );
+    }
+
+    #[test]
+    fn buy_with_sol_payment() {
+        assert_eq!(classify_token_movement(500.0, 0.0, -0.05), ActivityType::Buy);
+    }
+
+    #[test]
+    fn inbound_transfer_without_payment_is_transfer() {
+        // +token tanpa dana keluar = transfer dari feeder, bukan buy
+        assert_eq!(
+            classify_token_movement(669_000.0, 0.0, 0.0),
+            ActivityType::Transfer
+        );
+        assert_eq!(
+            classify_token_movement(669_000.0, 0.0, 0.000005), // cuma gas
+            ActivityType::Transfer
+        );
+    }
+
+    #[test]
+    fn sell_requires_quote_inflow() {
+        // Jual: token keluar, USDC masuk
+        assert_eq!(
+            classify_token_movement(-100.0, 50.0, 0.0),
+            ActivityType::Sell
+        );
+        // Token keluar tanpa dana masuk = transfer keluar, bukan sell
+        assert_eq!(
+            classify_token_movement(-100.0, 0.0, 0.0),
+            ActivityType::Transfer
+        );
+    }
+
+    #[test]
+    fn gas_only_sol_delta_is_not_payment() {
+        // Gas ~0.000005 SOL jauh di bawah ambang 0.001
+        assert_eq!(
+            classify_token_movement(1000.0, 0.0, -0.000005),
+            ActivityType::Transfer
+        );
+    }
+
+    #[test]
+    fn zero_delta_is_transfer() {
+        assert_eq!(
+            classify_token_movement(0.0, -5.0, -0.1),
+            ActivityType::Transfer
+        );
+    }
+
+    #[test]
+    fn collateral_mints_recognized() {
+        assert!(is_collateral_mint(
+            "So11111111111111111111111111111111111111112"
+        ));
+        assert!(is_collateral_mint(
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        ));
+        assert!(is_collateral_mint(
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+        ));
+        assert!(is_collateral_mint(
+            "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo"
+        ));
+        assert!(!is_collateral_mint(
+            "4UHmZGe6X4DZ5dxYGiGXMhi3Sp34uPWtHB7qDMyvRbYB"
+        ));
+    }
 
     #[test]
     fn logs_notification_accepts_successful_event() {

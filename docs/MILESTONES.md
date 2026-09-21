@@ -455,3 +455,15 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
 - [x] Fix 3 address terpotong di bunker+registry via match unik dari /tmp/unipcs_deep_scan.json (AgmLJBMD..., 5Yyz7b37..., C5Rvdk9w...)
 - [x] Verifikasi cross-check bunker vs registry: set identik, semua address 44-char base58
 - Catatan: engine TIDAK dijalankan otomatis; DRY_RUN=true (simulasi virtual). Rollback: copy backup ke wallet_registry.db
+
+## [2026-09-20] Fix confluence palsu (XMR) + identifikasi MM bot
+- [x] Diagnosa: solana_stream.rs:449 kirim address sbg handle; confluence COUNT(DISTINCT wallet_handle) -> 1 wallet = 2 "whale"; sinyal XMR (Wrapped Monero, liq $251k) lolos palsu
+- [x] Regression test confluence_dedupe_test; fix handle resolution + gate dedupe by wallet_address; full suite 21 suites OK
+- [x] Backfill 1.610 baris wallet_activities (handle=address) ke handle resmi; live verify pasca-restart: 0 baris rusak baru, confluence jujur
+- [x] Forensik MM bot GpMZbSM2...: wallet EOA 1.274,6 SOL (~$138k), router Jupiter, 1.491 tx hari ini (709 BUY $39.7k / 782 SELL $40.1k, 318 token) = pola market maker/MEV; kontaminasi eksperimen: 2 posisi shadow (XMR + LMT) terekam
+
+## [2026-09-20] Demote 6+1 wallet TIDAK LAYAK + wipe riwayat trading
+- [x] 7 wallet (4 proxy + insider + burst drained, + Raydium vault authority) ditandai TIDAK_LAYAK di backup registry (7 insert) & live registry (is_active=0)
+- [x] Wipe total trading_state.db: 2.707 aktivitas, 48 posisi, 177 sinyal, 83 trade history -> 0; snapshot aman: trading_state_snapshot_20260920_134516.db
+- [x] Engine restart 20:48 WIB: "Tracing on-chain funding clusters for 8 Tier-S wallets"; aktivitas pertama dari sniper cluster (handle resmi terverifikasi); 0 sinyal/posisi sampai verifikasi
+- Catatan: eksperimen bersih dimulai; motor: main, backbone, 4 sniper Bruce, 2 heavy feeder
