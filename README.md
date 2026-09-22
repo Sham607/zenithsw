@@ -35,9 +35,8 @@ TUI juga melakukan refresh database berkala. Status IPC harus dibedakan dari sna
 - Jupiter/PumpPortal digunakan oleh jalur executor yang tersedia.
 - Konfirmasi transaksi dipolling sebelum posisi dibuka atau ditutup.
 - Balance token direkonsiliasi dari RPC.
-- Posisi satu token digabung dengan VWAP.
-- Re-entry dari whale yang sama saat posisi masih terbuka ditolak.
-- Exit parsial mengikuti proporsi penjualan whale.
+- Posisi satu token digabung dengan VWAP (multi-lot accumulation didukung hingga batas exposure cap).
+- Exit parsial mengikuti proporsi penjualan whale saat mode shadow aktif.
 - Transaction aggregator yang dipakai untuk BUY harus menyediakan serialized transaction; blockhash diparse dari transaction yang benar-benar akan ditandatangani, bukan dari RPC `getLatestBlockhash` yang diambil terpisah.
 
 ### Robinhood Chain
@@ -76,10 +75,32 @@ Aturan umum yang dipakai lintas executor:
 - asset blacklist diterapkan sebelum entry;
 - harga, liquidity, market cap, amount, dan slippage harus valid serta finite;
 - satu posisi aktif per token dan chain;
-- averaging hanya dari whale berbeda;
-- same-whale re-entry diblokir;
-- partial exit dan full exit diproses secara proporsional;
+- satu posisi aktif per token dan chain;
+- multi-lot accumulation didukung dengan weighted VWAP hingga batas `MAX_TOKEN_EXPOSURE` ($50);
 - posisi live hanya boleh dipersist setelah bukti transaksi dan balance on-chain lengkap.
+
+### Strategi Exit Terbifurkasi (`SHADOW_EXIT_ENABLED`)
+
+ZenithSW mengisolasi aturan keluar menjadi dua mode operasional:
+
+1. **Mode Whale Mirror (`SHADOW_EXIT_ENABLED=true`)**:
+   - Menyimak transaksi penjualan whale secara real-time.
+   - `WHALE_FULL_DUMP`: Jika whale menjual $\ge$ `WHALE_FULL_DUMP_PCT` (default `95.0%`) dan whale tunggal $\rightarrow$ menutup 100% posisi.
+   - `WHALE_PARTIAL_DUMP`: Menjual proporsional berbobot sesuai porsi penjualan whale.
+   - Protokol 50-25-25: Take Profit 1 (`+100%`) menjual 50% untuk *free-roll* modal pokok; Take Profit 2 (`+300%`) menjual 25% *runner-lock*.
+   - Proteksi Moonbag: `PEAK_DRAWDOWN_GUARD_EXIT` (dump jika jatuh dari harga puncak) dan `PROFIT_LOCK_FLOOR_EXIT` (mengunci keuntungan minimum hijau).
+   - Pre-TP Trailing Stop Guard (pemicu `+35%`, drop `15%` dari peak $\rightarrow$ dump 100%) dan Fast-Lane Hard Stop Loss.
+
+2. **Mode Bot Otonom (`SHADOW_EXIT_ENABLED=false`)**:
+   - Mengabaikan seluruh transaksi jual whale (whale murni sebagai sinyal entri).
+   - Eksekusi 100% *All-or-Nothing* (tanpa parsial/moonbag, posisi selalu biner `OPEN` $\rightarrow$ `CLOSED`):
+     - `BOT_FULL_TP_EXIT`: Profit mencapai `BOT_TAKE_PROFIT_PCT` $\rightarrow$ Jual 100% full posisi.
+     - `BOT_HARD_SL_CUTLOSS`: Kerugian mencapai `-BOT_STOP_LOSS_PCT` $\rightarrow$ Cut-loss 100% seketika.
+     - `BOT_TRAILING_STOP_EXIT`: Gain mencapai `BOT_TRAILING_STOP_TRIGGER_PCT` lalu drop $\ge$ `BOT_TRAILING_STOP_PCT` dari peak $\rightarrow$ Jual 100% kunci profit.
+
+3. **Global Safety Guard (Berlaku di Kedua Mode)**:
+   - `LIQUIDITY_DRAIN_EXIT`: Jika likuiditas pool anjlok di bawah ambang `LIQUIDITY_DRAIN_USD` (anti jebakan *rug-pull*), posisi langsung didump 100%.
+
 
 Parameter runtime dibaca dari `.env`/secret manager melalui `Config::load()`. Gunakan `.env.example` sebagai referensi nama variabel. Jangan commit `.env`, private key, API key, atau database runtime.
 
@@ -218,7 +239,7 @@ mise exec rust@1.94.1 -- cargo build --release --locked
 git diff --check
 ```
 
-Verifikasi terbaru: **173 library tests & 17 integration tests lulus (total 190 test), 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
+Verifikasi terbaru: **181 library tests & 41 integration tests lulus (total 222 test), 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
 
 ## Credential dan keamanan
 

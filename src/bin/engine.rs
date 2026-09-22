@@ -795,10 +795,17 @@ async fn main() -> Result<()> {
     let config_pos = config.clone();
 
     tokio::spawn(async move {
-        println!(
-            "[POSITION TRACKER] Position & Floating PnL Tracker online (SL: -{:.1}%, TP: +{:.1}%)",
-            config_pos.stop_loss_pct, config_pos.take_profit_pct
-        );
+        if config_pos.shadow_exit_enabled {
+            println!(
+                "[POSITION TRACKER] Position Tracker online (Mode: WHALE SHADOW, SL: -{:.1}%, TP: +{:.1}%)",
+                config_pos.stop_loss_pct, config_pos.take_profit_pct
+            );
+        } else {
+            println!(
+                "[POSITION TRACKER] Position Tracker online (Mode: BOT AUTONOMOUS 100%, SL: -{:.1}%, TP: +{:.1}%)",
+                config_pos.bot_stop_loss_pct, config_pos.bot_take_profit_pct
+            );
+        }
         loop {
             if let Ok(mut positions) = db_pos_tracker.get_active_positions() {
                 for pos in &mut positions {
@@ -926,243 +933,376 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        // 1. Tier 1 Auto Take Profit (Sell 50% of initial position at +100% PnL to free-roll initial capital)
-                        if pos.unrealized_pnl_pct >= track_policy.initial_take_profit_pct
-                            && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
-                            && pos.remaining_portion_pct >= 90.0
-                        {
-                            println!("[AUTO-TP 1 (+{:.0}%) 🎯] Position {} ({}) reached +{:.1}% >= +{:.0}%! Selling 50% to secure capital (Free-Roll Mode)!",
-                                config_pos.take_profit_pct, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.take_profit_pct);
-                            match pos.chain {
-                                Chain::Solana => {
-                                    if let Err(error) = sol_exec_pos
-                                        .execute_partial_shadow_sell(
-                                            &pos.id,
-                                            50.0,
-                                            "AUTO_TP_50_FREE_ROLL",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=AUTO_TP_50_FREE_ROLL error={error}", pos.id);
+                        if config_pos.shadow_exit_enabled {
+                            // =========================================================================
+                            // MODE A: WHALE SHADOW & RUNNER PROTOCOL (Multi-tier 50-25-25 + Moonbag)
+                            // =========================================================================
+
+                            // 1. Tier 1 Auto Take Profit (Sell 50% of initial position at +100% PnL to free-roll initial capital)
+                            if pos.unrealized_pnl_pct >= track_policy.initial_take_profit_pct
+                                && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
+                                && pos.remaining_portion_pct >= 90.0
+                            {
+                                println!("[AUTO-TP 1 (+{:.0}%) 🎯] Position {} ({}) reached +{:.1}% >= +{:.0}%! Selling 50% to secure capital (Free-Roll Mode)!",
+                                    config_pos.take_profit_pct, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.take_profit_pct);
+                                match pos.chain {
+                                    Chain::Solana => {
+                                        if let Err(error) = sol_exec_pos
+                                            .execute_partial_shadow_sell(
+                                                &pos.id,
+                                                50.0,
+                                                "AUTO_TP_50_FREE_ROLL",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=AUTO_TP_50_FREE_ROLL error={error}", pos.id);
+                                        }
                                     }
-                                }
-                                _ => {
-                                    if let Err(error) = evm_exec_pos
-                                        .execute_partial_shadow_sell(
-                                            &pos.id,
-                                            50.0,
-                                            "AUTO_TP_50_FREE_ROLL",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=AUTO_TP_50_FREE_ROLL error={error}", pos.id);
+                                    _ => {
+                                        if let Err(error) = evm_exec_pos
+                                            .execute_partial_shadow_sell(
+                                                &pos.id,
+                                                50.0,
+                                                "AUTO_TP_50_FREE_ROLL",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=AUTO_TP_50_FREE_ROLL error={error}", pos.id);
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        // 2. Tier 2 Moonbag Take Profit (Sell 25% of initial at configured TP2 PnL, leaving runner)
-                        let tp2_target_pnl = config_pos.take_profit_2_pct;
-                        if pos.unrealized_pnl_pct >= tp2_target_pnl
-                            && pos.status == "PARTIAL_EXIT"
-                            && pos.remaining_portion_pct > 35.0
-                            && pos.remaining_portion_pct <= 55.0
-                        {
-                            println!("[AUTO-TP 2 (+{:.0}%) 🚀] Position {} ({}) hit +{:.1}%! Selling 25% of initial position to lock moonbag gains!",
-                                tp2_target_pnl, pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
-                            match pos.chain {
-                                Chain::Solana => {
-                                    if let Err(error) = sol_exec_pos
-                                        .execute_partial_shadow_sell(
-                                            &pos.id,
-                                            25.0,
-                                            "AUTO_TP_25_RUNNER_LOCK",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=AUTO_TP_25_RUNNER_LOCK error={error}", pos.id);
+                            // 2. Tier 2 Moonbag Take Profit (Sell 25% of initial at configured TP2 PnL, leaving runner)
+                            let tp2_target_pnl = config_pos.take_profit_2_pct;
+                            if pos.unrealized_pnl_pct >= tp2_target_pnl
+                                && pos.status == "PARTIAL_EXIT"
+                                && pos.remaining_portion_pct > 35.0
+                                && pos.remaining_portion_pct <= 55.0
+                            {
+                                println!("[AUTO-TP 2 (+{:.0}%) 🚀] Position {} ({}) hit +{:.1}%! Selling 25% of initial position to lock moonbag gains!",
+                                    tp2_target_pnl, pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
+                                match pos.chain {
+                                    Chain::Solana => {
+                                        if let Err(error) = sol_exec_pos
+                                            .execute_partial_shadow_sell(
+                                                &pos.id,
+                                                25.0,
+                                                "AUTO_TP_25_RUNNER_LOCK",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=AUTO_TP_25_RUNNER_LOCK error={error}", pos.id);
+                                        }
                                     }
-                                }
-                                _ => {
-                                    if let Err(error) = evm_exec_pos
-                                        .execute_partial_shadow_sell(
-                                            &pos.id,
-                                            25.0,
-                                            "AUTO_TP_25_RUNNER_LOCK",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=AUTO_TP_25_RUNNER_LOCK error={error}", pos.id);
-                                    }
-                                }
-                            }
-                        }
-
-                        // 3. Tier 3 Catastrophic Peak Drawdown Guard on Runner / Moonbag
-                        // If price drops beyond configured % from peak after a 2x+ pump, dump remaining portion to prevent roundtripping to zero
-                        let peak_drawdown_ratio = 1.0 - (config_pos.peak_drawdown_pct / 100.0);
-                        if pos.status == "PARTIAL_EXIT"
-                            && pos.peak_price >= pos.entry_price * 2.0
-                            && pos.current_price <= pos.peak_price * peak_drawdown_ratio
-                            && pos.remaining_portion_pct <= 55.0
-                        {
-                            println!("[PEAK DRAWDOWN GUARD 🛡️] Position {} ({}) dropped >{:.0}% from peak (${:.6} -> ${:.6})! Dumping remaining {:.0}% to lock profit!",
-                                pos.id, pos.token_symbol, config_pos.peak_drawdown_pct, pos.peak_price, pos.current_price, pos.remaining_portion_pct);
-                            match pos.chain {
-                                Chain::Solana => {
-                                    if let Err(error) = sol_exec_pos
-                                        .execute_shadow_sell(
-                                            &pos.id,
-                                            "PEAK_DRAWDOWN_GUARD_EXIT",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=PEAK_DRAWDOWN_GUARD_EXIT error={error}", pos.id);
-                                    }
-                                }
-                                _ => {
-                                    if let Err(error) = evm_exec_pos
-                                        .execute_shadow_sell(
-                                            &pos.id,
-                                            "PEAK_DRAWDOWN_GUARD_EXIT",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=PEAK_DRAWDOWN_GUARD_EXIT error={error}", pos.id);
+                                    _ => {
+                                        if let Err(error) = evm_exec_pos
+                                            .execute_partial_shadow_sell(
+                                                &pos.id,
+                                                25.0,
+                                                "AUTO_TP_25_RUNNER_LOCK",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=AUTO_TP_25_RUNNER_LOCK error={error}", pos.id);
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        // 4. Profit-Lock Floor on Moonbag (locked once profit reaches the configured floor)
-                        // STRICT SAFETY: Must have reached at least +100% PnL initially and current PnL must be positive (> +5.0%)
-                        if pos.status == "PARTIAL_EXIT"
-                            && pos.peak_price >= pos.entry_price * 2.0
-                            && pos.unrealized_pnl_pct <= config_pos.profit_lock_floor_pct
-                            && pos.unrealized_pnl_pct >= 5.0
-                            && pos.remaining_portion_pct <= 55.0
-                        {
-                            println!("[PROFIT-LOCK FLOOR 🛡️] Position {} ({}) moonbag dropped to +{:.1}% (<= +{:.0}%)! Closing remaining portion to guarantee green trade!",
-                                pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.profit_lock_floor_pct);
-                            match pos.chain {
-                                Chain::Solana => {
-                                    if let Err(error) = sol_exec_pos
-                                        .execute_shadow_sell(
-                                            &pos.id,
-                                            "PROFIT_LOCK_FLOOR_EXIT",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=PROFIT_LOCK_FLOOR_EXIT error={error}", pos.id);
-                                    }
-                                }
-                                _ => {
-                                    if let Err(error) = evm_exec_pos
-                                        .execute_shadow_sell(
-                                            &pos.id,
-                                            "PROFIT_LOCK_FLOOR_EXIT",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=PROFIT_LOCK_FLOOR_EXIT error={error}", pos.id);
-                                    }
-                                }
-                            }
-                        }
-
-                        // 5. Pre-TP Conditional Trailing Stop Guard (Capital Preservation)
-                        // Activates when peak gain reaches trailing_stop_trigger_pct (e.g. +35%),
-                        // and dumps 100% if current price drops >= trailing_stop_pct (e.g. 15%) from peak.
-                        let peak_gain_pct = if pos.entry_price > 0.0 {
-                            ((pos.peak_price - pos.entry_price) / pos.entry_price) * 100.0
-                        } else {
-                            0.0
-                        };
-
-                        if (pos.status == "OPEN" || pos.remaining_portion_pct >= 90.0)
-                            && peak_gain_pct >= config_pos.trailing_stop_trigger_pct
-                            && pos.status != "CLOSED"
-                        {
-                            let trailing_drop_threshold =
-                                1.0 - (config_pos.trailing_stop_pct / 100.0);
-                            let trailing_exit_price = pos.peak_price * trailing_drop_threshold;
-
-                            if pos.current_price <= trailing_exit_price {
-                                println!(
-                                    "[TRAILING STOP GUARD 🛡️] Position {} ({}) peak was +{:.1}% (${:.6}), dropped >{:.0}% from peak to ${:.6} (<= ${:.6})! Dumping 100% to lock profit!",
-                                    pos.id, pos.token_symbol, peak_gain_pct, pos.peak_price, config_pos.trailing_stop_pct, pos.current_price, trailing_exit_price
-                                );
+                            // 3. Tier 3 Catastrophic Peak Drawdown Guard on Runner / Moonbag
+                            // If price drops beyond configured % from peak after a 2x+ pump, dump remaining portion to prevent roundtripping to zero
+                            let peak_drawdown_ratio = 1.0 - (config_pos.peak_drawdown_pct / 100.0);
+                            if pos.status == "PARTIAL_EXIT"
+                                && pos.peak_price >= pos.entry_price * 2.0
+                                && pos.current_price <= pos.peak_price * peak_drawdown_ratio
+                                && pos.remaining_portion_pct <= 55.0
+                            {
+                                println!("[PEAK DRAWDOWN GUARD 🛡️] Position {} ({}) dropped >{:.0}% from peak (${:.6} -> ${:.6})! Dumping remaining {:.0}% to lock profit!",
+                                    pos.id, pos.token_symbol, config_pos.peak_drawdown_pct, pos.peak_price, pos.current_price, pos.remaining_portion_pct);
                                 match pos.chain {
                                     Chain::Solana => {
                                         if let Err(error) = sol_exec_pos
                                             .execute_shadow_sell(
                                                 &pos.id,
-                                                "TRAILING_STOP_EXIT",
+                                                "PEAK_DRAWDOWN_GUARD_EXIT",
                                                 live_price,
                                             )
                                             .await
                                         {
-                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=TRAILING_STOP_EXIT error={error}", pos.id);
+                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=PEAK_DRAWDOWN_GUARD_EXIT error={error}", pos.id);
                                         }
                                     }
                                     _ => {
                                         if let Err(error) = evm_exec_pos
                                             .execute_shadow_sell(
                                                 &pos.id,
-                                                "TRAILING_STOP_EXIT",
+                                                "PEAK_DRAWDOWN_GUARD_EXIT",
                                                 live_price,
                                             )
                                             .await
                                         {
-                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=TRAILING_STOP_EXIT error={error}", pos.id);
+                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=PEAK_DRAWDOWN_GUARD_EXIT error={error}", pos.id);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 4. Profit-Lock Floor on Moonbag (locked once profit reaches the configured floor)
+                            // STRICT SAFETY: Must have reached at least +100% PnL initially and current PnL must be positive (> +5.0%)
+                            if pos.status == "PARTIAL_EXIT"
+                                && pos.peak_price >= pos.entry_price * 2.0
+                                && pos.unrealized_pnl_pct <= config_pos.profit_lock_floor_pct
+                                && pos.unrealized_pnl_pct >= 5.0
+                                && pos.remaining_portion_pct <= 55.0
+                            {
+                                println!("[PROFIT-LOCK FLOOR 🛡️] Position {} ({}) moonbag dropped to +{:.1}% (<= +{:.0}%)! Closing remaining portion to guarantee green trade!",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.profit_lock_floor_pct);
+                                match pos.chain {
+                                    Chain::Solana => {
+                                        if let Err(error) = sol_exec_pos
+                                            .execute_shadow_sell(
+                                                &pos.id,
+                                                "PROFIT_LOCK_FLOOR_EXIT",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=PROFIT_LOCK_FLOOR_EXIT error={error}", pos.id);
+                                        }
+                                    }
+                                    _ => {
+                                        if let Err(error) = evm_exec_pos
+                                            .execute_shadow_sell(
+                                                &pos.id,
+                                                "PROFIT_LOCK_FLOOR_EXIT",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=PROFIT_LOCK_FLOOR_EXIT error={error}", pos.id);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 5. Pre-TP Conditional Trailing Stop Guard (Capital Preservation)
+                            // Activates when peak gain reaches trailing_stop_trigger_pct (e.g. +35%),
+                            // and dumps 100% if current price drops >= trailing_stop_pct (e.g. 15%) from peak.
+                            let peak_gain_pct = if pos.entry_price > 0.0 {
+                                ((pos.peak_price - pos.entry_price) / pos.entry_price) * 100.0
+                            } else {
+                                0.0
+                            };
+
+                            if (pos.status == "OPEN" || pos.remaining_portion_pct >= 90.0)
+                                && peak_gain_pct >= config_pos.trailing_stop_trigger_pct
+                                && pos.status != "CLOSED"
+                            {
+                                let trailing_drop_threshold =
+                                    1.0 - (config_pos.trailing_stop_pct / 100.0);
+                                let trailing_exit_price = pos.peak_price * trailing_drop_threshold;
+
+                                if pos.current_price <= trailing_exit_price {
+                                    println!(
+                                        "[TRAILING STOP GUARD 🛡️] Position {} ({}) peak was +{:.1}% (${:.6}), dropped >{:.0}% from peak to ${:.6} (<= ${:.6})! Dumping 100% to lock profit!",
+                                        pos.id, pos.token_symbol, peak_gain_pct, pos.peak_price, config_pos.trailing_stop_pct, pos.current_price, trailing_exit_price
+                                    );
+                                    match pos.chain {
+                                        Chain::Solana => {
+                                            if let Err(error) = sol_exec_pos
+                                                .execute_shadow_sell(
+                                                    &pos.id,
+                                                    "TRAILING_STOP_EXIT",
+                                                    live_price,
+                                                )
+                                                .await
+                                            {
+                                                eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=TRAILING_STOP_EXIT error={error}", pos.id);
+                                            }
+                                        }
+                                        _ => {
+                                            if let Err(error) = evm_exec_pos
+                                                .execute_shadow_sell(
+                                                    &pos.id,
+                                                    "TRAILING_STOP_EXIT",
+                                                    live_price,
+                                                )
+                                                .await
+                                            {
+                                                eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=TRAILING_STOP_EXIT error={error}", pos.id);
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // 6. Fixed hard SL hanya berlaku untuk Fast-Lane.
+                            let hard_sl_trigger = track_policy
+                                .fixed_stop_loss_pct
+                                .map(|stop_loss_pct| pos.unrealized_pnl_pct <= -stop_loss_pct)
+                                .unwrap_or(false);
+                            if hard_sl_trigger && pos.status != "CLOSED" {
+                                println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) hit {:.1}% <= -{:.1}%! Force closing immediately to protect capital!",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct);
+                                match pos.chain {
+                                    Chain::Solana => {
+                                        if let Err(error) = sol_exec_pos
+                                            .execute_shadow_sell(
+                                                &pos.id,
+                                                "EMERGENCY_HARD_SL_CUTLOSS",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=EMERGENCY_HARD_SL_CUTLOSS error={error}", pos.id);
+                                        }
+                                    }
+                                    _ => {
+                                        if let Err(error) = evm_exec_pos
+                                            .execute_shadow_sell(
+                                                &pos.id,
+                                                "EMERGENCY_HARD_SL_CUTLOSS",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=EMERGENCY_HARD_SL_CUTLOSS error={error}", pos.id);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // =========================================================================
+                            // MODE B: PURE BOT AUTONOMOUS EXIT (Mode FALSE — All-or-Nothing / Clean Scalp)
+                            // =========================================================================
+
+                            // 1. Bot Trailing Stop Guard (Capital Preservation)
+                            let peak_gain_pct = if pos.entry_price > 0.0 {
+                                ((pos.peak_price - pos.entry_price) / pos.entry_price) * 100.0
+                            } else {
+                                0.0
+                            };
+
+                            if pos.status != "CLOSED"
+                                && peak_gain_pct >= config_pos.bot_trailing_stop_trigger_pct
+                            {
+                                let trailing_drop_threshold =
+                                    1.0 - (config_pos.bot_trailing_stop_pct / 100.0);
+                                let trailing_exit_price = pos.peak_price * trailing_drop_threshold;
+
+                                if pos.current_price <= trailing_exit_price {
+                                    println!(
+                                        "[BOT TRAILING STOP 🛡️] Position {} ({}) peak was +{:.1}% (${:.6}), dropped >{:.0}% from peak to ${:.6} (<= ${:.6})! Dumping 100% to lock profit!",
+                                        pos.id, pos.token_symbol, peak_gain_pct, pos.peak_price, config_pos.bot_trailing_stop_pct, pos.current_price, trailing_exit_price
+                                    );
+                                    match pos.chain {
+                                        Chain::Solana => {
+                                            if let Err(error) = sol_exec_pos
+                                                .execute_shadow_sell(
+                                                    &pos.id,
+                                                    "BOT_TRAILING_STOP_EXIT",
+                                                    live_price,
+                                                )
+                                                .await
+                                            {
+                                                eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=BOT_TRAILING_STOP_EXIT error={error}", pos.id);
+                                            }
+                                        }
+                                        _ => {
+                                            if let Err(error) = evm_exec_pos
+                                                .execute_shadow_sell(
+                                                    &pos.id,
+                                                    "BOT_TRAILING_STOP_EXIT",
+                                                    live_price,
+                                                )
+                                                .await
+                                            {
+                                                eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=BOT_TRAILING_STOP_EXIT error={error}", pos.id);
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // 2. Bot Full Take Profit (100% dump, no partials)
+                            if pos.status != "CLOSED"
+                                && pos.unrealized_pnl_pct >= config_pos.bot_take_profit_pct
+                            {
+                                println!(
+                                    "[BOT AUTO-TP 🎯] Position {} ({}) hit +{:.1}% >= +{:.0}%! Selling 100% full position!",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.bot_take_profit_pct
+                                );
+                                match pos.chain {
+                                    Chain::Solana => {
+                                        if let Err(error) = sol_exec_pos
+                                            .execute_shadow_sell(
+                                                &pos.id,
+                                                "BOT_FULL_TP_EXIT",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=BOT_FULL_TP_EXIT error={error}", pos.id);
+                                        }
+                                    }
+                                    _ => {
+                                        if let Err(error) = evm_exec_pos
+                                            .execute_shadow_sell(
+                                                &pos.id,
+                                                "BOT_FULL_TP_EXIT",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=BOT_FULL_TP_EXIT error={error}", pos.id);
                                         }
                                     }
                                 }
                                 continue;
                             }
-                        }
 
-                        // 6. Fixed hard SL hanya berlaku untuk Fast-Lane.
-                        let hard_sl_trigger = track_policy
-                            .fixed_stop_loss_pct
-                            .map(|stop_loss_pct| pos.unrealized_pnl_pct <= -stop_loss_pct)
-                            .unwrap_or(false);
-                        if hard_sl_trigger && pos.status != "CLOSED" {
-                            println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) hit {:.1}% <= -{:.1}%! Force closing immediately to protect capital!",
-                                pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct);
-                            match pos.chain {
-                                Chain::Solana => {
-                                    if let Err(error) = sol_exec_pos
-                                        .execute_shadow_sell(
-                                            &pos.id,
-                                            "EMERGENCY_HARD_SL_CUTLOSS",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=EMERGENCY_HARD_SL_CUTLOSS error={error}", pos.id);
+                            // 3. Bot Full Hard Stop Loss (100% cut loss)
+                            if pos.status != "CLOSED"
+                                && pos.unrealized_pnl_pct <= -config_pos.bot_stop_loss_pct
+                            {
+                                println!(
+                                    "[BOT EMERGENCY SL 🛑] Position {} ({}) hit {:.1}% <= -{:.1}%! Force closing 100% immediately!",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.bot_stop_loss_pct
+                                );
+                                match pos.chain {
+                                    Chain::Solana => {
+                                        if let Err(error) = sol_exec_pos
+                                            .execute_shadow_sell(
+                                                &pos.id,
+                                                "BOT_HARD_SL_CUTLOSS",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=BOT_HARD_SL_CUTLOSS error={error}", pos.id);
+                                        }
+                                    }
+                                    _ => {
+                                        if let Err(error) = evm_exec_pos
+                                            .execute_shadow_sell(
+                                                &pos.id,
+                                                "BOT_HARD_SL_CUTLOSS",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=BOT_HARD_SL_CUTLOSS error={error}", pos.id);
+                                        }
                                     }
                                 }
-                                _ => {
-                                    if let Err(error) = evm_exec_pos
-                                        .execute_shadow_sell(
-                                            &pos.id,
-                                            "EMERGENCY_HARD_SL_CUTLOSS",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=EMERGENCY_HARD_SL_CUTLOSS error={error}", pos.id);
-                                    }
-                                }
+                                continue;
                             }
                         }
                     }
@@ -1385,8 +1525,16 @@ async fn main() -> Result<()> {
                 min_liquidity_usd: config_hb.min_liquidity_usd,
                 max_price_delta_pct: config_hb.max_price_delta_pct,
                 position_size_usd: config_hb.position_size_usd,
-                stop_loss_pct: config_hb.stop_loss_pct,
-                take_profit_pct: config_hb.take_profit_pct,
+                stop_loss_pct: if config_hb.shadow_exit_enabled {
+                    config_hb.stop_loss_pct
+                } else {
+                    config_hb.bot_stop_loss_pct
+                },
+                take_profit_pct: if config_hb.shadow_exit_enabled {
+                    config_hb.take_profit_pct
+                } else {
+                    config_hb.bot_take_profit_pct
+                },
                 min_whale_buy_usd: config_hb.min_whale_buy_usd,
                 is_live_mode: !config_hb.dry_run,
                 wallet_pubkey,

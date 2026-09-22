@@ -43,6 +43,10 @@ pub struct Config {
     pub demote_consecutive_losses: u32, // Number of consecutive losses to demote whale
     pub demote_catastrophic_loss_pct: f64, // Single-trade loss % to trigger demotion
     pub shadow_exit_enabled: bool, // Mirror sell when whale dumps
+    pub bot_take_profit_pct: f64, // Bot autonomous 100% TP (when shadow_exit_enabled=false)
+    pub bot_stop_loss_pct: f64,   // Bot autonomous 100% SL (when shadow_exit_enabled=false)
+    pub bot_trailing_stop_trigger_pct: f64, // Bot autonomous trailing trigger
+    pub bot_trailing_stop_pct: f64, // Bot autonomous trailing drop %
     pub confluence_mode: String,  // "TIER_S_OR_DUAL_A"
     pub dry_run: bool,
     pub sim_initial_balance: f64, // Virtual cash balance in dry_run mode
@@ -273,6 +277,10 @@ impl Config {
         let peak_drawdown_pct = parse_value("PEAK_DRAWDOWN_PCT", 50.0f64)?;
         let profit_lock_floor_pct = parse_value("PROFIT_LOCK_FLOOR_PCT", 20.0f64)?;
         let whale_full_dump_pct = parse_value("WHALE_FULL_DUMP_PCT", 95.0f64)?;
+        let bot_take_profit_pct = parse_value("BOT_TAKE_PROFIT_PCT", 50.0f64)?;
+        let bot_stop_loss_pct = parse_value("BOT_STOP_LOSS_PCT", 20.0f64)?;
+        let bot_trailing_stop_trigger_pct = parse_value("BOT_TRAILING_STOP_TRIGGER_PCT", 30.0f64)?;
+        let bot_trailing_stop_pct = parse_value("BOT_TRAILING_STOP_PCT", 10.0f64)?;
         let quarantine_base_minutes = parse_value("QUARANTINE_BASE_MINUTES", 15u64)?;
         let quarantine_max_minutes = parse_value("QUARANTINE_MAX_MINUTES", 240u64)?;
         let demote_consecutive_losses = parse_value("DEMOTE_CONSECUTIVE_LOSSES", 2u32)?;
@@ -295,6 +303,13 @@ impl Config {
             ("PEAK_DRAWDOWN_PCT", peak_drawdown_pct),
             ("PROFIT_LOCK_FLOOR_PCT", profit_lock_floor_pct),
             ("WHALE_FULL_DUMP_PCT", whale_full_dump_pct),
+            ("BOT_TAKE_PROFIT_PCT", bot_take_profit_pct),
+            ("BOT_STOP_LOSS_PCT", bot_stop_loss_pct),
+            (
+                "BOT_TRAILING_STOP_TRIGGER_PCT",
+                bot_trailing_stop_trigger_pct,
+            ),
+            ("BOT_TRAILING_STOP_PCT", bot_trailing_stop_pct),
             ("DEMOTE_CATASTROPHIC_LOSS_PCT", demote_catastrophic_loss_pct),
         ] {
             if !value.is_finite() || value <= 0.0 {
@@ -318,6 +333,12 @@ impl Config {
         }
         if trailing_stop_pct > 100.0 {
             anyhow::bail!("TRAILING_STOP_PCT tidak boleh melebihi 100.0");
+        }
+        if bot_stop_loss_pct > 100.0 {
+            anyhow::bail!("BOT_STOP_LOSS_PCT tidak boleh melebihi 100.0");
+        }
+        if bot_trailing_stop_pct > 100.0 {
+            anyhow::bail!("BOT_TRAILING_STOP_PCT tidak boleh melebihi 100.0");
         }
         if whale_full_dump_pct > 100.0 {
             anyhow::bail!("WHALE_FULL_DUMP_PCT tidak boleh melebihi 100.0");
@@ -395,6 +416,10 @@ impl Config {
             demote_consecutive_losses,
             demote_catastrophic_loss_pct,
             shadow_exit_enabled: parse_bool("SHADOW_EXIT_ENABLED", true)?,
+            bot_take_profit_pct,
+            bot_stop_loss_pct,
+            bot_trailing_stop_trigger_pct,
+            bot_trailing_stop_pct,
             confluence_mode: env::var("CONFLUENCE_MODE")
                 .unwrap_or_else(|_| "TIER_S_OR_DUAL_A".to_string()),
             dry_run,

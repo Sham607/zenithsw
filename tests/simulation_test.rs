@@ -70,6 +70,10 @@ fn get_mock_config() -> Config {
         demote_consecutive_losses: 2,
         demote_catastrophic_loss_pct: 30.0,
         shadow_exit_enabled: true,
+        bot_take_profit_pct: 50.0,
+        bot_stop_loss_pct: 20.0,
+        bot_trailing_stop_trigger_pct: 30.0,
+        bot_trailing_stop_pct: 10.0,
         confluence_mode: "TIER_S_OR_DUAL_A".to_string(),
         dry_run: true,
         sim_initial_balance: 100.0,
@@ -1522,4 +1526,108 @@ async fn test_pre_tp_conditional_trailing_stop_logic() {
     assert_eq!(trades[0].exit_price, 1.30);
     assert!((trades[0].pnl_pct - 30.0).abs() < 1e-4);
     assert!(trades[0].pnl_usd > 0.0);
+}
+
+#[tokio::test]
+async fn test_bot_autonomous_exit_full_tp_and_sl_logic() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let mut config = get_mock_config();
+    config.shadow_exit_enabled = false;
+    config.bot_take_profit_pct = 50.0; // 50% TP -> 100% dump
+    config.bot_stop_loss_pct = 20.0; // 20% SL -> 100% cut loss
+    config.bot_trailing_stop_trigger_pct = 30.0;
+    config.bot_trailing_stop_pct = 10.0;
+    let sol_exec = SolanaExecutor::new(config.clone(), db.clone());
+    let now = Utc::now();
+
+    // 1. Test Full TP (100% dump without partial moonbag)
+    let pos_tp = ShadowPosition {
+        id: "POS-BOT-TP-TEST".to_string(),
+        chain: Chain::Solana,
+        token_symbol: "BOTTP".to_string(),
+        token_mint: "BotTpMint111111111111111111111111111111111".to_string(),
+        target_whale_handle: "whale_bot".to_string(),
+        target_whale_address: "AddrBot111111111111111111111111111111111111".to_string(),
+        track: ExecutionTrack::FastLane,
+        entry_price: 1.0,
+        current_price: 1.55, // +55% >= +50% TP
+        peak_price: 1.55,
+        amount_native: 10.0,
+        amount_usd: 10.0,
+        remaining_portion_pct: 100.0,
+        unrealized_pnl_pct: 55.0,
+        realized_pnl_usd: 0.0,
+        entry_time: now,
+        last_update: now,
+        status: "OPEN".to_string(),
+        is_dry_run: true,
+    };
+    db.upsert_position(&pos_tp).unwrap();
+
+    assert!(pos_tp.unrealized_pnl_pct >= config.bot_take_profit_pct);
+
+    sol_exec
+        .execute_shadow_sell(&pos_tp.id, "BOT_FULL_TP_EXIT", pos_tp.current_price)
+        .await
+        .unwrap();
+
+    let active_positions = db.get_active_positions().unwrap();
+    assert!(
+        active_positions.iter().all(|p| p.id != pos_tp.id),
+        "Position harus CLOSED 100% setelah bot full TP"
+    );
+
+    let trades = db.get_recent_trades(5).unwrap();
+    let tp_trade = trades.iter().find(|t| t.symbol == "BOTTP").unwrap();
+    assert_eq!(tp_trade.action, "SELL");
+    assert_eq!(tp_trade.exit_reason, "BOT_FULL_TP_EXIT");
+    assert_eq!(tp_trade.portion_sold_pct, 100.0);
+    assert!((tp_trade.pnl_pct - 55.0).abs() < 1e-4);
+
+    // 2. Test Full Hard SL (100% cut loss)
+    let pos_sl = ShadowPosition {
+        id: "POS-BOT-SL-TEST".to_string(),
+        chain: Chain::Solana,
+        token_symbol: "BOTSL".to_string(),
+        token_mint: "BotSlMint111111111111111111111111111111111".to_string(),
+        target_whale_handle: "whale_bot".to_string(),
+        target_whale_address: "AddrBot111111111111111111111111111111111111".to_string(),
+        track: ExecutionTrack::FastLane,
+        entry_price: 1.0,
+        current_price: 0.78, // -22% <= -20% SL
+        peak_price: 1.0,
+        amount_native: 10.0,
+        amount_usd: 10.0,
+        remaining_portion_pct: 100.0,
+        unrealized_pnl_pct: -22.0,
+        realized_pnl_usd: 0.0,
+        entry_time: now,
+        last_update: now,
+        status: "OPEN".to_string(),
+        is_dry_run: true,
+    };
+    db.upsert_position(&pos_sl).unwrap();
+
+    assert!(pos_sl.unrealized_pnl_pct <= -config.bot_stop_loss_pct);
+
+    sol_exec
+        .execute_shadow_sell(&pos_sl.id, "BOT_HARD_SL_CUTLOSS", pos_sl.current_price)
+        .await
+        .unwrap();
+
+    let active_positions_after_sl = db.get_active_positions().unwrap();
+    assert!(
+        active_positions_after_sl.iter().all(|p| p.id != pos_sl.id),
+        "Position harus CLOSED 100% setelah bot full SL"
+    );
+
+    let trades_after_sl = db.get_recent_trades(5).unwrap();
+    let sl_trade = trades_after_sl
+        .iter()
+        .find(|t| t.symbol == "BOTSL")
+        .unwrap();
+    assert_eq!(sl_trade.action, "SELL");
+    assert_eq!(sl_trade.exit_reason, "BOT_HARD_SL_CUTLOSS");
+    assert_eq!(sl_trade.portion_sold_pct, 100.0);
+    assert!((sl_trade.pnl_pct - (-22.0)).abs() < 1e-4);
 }

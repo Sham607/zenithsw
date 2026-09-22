@@ -486,3 +486,17 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
 - [x] Full test suite: 220/220 unit & integration tests PASS.
 - [x] Binary release dikompilasi (`zenithsw-engine` & `zenithsw`); engine dimatikan sementara sesuai arahan user.
 - [x] Integrasi 2 mode `SHADOW_EXIT_ENABLED`: Sambungkan `config_stream.shadow_exit_enabled` di `src/bin/engine.rs:595` agar switch `true` (mirror dump whale) / `false` (independent bot exit) di `.env` berfungsi fisik. Test 220/220 PASS.
+
+## [2026-09-22] Bifurkasi Exit Strategy: Parameter & Logika Terpisah (Whale Mirror vs Bot Autonomous 100%)
+- [x] Bifurkasi Arsitektur Exit:
+  - Mode `SHADOW_EXIT_ENABLED=true`: Protokol multi-tier (50% TP1 free-roll, 25% TP2 runner lock, moonbag peak drawdown, profit-lock floor, whale mirror partial & full dump).
+  - Mode `SHADOW_EXIT_ENABLED=false`: Mode bot otonom (All-or-Nothing / clean scalp 100% full exit tanpa sisa moonbag) saat TP, SL, atau Trailing Stop terpicu.
+- [x] Penambahan 4 Parameter Khusus Bot di `Config`, `.env.example`, dan `.env`:
+  - `BOT_TAKE_PROFIT_PCT` (default: 50.0%) -> Dump 100% via `BOT_FULL_TP_EXIT`.
+  - `BOT_STOP_LOSS_PCT` (default: 20.0%) -> Cut loss 100% via `BOT_HARD_SL_CUTLOSS`.
+  - `BOT_TRAILING_STOP_TRIGGER_PCT` (default: 30.0%) -> Ambang pemicu trailing stop bot.
+  - `BOT_TRAILING_STOP_PCT` (default: 10.0%) -> Dump 100% via `BOT_TRAILING_STOP_EXIT`.
+- [x] Validasi fail-closed: finite, > 0.0, percentages <= 100.0.
+- [x] Sinkronisasi TUI / Heartbeat IPC: Menyiarkan parameter aktif yang relevan berdasarkan mode yang sedang dipilih.
+- [x] Test suite: `test_bot_autonomous_exit_full_tp_and_sl_logic` lulus; full regression suite: 222 passed (181 unit + 41 integration across all shards), 0 failed.
+- [x] Kompilasi release binary: `zenithsw` & `zenithsw-engine` sukses.
