@@ -405,21 +405,12 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
             (Color::Red, "REJECTED ❌")
         };
 
-        let (track_badge, track_color) = match sig.track {
-            ExecutionTrack::FastLane => ("[FAST ⚡] ", Color::Cyan),
-            ExecutionTrack::VaultLane => ("[VAULT 🏛️] ", Color::Yellow),
-        };
-
         let line1 = Line::from(vec![
             Span::styled(
-                track_badge,
-                Style::default()
-                    .fg(track_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
                 format!("[{}] ", sig.chain),
-                Style::default().fg(Color::Cyan),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 &sig.token_symbol,
@@ -984,29 +975,12 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
         })
         .sum();
 
-    let fast_trades: Vec<&crate::models::TradeRecord> = app
-        .trades
-        .iter()
-        .filter(|t| t.track == ExecutionTrack::FastLane)
-        .collect();
-    let vault_trades: Vec<&crate::models::TradeRecord> = app
-        .trades
-        .iter()
-        .filter(|t| t.track == ExecutionTrack::VaultLane)
-        .collect();
-
-    let fast_pnl: f64 = fast_trades.iter().map(|t| t.pnl_usd).sum();
-    let fast_wins = fast_trades.iter().filter(|t| t.pnl_usd > 0.0).count();
-    let fast_wr = if !fast_trades.is_empty() {
-        (fast_wins as f64 / fast_trades.len() as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let vault_pnl: f64 = vault_trades.iter().map(|t| t.pnl_usd).sum();
-    let vault_wins = vault_trades.iter().filter(|t| t.pnl_usd > 0.0).count();
-    let vault_wr = if !vault_trades.is_empty() {
-        (vault_wins as f64 / vault_trades.len() as f64) * 100.0
+    let total_closed = app.trades.len();
+    let total_wins = app.trades.iter().filter(|t| t.pnl_usd > 0.0).count();
+    let total_losses = app.trades.iter().filter(|t| t.pnl_usd < 0.0).count();
+    let closed_trades_pnl: f64 = app.trades.iter().map(|t| t.pnl_usd).sum();
+    let win_rate = if total_closed > 0 {
+        (total_wins as f64 / total_closed as f64) * 100.0
     } else {
         0.0
     };
@@ -1099,26 +1073,23 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(vec![
-            Span::raw(" • Dual-Track Analytics: "),
+            Span::raw(" • Closed Trades Performance: "),
             Span::styled(
-                "⚡ Fast-Lane: ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                format!("{} Total Closed", total_closed),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             ),
+            Span::raw(" | Win Rate = "),
             Span::styled(
-                format!("${:+.2} (WR: {:.1}%, {} closed) ", fast_pnl, fast_wr, fast_trades.len()),
+                format!("{:.1}% ({} Win / {} Loss)", win_rate, total_wins, total_losses),
                 Style::default()
-                    .fg(if fast_pnl >= 0.0 { Color::Green } else { Color::Red })
+                    .fg(if win_rate >= 50.0 { Color::Green } else { Color::Yellow })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("| "),
+            Span::raw(" | Closed Realized PnL = "),
             Span::styled(
-                "🏛️ Vault-Lane: ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("${:+.2} (WR: {:.1}%, {} closed)", vault_pnl, vault_wr, vault_trades.len()),
+                format!("${:+.2} USD", closed_trades_pnl),
                 Style::default()
-                    .fg(if vault_pnl >= 0.0 { Color::Green } else { Color::Red })
+                    .fg(if closed_trades_pnl >= 0.0 { Color::Green } else { Color::Red })
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
