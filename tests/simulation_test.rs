@@ -42,6 +42,7 @@ fn get_mock_config() -> Config {
     Config {
         solana_rpc_url: "https://mainnet.helius-rpc.com/?api-key=test".to_string(),
         solana_ws_url: "wss://mainnet.helius-rpc.com/?api-key=test".to_string(),
+        solana_execution_rpc_url: None,
         solana_private_key: None,
         robinhood_rpc_url: "https://robinhood-rpc.test".to_string(),
         robinhood_ws_url: "wss://robinhood-rpc.test".to_string(),
@@ -56,6 +57,7 @@ fn get_mock_config() -> Config {
         min_market_cap_usd: 50000.0,
         max_market_cap_usd: 20000000.0,
         trailing_stop_pct: 10.0,
+        trailing_stop_trigger_pct: 35.0,
         stop_loss_pct: 15.0,
         take_profit_pct: 50.0,
         take_profit_2_pct: 300.0,
@@ -645,24 +647,16 @@ async fn test_multi_whale_averaging_and_same_whale_reentry_accumulation() {
         "Signal should still pass gating (confluence engine tidak tahu state posisi)"
     );
 
-    // Executor HARUS memblokir karena whale1 sudah berkontribusi ke posisi ini
+    // 2. Whale 1 buys AGAIN on the same token -> Multi-lot accumulation allowed!
+    // Tiap lot = $10.0. Avg gabungan dihitung ulang.
     let pos1_reentry: Option<ShadowPosition> =
         sol_exec.execute_shadow_buy(&sig1_repeat).await.unwrap();
     assert!(
-        pos1_reentry.is_none(),
-        "Same-whale re-entry HARUS diblokir oleh executor — 1 whale = 1 kontribusi per posisi terbuka"
+        pos1_reentry.is_some(),
+        "Whale 1 multi-lot accumulation harus diizinkan oleh executor"
     );
-
-    // Verifikasi posisi tidak berubah setelah attempt re-entry
-    let positions_after_block = db.get_active_positions().unwrap();
-    let unchanged = positions_after_block
-        .iter()
-        .find(|p| p.token_mint == mint)
-        .unwrap();
-    assert_eq!(
-        unchanged.amount_usd, 10.0,
-        "Posisi tidak boleh berubah setelah same-whale re-entry diblokir"
-    );
+    let pos1_accum = pos1_reentry.unwrap();
+    assert_eq!(pos1_accum.amount_usd, 20.0);
 
     // 3. Whale 2 (DIFFERENT WHALE) buys Token at $0.020 -> MUST BE ALLOWED & AVERAGED IN!
     let act2 = WalletActivity {
@@ -694,11 +688,9 @@ async fn test_multi_whale_averaging_and_same_whale_reentry_accumulation() {
     let pos2: Option<ShadowPosition> = sol_exec.execute_shadow_buy(&sig2).await.unwrap();
     let pos2 = pos2.unwrap();
 
-    // Total USD = 10.0 (whale1 initial) + 10.0 (whale2) = 20.0
-    // Whale1 re-entry diblokir — posisi_usd tidak berubah dari 10.0 sebelum whale2 masuk
-    // Total tokens = 1000.0 (whale1 @0.010) + (10.0 / 0.020 = 500.0) (whale2) = 1500.0
-    assert_eq!(pos2.amount_usd, 20.0);
-    assert!(pos2.amount_native > 1400.0);
+    // Total USD = 10.0 (whale1 lot 1) + 10.0 (whale1 lot 2) + 10.0 (whale2) = 30.0
+    assert_eq!(pos2.amount_usd, 30.0);
+    assert!(pos2.amount_native > 1800.0);
 
     // Verify handles and addresses recorded
     assert!(pos2.target_whale_handle.contains("@sol_whale_alpha"));
@@ -1460,4 +1452,74 @@ async fn test_wallet_demotion_on_catastrophic_loss() {
         .unwrap();
     assert_eq!(w_demoted.tier, WalletTier::TierB);
     assert!(!w_demoted.is_active);
+}
+
+#[tokio::test]
+async fn test_pre_tp_conditional_trailing_stop_logic() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let mut config = get_mock_config();
+    config.trailing_stop_trigger_pct = 35.0; // Trigger at +35%
+    config.trailing_stop_pct = 15.0; // 15% drop from peak
+    let sol_exec = SolanaExecutor::new(config.clone(), db.clone());
+    let now = Utc::now();
+
+    let mut pos = ShadowPosition {
+        id: "POS-TRAILING-TEST".to_string(),
+        chain: Chain::Solana,
+        token_symbol: "TRENDS".to_string(),
+        token_mint: "TrendsMint111111111111111111111111111111111".to_string(),
+        target_whale_handle: "whale_s".to_string(),
+        target_whale_address: "AddrS11111111111111111111111111111111111111".to_string(),
+        track: ExecutionTrack::FastLane,
+        entry_price: 1.0,
+        current_price: 1.0,
+        peak_price: 1.0,
+        amount_native: 10.0,
+        amount_usd: 10.0,
+        remaining_portion_pct: 100.0,
+        unrealized_pnl_pct: 0.0,
+        realized_pnl_usd: 0.0,
+        entry_time: now,
+        last_update: now,
+        status: "OPEN".to_string(),
+        is_dry_run: true,
+    };
+    db.upsert_position(&pos).unwrap();
+
+    // Scenario 1: Price goes up to 1.20 (+20%). Peak is 1.20 (< 35% trigger).
+    // Drop 15% to 1.02. Trailing stop must NOT trigger because trigger threshold not met.
+    pos.peak_price = 1.20;
+    pos.current_price = 1.02;
+    pos.unrealized_pnl_pct = 2.0;
+    let peak_gain_pct = ((pos.peak_price - pos.entry_price) / pos.entry_price) * 100.0;
+    assert!(peak_gain_pct < config.trailing_stop_trigger_pct);
+
+    // Scenario 2: Price surges to 1.55 (+55% like TRENDS). Peak is 1.55 (>= 35% trigger).
+    pos.peak_price = 1.55;
+    let peak_gain_pct_2 = ((pos.peak_price - pos.entry_price) / pos.entry_price) * 100.0;
+    assert!(peak_gain_pct_2 >= config.trailing_stop_trigger_pct);
+
+    let trailing_drop_threshold = 1.0 - (config.trailing_stop_pct / 100.0);
+    let trailing_exit_price = pos.peak_price * trailing_drop_threshold;
+    assert!((trailing_exit_price - 1.3175).abs() < 1e-4);
+
+    // Price drops to 1.30 (<= 1.3175). Trailing stop triggers sell!
+    pos.current_price = 1.30;
+    assert!(pos.current_price <= trailing_exit_price);
+
+    sol_exec
+        .execute_shadow_sell(&pos.id, "TRAILING_STOP_EXIT", pos.current_price)
+        .await
+        .unwrap();
+
+    let active_pos = db.get_active_positions().unwrap();
+    assert!(active_pos.is_empty(), "Position should be closed");
+
+    let trades = db.get_recent_trades(5).unwrap();
+    assert_eq!(trades.len(), 1);
+    assert_eq!(trades[0].action, "SELL");
+    assert_eq!(trades[0].exit_reason, "TRAILING_STOP_EXIT");
+    assert_eq!(trades[0].exit_price, 1.30);
+    assert!((trades[0].pnl_pct - 30.0).abs() < 1e-4);
+    assert!(trades[0].pnl_usd > 0.0);
 }

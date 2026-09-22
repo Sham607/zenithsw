@@ -60,6 +60,7 @@ fn get_price_cache() -> &'static PriceCache {
 
 pub struct SolanaStreamListener {
     rpc_urls: Vec<String>,
+    execution_rpc_url: Option<String>,
     current_rpc_idx: AtomicUsize,
     last_signatures: Arc<Mutex<HashMap<String, String>>>,
     processed_signatures: Arc<Mutex<HashSet<String>>>,
@@ -67,7 +68,7 @@ pub struct SolanaStreamListener {
 }
 
 impl SolanaStreamListener {
-    pub fn new(primary_rpc_url: &str) -> Self {
+    pub fn new(primary_rpc_url: &str, execution_rpc_url: Option<String>) -> Self {
         let mut rpc_urls: Vec<String> = primary_rpc_url
             .split(',')
             .map(str::trim)
@@ -88,11 +89,13 @@ impl SolanaStreamListener {
 
         Self {
             rpc_urls,
+            execution_rpc_url,
             current_rpc_idx: AtomicUsize::new(0),
             last_signatures: Arc::new(Mutex::new(HashMap::new())),
             processed_signatures: Arc::new(Mutex::new(HashSet::new())),
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
+                .user_agent("ZenithSW/1.0")
                 .build()
                 .unwrap_or_default(),
         }
@@ -220,19 +223,35 @@ impl SolanaStreamListener {
         });
 
         let mut tx_result = None;
-        for _ in 0..self.rpc_urls.len() {
-            let rpc = self.get_rpc_url();
-            match self.client.post(&rpc).json(&tx_payload).send().await {
-                Ok(res) if res.status().is_success() => {
+        // Dual-channel: prioritas kanal presisi (Helius) untuk parsing mendalam getTransaction
+        if let Some(ref exec_rpc) = self.execution_rpc_url {
+            if let Ok(res) = self.client.post(exec_rpc).json(&tx_payload).send().await {
+                if res.status().is_success() {
                     if let Ok(tx_json) = res.json::<Value>().await {
                         if !tx_json["result"].is_null() {
                             tx_result = Some(tx_json["result"].clone());
-                            break;
                         }
                     }
                 }
-                _ => {
-                    self.rotate_rpc();
+            }
+        }
+
+        // Fallback ke pool RPC publik jika eksekusi Helius tidak tersedia / gagal
+        if tx_result.is_none() {
+            for _ in 0..self.rpc_urls.len() {
+                let rpc = self.get_rpc_url();
+                match self.client.post(&rpc).json(&tx_payload).send().await {
+                    Ok(res) if res.status().is_success() => {
+                        if let Ok(tx_json) = res.json::<Value>().await {
+                            if !tx_json["result"].is_null() {
+                                tx_result = Some(tx_json["result"].clone());
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        self.rotate_rpc();
+                    }
                 }
             }
         }
@@ -316,8 +335,7 @@ impl SolanaStreamListener {
             if let Some((mint, delta, bal_before, bal_after)) = best {
                 // Delta quote asset di wallet yang sama = bukti pembayaran swap.
                 let q = |m: &str| {
-                    post_map.get(m).copied().unwrap_or(0.0)
-                        - pre_map.get(m).copied().unwrap_or(0.0)
+                    post_map.get(m).copied().unwrap_or(0.0) - pre_map.get(m).copied().unwrap_or(0.0)
                 };
                 let delta_sol = q("So11111111111111111111111111111111111111112");
                 let delta_stables_usd = q("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
@@ -731,7 +749,10 @@ mod tests {
 
     #[test]
     fn buy_with_sol_payment() {
-        assert_eq!(classify_token_movement(500.0, 0.0, -0.05), ActivityType::Buy);
+        assert_eq!(
+            classify_token_movement(500.0, 0.0, -0.05),
+            ActivityType::Buy
+        );
     }
 
     #[test]

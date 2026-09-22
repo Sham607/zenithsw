@@ -218,7 +218,10 @@ async fn main() -> Result<()> {
     }
 
     // Initialize Stream Listeners
-    let sol_listener = Arc::new(SolanaStreamListener::new(&config.solana_rpc_url));
+    let sol_listener = Arc::new(SolanaStreamListener::new(
+        &config.solana_rpc_url,
+        config.solana_execution_rpc_url.clone(),
+    ));
     let arb_listener = Arc::new(EvmStreamListener::new(
         &config.robinhood_rpc_url,
         Chain::Robinhood,
@@ -398,7 +401,9 @@ async fn main() -> Result<()> {
                 );
             }
             Err(error) => {
-                eprintln!("[STARTUP AUDIT ERROR ⚠️] Solana physical reconciliation failed: {error}");
+                eprintln!(
+                    "[STARTUP AUDIT ERROR ⚠️] Solana physical reconciliation failed: {error}"
+                );
             }
         }
     }
@@ -589,7 +594,7 @@ async fn main() -> Result<()> {
                                                 })
                                                 .any(|handle| handle == handle_lower);
 
-                                        if is_participant {
+                                        if config_stream.shadow_exit_enabled && is_participant {
                                             let exit_price = if act.execution_price_usd > 0.0 {
                                                 act.execution_price_usd
                                             } else {
@@ -606,7 +611,9 @@ async fn main() -> Result<()> {
                                             let effective_sell_ratio =
                                                 (raw_sell_ratio * whale_weight).clamp(1.0, 100.0);
 
-                                            if raw_sell_ratio >= config_stream.whale_full_dump_pct && whale_count <= 1.0 {
+                                            if raw_sell_ratio >= config_stream.whale_full_dump_pct
+                                                && whale_count <= 1.0
+                                            {
                                                 println!("[SHADOW FULL EXIT 🔴] Target @{} sold {:.0}% (>= {:.0}%) of {} -> Closing position completely!", act.wallet_handle, raw_sell_ratio, config_stream.whale_full_dump_pct, pos.token_symbol);
                                                 match pos.chain {
                                                     Chain::Solana => {
@@ -733,11 +740,15 @@ async fn main() -> Result<()> {
                                     Chain::Solana => {
                                         match sol_exec_stream.execute_shadow_buy(&sig).await {
                                             Ok(position) => {
-                                                confluence.cooldowns.clear_cooldown(&sig.token_mint);
+                                                confluence
+                                                    .cooldowns
+                                                    .clear_cooldown(&sig.token_mint);
                                                 position
                                             }
                                             Err(error) => {
-                                                let dur = confluence.cooldowns.record_failure(&sig.token_mint);
+                                                let dur = confluence
+                                                    .cooldowns
+                                                    .record_failure(&sig.token_mint);
                                                 eprintln!("[EXECUTION ERROR] Solana shadow buy token={} error={} -> Quarantined for {:?}", sig.token_mint, error, dur);
                                                 None
                                             }
@@ -749,7 +760,9 @@ async fn main() -> Result<()> {
                                             position
                                         }
                                         Err(error) => {
-                                            let dur = confluence.cooldowns.record_failure(&sig.token_mint);
+                                            let dur = confluence
+                                                .cooldowns
+                                                .record_failure(&sig.token_mint);
                                             eprintln!("[EXECUTION ERROR] EVM shadow buy token={} error={} -> Quarantined for {:?}", sig.token_mint, error, dur);
                                             None
                                         }
@@ -1065,7 +1078,59 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // 5. Fixed hard SL hanya berlaku untuk Fast-Lane.
+                        // 5. Pre-TP Conditional Trailing Stop Guard (Capital Preservation)
+                        // Activates when peak gain reaches trailing_stop_trigger_pct (e.g. +35%),
+                        // and dumps 100% if current price drops >= trailing_stop_pct (e.g. 15%) from peak.
+                        let peak_gain_pct = if pos.entry_price > 0.0 {
+                            ((pos.peak_price - pos.entry_price) / pos.entry_price) * 100.0
+                        } else {
+                            0.0
+                        };
+
+                        if (pos.status == "OPEN" || pos.remaining_portion_pct >= 90.0)
+                            && peak_gain_pct >= config_pos.trailing_stop_trigger_pct
+                            && pos.status != "CLOSED"
+                        {
+                            let trailing_drop_threshold =
+                                1.0 - (config_pos.trailing_stop_pct / 100.0);
+                            let trailing_exit_price = pos.peak_price * trailing_drop_threshold;
+
+                            if pos.current_price <= trailing_exit_price {
+                                println!(
+                                    "[TRAILING STOP GUARD 🛡️] Position {} ({}) peak was +{:.1}% (${:.6}), dropped >{:.0}% from peak to ${:.6} (<= ${:.6})! Dumping 100% to lock profit!",
+                                    pos.id, pos.token_symbol, peak_gain_pct, pos.peak_price, config_pos.trailing_stop_pct, pos.current_price, trailing_exit_price
+                                );
+                                match pos.chain {
+                                    Chain::Solana => {
+                                        if let Err(error) = sol_exec_pos
+                                            .execute_shadow_sell(
+                                                &pos.id,
+                                                "TRAILING_STOP_EXIT",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=TRAILING_STOP_EXIT error={error}", pos.id);
+                                        }
+                                    }
+                                    _ => {
+                                        if let Err(error) = evm_exec_pos
+                                            .execute_shadow_sell(
+                                                &pos.id,
+                                                "TRAILING_STOP_EXIT",
+                                                live_price,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=TRAILING_STOP_EXIT error={error}", pos.id);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+
+                        // 6. Fixed hard SL hanya berlaku untuk Fast-Lane.
                         let hard_sl_trigger = track_policy
                             .fixed_stop_loss_pct
                             .map(|stop_loss_pct| pos.unrealized_pnl_pct <= -stop_loss_pct)

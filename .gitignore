@@ -3,6 +3,9 @@
 Cargo.lock
 data/
 .env
+.env.*
+!.env.example
+*.swp
 *.log
 __pycache__/
 *.pyc

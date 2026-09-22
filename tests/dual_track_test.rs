@@ -72,6 +72,7 @@ async fn test_dual_track_db_roundtrip_and_routing() {
     let config = Config {
         solana_rpc_url: "http://127.0.0.1:8899".to_string(),
         solana_ws_url: "ws://127.0.0.1:8900".to_string(),
+        solana_execution_rpc_url: None,
         solana_private_key: None,
         robinhood_rpc_url: "http://127.0.0.1:8545".to_string(),
         robinhood_ws_url: "ws://127.0.0.1:8546".to_string(),
@@ -86,6 +87,7 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         min_market_cap_usd: 50000.0,
         max_market_cap_usd: 20000000.0,
         trailing_stop_pct: 10.0,
+        trailing_stop_trigger_pct: 35.0,
         stop_loss_pct: 15.0,
         take_profit_pct: 100.0,
         take_profit_2_pct: 300.0,

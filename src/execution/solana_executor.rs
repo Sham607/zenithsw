@@ -238,6 +238,26 @@ impl SolanaExecutor {
             return Err(anyhow!("No Solana RPC endpoints configured"));
         }
         let is_broadcast = payload.get("method").and_then(Value::as_str) == Some("sendTransaction");
+        let is_blockhash =
+            payload.get("method").and_then(Value::as_str) == Some("getLatestBlockhash");
+
+        // Prioritas kanal presisi (Helius) untuk broadcast transaksi riil dan fetch blockhash kritis
+        if is_broadcast || is_blockhash {
+            if let Some(ref exec_rpc) = self.config.solana_execution_rpc_url {
+                self.rpc_requests.fetch_add(1, Ordering::Relaxed);
+                if let Ok(res) = self.client.post(exec_rpc).json(payload).send().await {
+                    if res.status().is_success() {
+                        if let Ok(json) = res.json::<Value>().await {
+                            if json.get("error").is_none() && json.get("result").is_some() {
+                                self.rpc_successes.fetch_add(1, Ordering::Relaxed);
+                                return Ok(json);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let start = self.rpc_index.fetch_add(1, Ordering::Relaxed) % count;
         let max_attempts = if is_broadcast { 1 } else { count };
         let mut last_err = anyhow!("All Solana RPC endpoints failed");
@@ -456,7 +476,10 @@ impl SolanaExecutor {
             }
         };
 
-        println!("[STARTUP RECONCILIATION 🔍] Scanning physical on-chain SPL holdings for {}...", wallet_pubkey);
+        println!(
+            "[STARTUP RECONCILIATION 🔍] Scanning physical on-chain SPL holdings for {}...",
+            wallet_pubkey
+        );
         let onchain_tokens = self.get_all_wallet_token_balances(&wallet_pubkey).await;
         let mut onchain_map: HashMap<String, f64> = HashMap::new();
         for (mint, amt) in onchain_tokens {
@@ -491,8 +514,14 @@ impl SolanaExecutor {
                 onchain_map.remove(&pos.token_mint);
             } else {
                 // Ghost position: DB says active, but physical on-chain balance is zero
-                if let Err(e) = self.db.close_position(&pos.id, "ORPHAN_AUDIT_ONCHAIN_ZERO", 0.0) {
-                    eprintln!("[STARTUP RECONCILIATION ERROR] Failed closing ghost position {}: {e}", pos.id);
+                if let Err(e) = self
+                    .db
+                    .close_position(&pos.id, "ORPHAN_AUDIT_ONCHAIN_ZERO", 0.0)
+                {
+                    eprintln!(
+                        "[STARTUP RECONCILIATION ERROR] Failed closing ghost position {}: {e}",
+                        pos.id
+                    );
                 } else {
                     ghost_closed += 1;
                     println!(
@@ -506,16 +535,21 @@ impl SolanaExecutor {
         // 2. Any remaining items in onchain_map are orphan holdings (on-chain balance > 0, but no active DB position)
         for (orphan_mint, orphan_amt) in onchain_map {
             // Attempt to resolve symbol & current price via Solana resolver
-            let (symbol, price, _, _) = match SolanaStreamListener::fetch_token_price(&orphan_mint).await {
-                Ok(res) => res,
-                Err(_) => ("UNKNOWN".to_string(), 0.0, 0.0, 0.0),
-            };
+            let (symbol, price, _, _) =
+                match SolanaStreamListener::fetch_token_price(&orphan_mint).await {
+                    Ok(res) => res,
+                    Err(_) => ("UNKNOWN".to_string(), 0.0, 0.0, 0.0),
+                };
 
             let approx_usd = if price > 0.0 { orphan_amt * price } else { 0.0 };
             let orphan_pos = ShadowPosition {
                 id: format!("orphan_{}", &orphan_mint[..orphan_mint.len().min(12)]),
                 chain: Chain::Solana,
-                token_symbol: if symbol.is_empty() { "ORPHAN".to_string() } else { symbol },
+                token_symbol: if symbol.is_empty() {
+                    "ORPHAN".to_string()
+                } else {
+                    symbol
+                },
                 token_mint: orphan_mint.clone(),
                 target_whale_handle: "ORPHAN_ADOPTED".to_string(),
                 target_whale_address: wallet_pubkey.clone(),
@@ -535,7 +569,10 @@ impl SolanaExecutor {
             };
 
             if let Err(e) = self.db.upsert_position(&orphan_pos) {
-                eprintln!("[STARTUP RECONCILIATION ERROR] Failed adopting orphan token {}: {e}", orphan_mint);
+                eprintln!(
+                    "[STARTUP RECONCILIATION ERROR] Failed adopting orphan token {}: {e}",
+                    orphan_mint
+                );
             } else {
                 orphans_adopted += 1;
                 println!(
@@ -1146,8 +1183,12 @@ impl SolanaExecutor {
                 if sol_price > 0.0 {
                     let sim_sol = amount_usd / sol_price;
                     let sim_lamports = (sim_sol * 1_000_000_000.0) as u64;
-                    if let Ok(quote) = self.fetch_jupiter_quote(wsol_mint, &signal.token_mint, sim_lamports, 150).await {
-                        let impact_pct = quote.get("priceImpactPct")
+                    if let Ok(quote) = self
+                        .fetch_jupiter_quote(wsol_mint, &signal.token_mint, sim_lamports, 150)
+                        .await
+                    {
+                        let impact_pct = quote
+                            .get("priceImpactPct")
                             .and_then(|v| v.as_str())
                             .and_then(|s| s.parse::<f64>().ok())
                             .unwrap_or(0.0);
@@ -1530,14 +1571,26 @@ mod transaction_tests {
     fn startup_reconciliation_logic_filters_blacklisted_and_zero_balances() {
         use crate::models::is_blacklisted_asset;
         let mut onchain_tokens = vec![
-            ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(), 100.0), // USDC -> Blacklisted
-            ("So11111111111111111111111111111111111111112".to_string(), 2.5),  // WSOL -> Blacklisted
-            ("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".to_string(), 1500.0), // BONK -> Valid
+            (
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+                100.0,
+            ), // USDC -> Blacklisted
+            (
+                "So11111111111111111111111111111111111111112".to_string(),
+                2.5,
+            ), // WSOL -> Blacklisted
+            (
+                "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".to_string(),
+                1500.0,
+            ), // BONK -> Valid
         ];
 
         onchain_tokens.retain(|(mint, _)| !is_blacklisted_asset(mint, ""));
         assert_eq!(onchain_tokens.len(), 1);
-        assert_eq!(onchain_tokens[0].0, "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263");
+        assert_eq!(
+            onchain_tokens[0].0,
+            "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+        );
         assert_eq!(onchain_tokens[0].1, 1500.0);
     }
 }

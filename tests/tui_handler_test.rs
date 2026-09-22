@@ -13,6 +13,7 @@ fn test_config() -> Config {
     Config {
         solana_rpc_url: "https://127.0.0.1:1".to_string(),
         solana_ws_url: "ws://127.0.0.1:1".to_string(),
+        solana_execution_rpc_url: None,
         solana_private_key: None,
         robinhood_api_key: None,
         evm_private_key: None,
@@ -27,6 +28,7 @@ fn test_config() -> Config {
         min_market_cap_usd: 50000.0,
         max_market_cap_usd: 20000000.0,
         trailing_stop_pct: 10.0,
+        trailing_stop_trigger_pct: 35.0,
         stop_loss_pct: 15.0,
         take_profit_pct: 50.0,
         take_profit_2_pct: 300.0,

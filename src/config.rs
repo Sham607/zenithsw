@@ -9,6 +9,7 @@ pub struct Config {
     // Solana settings
     pub solana_rpc_url: String,
     pub solana_ws_url: String,
+    pub solana_execution_rpc_url: Option<String>,
     pub solana_private_key: Option<String>,
 
     // Robinhood Chain settings
@@ -29,6 +30,7 @@ pub struct Config {
     pub min_market_cap_usd: f64,  // Min $50k market cap
     pub max_market_cap_usd: f64,  // Max $20M market cap
     pub trailing_stop_pct: f64,   // 10% trailing stop
+    pub trailing_stop_trigger_pct: f64, // Activation threshold for trailing stop (e.g. 35%)
     pub stop_loss_pct: f64,       // 15% stop loss
     pub take_profit_pct: f64,     // 100% take profit trigger (50% partial exit)
     pub take_profit_2_pct: f64,   // Tier 2 take profit (e.g. 300% / 4x)
@@ -37,7 +39,7 @@ pub struct Config {
     pub profit_lock_floor_pct: f64, // Minimum positive profit floor on moonbag (e.g. 20%)
     pub whale_full_dump_pct: f64, // Whale sell % triggering 100% mirror dump (e.g. 95%)
     pub quarantine_base_minutes: u64, // Base cooldown duration for failed tokens
-    pub quarantine_max_minutes: u64,  // Maximum cooldown cap for failed tokens
+    pub quarantine_max_minutes: u64, // Maximum cooldown cap for failed tokens
     pub demote_consecutive_losses: u32, // Number of consecutive losses to demote whale
     pub demote_catastrophic_loss_pct: f64, // Single-trade loss % to trigger demotion
     pub shadow_exit_enabled: bool, // Mirror sell when whale dumps
@@ -235,6 +237,13 @@ impl Config {
         }
         let solana_ws_url = required("SOLANA_WS_URL")?;
         validate_url("SOLANA_WS_URL", &solana_ws_url, &["ws://", "wss://"])?;
+        let solana_execution_rpc_url = env::var("SOLANA_EXECUTION_RPC_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(ref url) = solana_execution_rpc_url {
+            validate_url("SOLANA_EXECUTION_RPC_URL", url, &["http://", "https://"])?;
+        }
         let robinhood_rpc_url = required("ROBINHOOD_RPC_URL")?;
         validate_url(
             "ROBINHOOD_RPC_URL",
@@ -256,6 +265,7 @@ impl Config {
         let min_market_cap_usd = parse_value("MIN_MARKET_CAP_USD", 50000.0f64)?;
         let max_market_cap_usd = parse_value("MAX_MARKET_CAP_USD", 20000000.0f64)?;
         let trailing_stop_pct = parse_value("TRAILING_STOP_PCT", 10.0f64)?;
+        let trailing_stop_trigger_pct = parse_value("TRAILING_STOP_TRIGGER_PCT", 35.0f64)?;
         let stop_loss_pct = parse_value("STOP_LOSS_PCT", 15.0f64)?;
         let take_profit_pct = parse_value("TAKE_PROFIT_PCT", 100.0f64)?;
         let take_profit_2_pct = parse_value("TAKE_PROFIT_2_PCT", 300.0f64)?;
@@ -277,6 +287,7 @@ impl Config {
             ("MIN_MARKET_CAP_USD", min_market_cap_usd),
             ("MAX_MARKET_CAP_USD", max_market_cap_usd),
             ("TRAILING_STOP_PCT", trailing_stop_pct),
+            ("TRAILING_STOP_TRIGGER_PCT", trailing_stop_trigger_pct),
             ("STOP_LOSS_PCT", stop_loss_pct),
             ("TAKE_PROFIT_PCT", take_profit_pct),
             ("TAKE_PROFIT_2_PCT", take_profit_2_pct),
@@ -304,6 +315,9 @@ impl Config {
         }
         if peak_drawdown_pct > 100.0 {
             anyhow::bail!("PEAK_DRAWDOWN_PCT tidak boleh melebihi 100.0");
+        }
+        if trailing_stop_pct > 100.0 {
+            anyhow::bail!("TRAILING_STOP_PCT tidak boleh melebihi 100.0");
         }
         if whale_full_dump_pct > 100.0 {
             anyhow::bail!("WHALE_FULL_DUMP_PCT tidak boleh melebihi 100.0");
@@ -349,6 +363,7 @@ impl Config {
         let config = Self {
             solana_rpc_url,
             solana_ws_url,
+            solana_execution_rpc_url,
             solana_private_key: env::var("SOLANA_PRIVATE_KEY").ok(),
             robinhood_rpc_url,
             robinhood_ws_url,
@@ -367,6 +382,7 @@ impl Config {
             min_market_cap_usd,
             max_market_cap_usd,
             trailing_stop_pct,
+            trailing_stop_trigger_pct,
             stop_loss_pct,
             take_profit_pct,
             take_profit_2_pct,

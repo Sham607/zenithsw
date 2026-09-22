@@ -317,8 +317,14 @@ impl ConfluenceEngine {
             .count_recent_buyers_for_mint(&activity.token_mint, 300)
             .unwrap_or(1);
 
-        let allow_solo = self.config.confluence_mode.eq_ignore_ascii_case("ALL_TIERS_SOLO")
-            || self.config.confluence_mode.eq_ignore_ascii_case("ALLOW_ALL");
+        let allow_solo = self
+            .config
+            .confluence_mode
+            .eq_ignore_ascii_case("ALL_TIERS_SOLO")
+            || self
+                .config
+                .confluence_mode
+                .eq_ignore_ascii_case("ALLOW_ALL");
 
         if !allow_solo && wallet.tier == WalletTier::TierB && confluence_count < 2 {
             is_passed = false;

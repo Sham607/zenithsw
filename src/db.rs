@@ -472,12 +472,9 @@ impl SmartWalletDb {
              CREATE INDEX IF NOT EXISTS idx_activity_ipc_outbox_status
                  ON activity_ipc_outbox(status, created_at);",
         )?;
-        for (column, definition) in [
-            ("is_dry_run", "INTEGER NOT NULL DEFAULT 1"),
-        ] {
-            add_column_if_missing(&conn, "shadow_positions", column, definition)?;
-            add_column_if_missing(&conn, "trade_history", column, definition)?;
-        }
+        let (column, definition) = ("is_dry_run", "INTEGER NOT NULL DEFAULT 1");
+        add_column_if_missing(&conn, "shadow_positions", column, definition)?;
+        add_column_if_missing(&conn, "trade_history", column, definition)?;
         for (column, definition) in [
             ("source_reference", "TEXT"),
             ("parser_version", "TEXT"),

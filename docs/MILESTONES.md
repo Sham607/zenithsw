@@ -467,3 +467,22 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
 - [x] Wipe total trading_state.db: 2.707 aktivitas, 48 posisi, 177 sinyal, 83 trade history -> 0; snapshot aman: trading_state_snapshot_20260920_134516.db
 - [x] Engine restart 20:48 WIB: "Tracing on-chain funding clusters for 8 Tier-S wallets"; aktivitas pertama dari sniper cluster (handle resmi terverifikasi); 0 sinyal/posisi sampai verifikasi
 - Catatan: eksperimen bersih dimulai; motor: main, backbone, 4 sniper Bruce, 2 heavy feeder
+
+## [2026-09-21] Implementasi Conditional Pre-TP Trailing Stop Guard (Capital Preservation)
+- [x] Diagnosis dead config: parameter `TRAILING_STOP_PCT` di `.env` sebelumnya tidak tersambung ke loop evaluasi posisi di `src/bin/engine.rs`.
+- [x] Implementasi Pre-TP Trailing Stop: `TRAILING_STOP_TRIGGER_PCT` (default 35.0%) dan `TRAILING_STOP_PCT` (15.0%) disambungkan ke `engine.rs` untuk posisi `OPEN` sebelum Tier 1 TP.
+- [x] Sinkronisasi `Config`: struct, loader `parse_value`, validasi fail-closed, `.env.example`, dan mock constructor test (`simulation_test.rs`, `dual_track_test.rs`, `tui_handler_test.rs`).
+- [x] Integration test deterministik: `test_pre_tp_conditional_trailing_stop_logic` lulus (17/17 tests passing di `simulation_test`).
+- [x] Full regression suite: 220 tests PASS (180 unit + 40 integration across 8 test shards).
+- [x] Deploy release binary & restart daemon: service PID 41557 aktif.
+- [x] Eksekusi live: EMBER terkunci profit +31.37% (+$1.57 USD) via `TRAILING_STOP_EXIT`; TRENDS diputus di -17.03% (-$0.85 USD) sebelum terseret Hard SL -45%. Total realized PnL naik ke +$14.12 USD.
+
+## [2026-09-21] Implementasi Dual-Channel RPC Architecture (Helius Quota Preserver)
+- [x] Diagnosis pemborosan kuota: round-robin polling wallet membakar ~432.000 RPC request/hari, mengancam kuota 1.000.000 credits Helius habis dalam 2,5 hari.
+- [x] Arsitektur Dual-Channel diimplementasikan:
+  - Kanal Publik Nol-Biaya (`SOLANA_RPC_URLS` & `SOLANA_WS_URL`): `https://solana-rpc.publicnode.com`, `https://api.mainnet-beta.solana.com`, `wss://solana-rpc.publicnode.com` menangani polling rutin `getSignaturesForAddress`, radar token scan, dan WebSocket logsSubscribe.
+  - Kanal Presisi Helius (`SOLANA_EXECUTION_RPC_URL`): Didedikasikan eksklusif untuk parsing terurai `getTransaction` (saat ada event transaksi whale), `getLatestBlockhash`, dan `sendTransaction` broadcast.
+- [x] Fallback fail-closed: Jika kanal eksekusi Helius offline/habis kuota, engine otomatis failover ke pool RPC publik tanpa crash.
+- [x] Full test suite: 220/220 unit & integration tests PASS.
+- [x] Binary release dikompilasi (`zenithsw-engine` & `zenithsw`); engine dimatikan sementara sesuai arahan user.
+- [x] Integrasi 2 mode `SHADOW_EXIT_ENABLED`: Sambungkan `config_stream.shadow_exit_enabled` di `src/bin/engine.rs:595` agar switch `true` (mirror dump whale) / `false` (independent bot exit) di `.env` berfungsi fisik. Test 220/220 PASS.
