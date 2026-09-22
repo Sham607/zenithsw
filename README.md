@@ -31,7 +31,9 @@ TUI juga melakukan refresh database berkala. Status IPC harus dibedakan dari sna
 
 ### Solana
 
-- RPC/WebSocket dikonfigurasi melalui environment.
+- **Arsitektur Dual-Channel RPC**:
+  - *Kanal Publik & WebSocket* (`SOLANA_RPC_URL`, `SOLANA_WS_URL`): Menangani beban polling rutin tanda tangan wallet (`getSignaturesForAddress`) dan langganan event tanpa biaya (0 credit Helius).
+  - *Kanal Presisi Eksekusi* (`SOLANA_EXECUTION_RPC_URL`, misal Helius): Diprioritaskan khusus untuk bedah mendalam transaksi whale (`getTransaction` jsonParsed), fetch blockhash kritis (`getLatestBlockhash`), dan broadcast transaksi langsung (`sendTransaction`).
 - Jupiter/PumpPortal digunakan oleh jalur executor yang tersedia.
 - Konfirmasi transaksi dipolling sebelum posisi dibuka atau ditutup.
 - Balance token direkonsiliasi dari RPC.
@@ -148,7 +150,7 @@ chain validation
 
 ## Sinkronisasi Engine–TUI
 
-TUI hanya menampilkan engine online setelah menerima heartbeat aktual yang masih fresh. Heartbeat membawa sequence monoton, timestamp, mode, equity engine, parameter runtime, wallet scope, dan RPC health counters.
+TUI hanya menampilkan engine online setelah menerima heartbeat aktual yang masih fresh. Heartbeat membawa sequence monoton, timestamp, mode live/dry-run, status mode exit (`shadow_exit_enabled`), equity engine, parameter runtime, wallet scope, dan RPC health counters.
 
 Snapshot periodik berikut mengganti state lama TUI setelah chain filtering:
 
@@ -160,6 +162,11 @@ Snapshot periodik berikut mengganti state lama TUI setelah chain filtering:
 - `SignalSync`
 
 `ActivityBroadcast` dan `SignalBroadcast` tetap digunakan untuk event latency rendah. Snapshot periodik mencegah state activity/signal tertinggal ketika event terlewat atau IPC reconnect. Runtime harness Engine → IPC → DB telah lulus pada DB/socket terisolasi dan `DRY_RUN=true`.
+
+### Optimasi Sinkronisasi & Polling Adaptif
+- **Adaptive Polling Cadence**: Saat koneksi IPC sehat dan streaming berjalan, TUI memperlambat polling SQLite lokal ke siklus rekonsiliasi ringan (10 detik) untuk mencegah lock contention dan I/O ganda. Jika IPC terputus atau stale, TUI secara otomatis beralih ke mode cepat (1500ms) sebagai mekanisme fail-safe.
+- **Harmonisasi Ring Buffer**: Query database untuk log aktivitas dan sinyal disinkronkan ke kapasitas 100 entri, selaras dengan batas tampungan ring buffer IPC real-time.
+- **Indikator Visual Dinamis Tab 5**: Dashboard menampilkan status mode keluar aktif (`WHALE MIRROR (Shadow Exit) 🐋` atau `BOT AUTONOMOUS (Clean Scalp) 🤖`) dengan parameter Stop Loss dan Take Profit yang tersinkronisasi live.
 
 ## Durable execution intent
 

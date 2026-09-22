@@ -24,8 +24,17 @@ async fn main() -> Result<()> {
         state.min_liquidity_usd = config.min_liquidity_usd;
         state.max_price_delta_pct = config.max_price_delta_pct;
         state.position_size_usd = config.position_size_usd;
-        state.stop_loss_pct = config.stop_loss_pct;
-        state.take_profit_pct = config.take_profit_pct;
+        state.shadow_exit_enabled = config.shadow_exit_enabled;
+        state.stop_loss_pct = if config.shadow_exit_enabled {
+            config.stop_loss_pct
+        } else {
+            config.bot_stop_loss_pct
+        };
+        state.take_profit_pct = if config.shadow_exit_enabled {
+            config.take_profit_pct
+        } else {
+            config.bot_take_profit_pct
+        };
         state.min_whale_buy_usd = config.min_whale_buy_usd;
         state.is_live_mode = !config.dry_run;
     }
@@ -99,6 +108,22 @@ async fn main() -> Result<()> {
             SmartWalletDb::new_with_wallet_path(&trading_db_path_sync, &wallet_db_path_sync)
         {
             loop {
+                let is_ipc_healthy = if let Ok(state) = app_db_sync.lock() {
+                    state.is_connected_ipc && state.heartbeat_is_fresh()
+                } else {
+                    false
+                };
+
+                // When IPC is healthy, daemon engine broadcasts all state push updates (positions,
+                // wallets, trades, activities, signals, tracked tokens). Polling SQLite every 1.5s
+                // causes redundant I/O and truncates real-time broadcast buffers.
+                // We use an adaptive 10s light reconciliation cadence when IPC is active,
+                // and fall back to 1.5s rapid polling whenever IPC is disconnected or stale.
+                if is_ipc_healthy {
+                    sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+
                 if let Ok(mut state) = app_db_sync.lock() {
                     if let Ok(mut wallets) = db.get_qualified_wallets() {
                         wallets.retain(|w| match w.chain {
@@ -147,7 +172,7 @@ async fn main() -> Result<()> {
                         }
                         Err(error) => state.add_log(format!("TUI DB trades stale: {error}")),
                     }
-                    match db.get_recent_activities(50) {
+                    match db.get_recent_activities(100) {
                         Ok(mut acts) => {
                             acts.retain(|a| match a.chain {
                                 Chain::Solana => enable_sol,
@@ -159,7 +184,7 @@ async fn main() -> Result<()> {
                         }
                         Err(error) => state.add_log(format!("TUI DB activities stale: {error}")),
                     }
-                    match db.get_recent_signals(50) {
+                    match db.get_recent_signals(100) {
                         Ok(mut sigs) => {
                             sigs.retain(|s| match s.chain {
                                 Chain::Solana => enable_sol,

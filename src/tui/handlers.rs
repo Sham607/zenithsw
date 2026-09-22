@@ -42,6 +42,7 @@ pub fn apply_ipc_message(app: &mut App, msg: IpcMessage, config: &Config) {
             position_size_usd,
             stop_loss_pct,
             take_profit_pct,
+            shadow_exit_enabled,
             min_whale_buy_usd,
             is_live_mode,
             wallet_pubkey,
@@ -78,6 +79,7 @@ pub fn apply_ipc_message(app: &mut App, msg: IpcMessage, config: &Config) {
             app.position_size_usd = position_size_usd;
             app.stop_loss_pct = stop_loss_pct;
             app.take_profit_pct = take_profit_pct;
+            app.shadow_exit_enabled = shadow_exit_enabled;
             app.min_whale_buy_usd = min_whale_buy_usd;
             app.is_live_mode = is_live_mode;
             app.wallet_pubkey = wallet_pubkey;

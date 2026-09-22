@@ -1137,21 +1137,44 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(format!(" | Solana RPC {}/{} fail={} 429={} | Robinhood RPC {}/{} fail={} 429={} | Scope qualified={} polled={} global={} candidates={}", app.solana_rpc_successes, app.solana_rpc_requests, app.solana_rpc_failures, app.solana_rpc_rate_limited, app.robinhood_rpc_successes, app.robinhood_rpc_requests, app.robinhood_rpc_failures, app.robinhood_rpc_rate_limited, app.qualified_wallets_count, app.polled_wallets_count, app.global_scanned_wallets_count, app.candidate_wallets_count))
         ]),
         Line::from(vec![
-            Span::raw(" • Execution Rules: Position Size = "),
+            Span::raw(" • Execution Rules: Mode = "),
             Span::styled(
-                format!("${:.2} USD", app.position_size_usd),
+                if app.shadow_exit_enabled {
+                    "WHALE MIRROR (Shadow Exit) 🐋"
+                } else {
+                    "BOT AUTONOMOUS (Clean Scalp) 🤖"
+                },
+                Style::default()
+                    .fg(if app.shadow_exit_enabled {
+                        Color::Cyan
+                    } else {
+                        Color::Magenta
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | Pos Size = "),
+            Span::styled(
+                format!("${:.2}", app.position_size_usd),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | Stop Loss = "),
             Span::styled(
-                format!("-{:.1}% (Whale Mirror Priority)", app.stop_loss_pct),
+                if app.shadow_exit_enabled {
+                    format!("-{:.1}% (Whale Mirror Priority)", app.stop_loss_pct)
+                } else {
+                    format!("-{:.1}% (Bot Full Exit)", app.stop_loss_pct)
+                },
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | Auto-TP = "),
             Span::styled(
-                format!("+{:.1}% (50% Partial Free-Roll)", app.take_profit_pct),
+                if app.shadow_exit_enabled {
+                    format!("+{:.1}% (50% Partial Free-Roll)", app.take_profit_pct)
+                } else {
+                    format!("+{:.1}% (100% Full Scalp)", app.take_profit_pct)
+                },
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),

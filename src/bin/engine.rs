@@ -1535,6 +1535,7 @@ async fn main() -> Result<()> {
                 } else {
                     config_hb.bot_take_profit_pct
                 },
+                shadow_exit_enabled: config_hb.shadow_exit_enabled,
                 min_whale_buy_usd: config_hb.min_whale_buy_usd,
                 is_live_mode: !config_hb.dry_run,
                 wallet_pubkey,

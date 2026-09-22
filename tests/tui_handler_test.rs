@@ -332,6 +332,7 @@ fn heartbeat_updates_connection_and_dry_run_mode() {
             position_size_usd: 15.0,
             stop_loss_pct: 15.0,
             take_profit_pct: 50.0,
+            shadow_exit_enabled: false,
             min_whale_buy_usd: 250.0,
             is_live_mode: false,
             wallet_pubkey: "pubkey".to_string(),
@@ -356,6 +357,7 @@ fn heartbeat_updates_connection_and_dry_run_mode() {
     assert_eq!(app.heartbeat_seq, 7);
     assert_eq!(app.uptime_secs, 120);
     assert!(!app.is_live_mode);
+    assert!(!app.shadow_exit_enabled);
     assert_eq!(app.qualified_wallets_count, 2);
     assert_eq!(app.candidate_wallets_count, 5);
 }

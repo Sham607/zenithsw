@@ -40,6 +40,8 @@ pub enum IpcMessage {
         #[serde(default)]
         take_profit_pct: f64,
         #[serde(default)]
+        shadow_exit_enabled: bool,
+        #[serde(default)]
         min_whale_buy_usd: f64,
         #[serde(default)]
         is_live_mode: bool,
