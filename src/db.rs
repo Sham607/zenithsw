@@ -69,6 +69,32 @@ pub fn deduplicate_scan_addresses(
         .collect()
 }
 
+pub fn extract_whale_alias(handle: &str, name: &str) -> String {
+    let h = handle.to_ascii_lowercase();
+    let n = name.to_ascii_lowercase();
+    if h.contains("solstice") || n.contains("solstice") {
+        "solstice".to_string()
+    } else if h.contains("veeman") || n.contains("veeman") {
+        "veeman".to_string()
+    } else if h.contains("detweiler") || n.contains("detweiler") {
+        "detweiler".to_string()
+    } else if h.contains("unipcs")
+        || n.contains("unipcs")
+        || h.contains("sniper")
+        || h.contains("feeder")
+    {
+        "unipcs".to_string()
+    } else {
+        let clean = h.replace("bunker_", "");
+        let first = clean.split('_').next().unwrap_or(&clean);
+        if first.is_empty() {
+            handle.to_string()
+        } else {
+            first.to_string()
+        }
+    }
+}
+
 impl CandidateWalletDb {
     pub fn open(path: &str) -> Result<Self> {
         if let Some(parent) = Path::new(path).parent() {
@@ -498,6 +524,7 @@ impl SmartWalletDb {
             add_column_if_missing(&conn, "radar_market_snapshots", column, definition)?;
             add_column_if_missing(&conn, "radar_projections", column, definition)?;
         }
+        add_column_if_missing(&conn, "radar_projections", "whales", "TEXT")?;
         for (column, definition) in [
             ("nonce", "INTEGER"),
             ("recent_blockhash", "TEXT"),
@@ -930,6 +957,26 @@ impl SmartWalletDb {
             .map_err(Into::into)
     }
 
+    /// Membaca pemetaan wallet address ke alias whale ringkas untuk tampilan radar.
+    pub fn get_wallet_alias_map(&self) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.wallet_db();
+        let mut stmt =
+            conn.prepare("SELECT address, handle, name FROM wallets WHERE is_active = 1")?;
+        let rows = stmt.query_map([], |row| {
+            let address: String = row.get(0)?;
+            let handle: String = row.get(1)?;
+            let name: String = row.get(2)?;
+            let alias = extract_whale_alias(&handle, &name);
+            Ok((address.trim().to_ascii_lowercase(), alias))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for r in rows {
+            let (addr, alias) = r?;
+            map.insert(addr, alias);
+        }
+        Ok(map)
+    }
+
     pub fn get_active_wallets(&self) -> Result<Vec<SmartWallet>> {
         let conn = self.wallet_db();
         let mut stmt = conn.prepare(
@@ -1189,24 +1236,44 @@ impl SmartWalletDb {
         }
     }
 
-    pub fn insert_radar_evidence(&self, evidence: &OnChainTokenEvidence) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO radar_evidence
-             (chain, token_address, wallet_address, evidence_kind, tx_id, observed_at, cluster_id, qualified_wallet)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                evidence.chain.to_string(),
-                evidence.token_address,
-                evidence.wallet_address,
-                format!("{:?}", evidence.kind),
-                evidence.tx_id,
-                evidence.observed_at.to_rfc3339(),
-                evidence.cluster_id,
-                evidence.qualified_wallet as i32,
-            ],
-        )?;
+    pub fn insert_radar_evidence_batch(
+        &self,
+        evidence_list: &[OnChainTokenEvidence],
+    ) -> Result<()> {
+        if evidence_list.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO radar_evidence
+                 (chain, token_address, wallet_address, evidence_kind, tx_id, observed_at, cluster_id, qualified_wallet)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for evidence in evidence_list {
+                stmt.execute(params![
+                    evidence.chain.to_string(),
+                    evidence.token_address,
+                    evidence.wallet_address,
+                    format!("{:?}", evidence.kind),
+                    evidence.tx_id,
+                    evidence.observed_at.to_rfc3339(),
+                    evidence.cluster_id,
+                    evidence.qualified_wallet as i32,
+                ])?;
+            }
+        }
+        let _ = tx.execute(
+            "DELETE FROM radar_evidence WHERE observed_at < datetime('now', '-24 hours')",
+            [],
+        );
+        tx.commit()?;
         Ok(())
+    }
+
+    pub fn insert_radar_evidence(&self, evidence: &OnChainTokenEvidence) -> Result<()> {
+        self.insert_radar_evidence_batch(std::slice::from_ref(evidence))
     }
 
     pub fn insert_radar_market_snapshot(
@@ -1252,8 +1319,8 @@ impl SmartWalletDb {
              (chain, token_address, symbol, pool_address, dex_id, market_cap_usd, liquidity_usd, price_usd,
               change_24h_pct, change_6h_pct, change_1h_pct, market_structure, price_action,
               qualified_holder_count, candidate_holder_count, independent_cluster_count,
-              direct_accumulator_count, status, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+              direct_accumulator_count, status, whales, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 projection.chain.to_string(),
                 projection.token_address,
@@ -1273,6 +1340,7 @@ impl SmartWalletDb {
                 projection.independent_cluster_count as i64,
                 projection.direct_accumulator_count as i64,
                 format!("{:?}", projection.status),
+                projection.whales,
                 observed_at.to_rfc3339(),
             ],
         )?;
@@ -2095,12 +2163,12 @@ impl SmartWalletDb {
 
     pub fn get_radar_projections(&self, limit: usize) -> Result<Vec<RadarProjection>> {
         let conn = self.conn.lock().unwrap();
-        let cutoff = (Utc::now() - chrono::Duration::minutes(15)).to_rfc3339();
+        let cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT chain, token_address, symbol, pool_address, dex_id, market_cap_usd, liquidity_usd, price_usd,
                     change_24h_pct, change_6h_pct, change_1h_pct, market_structure, price_action,
                     qualified_holder_count, candidate_holder_count, independent_cluster_count,
-                    direct_accumulator_count, status
+                    direct_accumulator_count, status, whales
              FROM radar_projections AS current
              WHERE current.observed_at >= ?1
                AND NOT EXISTS (
@@ -2123,6 +2191,7 @@ impl SmartWalletDb {
                 "HighPriorityRadar" => crate::radar::RadarStatus::HighPriorityRadar,
                 _ => return Err(rusqlite::Error::InvalidQuery),
             };
+            let whales: Option<String> = row.get(18).ok();
             Ok(RadarProjection {
                 chain,
                 token_address: row.get(1)?,
@@ -2141,6 +2210,7 @@ impl SmartWalletDb {
                 candidate_holder_count: row.get::<_, i64>(14)? as usize,
                 independent_cluster_count: row.get::<_, i64>(15)? as usize,
                 direct_accumulator_count: row.get::<_, i64>(16)? as usize,
+                whales,
                 status,
             })
         })?;
@@ -2507,5 +2577,31 @@ mod scan_address_tests {
         let result = deduplicate_scan_addresses(items);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].source_db, "wallet_registry.db");
+    }
+
+    #[test]
+    fn extracts_canonical_whale_alias() {
+        use super::extract_whale_alias;
+
+        assert_eq!(
+            extract_whale_alias("bunker_unipcs_main_01", "@unipcs"),
+            "unipcs"
+        );
+        assert_eq!(
+            extract_whale_alias("bunker_sniper_01", "Unipcs Sniper"),
+            "unipcs"
+        );
+        assert_eq!(
+            extract_whale_alias("bunker_solstice_feeder_01", "Solstice Feeder"),
+            "solstice"
+        );
+        assert_eq!(
+            extract_whale_alias("bunker_veeman_main_01", "@theveeman"),
+            "veeman"
+        );
+        assert_eq!(
+            extract_whale_alias("bunker_detweiler_sat_01", "@0xdetweiler"),
+            "detweiler"
+        );
     }
 }

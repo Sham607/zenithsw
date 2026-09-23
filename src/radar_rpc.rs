@@ -184,13 +184,28 @@ pub async fn collect_solana_holdings_read_only(
             build_solana_token_accounts_request(&address.address, request_id as u64 * 2 + 1)?,
             build_solana_token_2022_accounts_request(&address.address, request_id as u64 * 2 + 2)?,
         ] {
-            let response = client.call(&request).await?;
-            evidence.extend(parse_solana_token_accounts(
-                &response,
-                &address.address,
-                !address.is_candidate,
-            )?);
+            let response = match client.call(&request).await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    eprintln!(
+                        "[RADAR RPC SKIP] wallet={} query gagal: {err}",
+                        address.address
+                    );
+                    continue;
+                }
+            };
+            match parse_solana_token_accounts(&response, &address.address, !address.is_candidate) {
+                Ok(items) => evidence.extend(items),
+                Err(err) => {
+                    eprintln!(
+                        "[RADAR RPC SKIP] wallet={} parse gagal: {err}",
+                        address.address
+                    );
+                }
+            }
         }
+        // Jeda 2000ms antar wallet agar RPC publik resmi Solana tetap lancar tanpa rate-limit
+        tokio::time::sleep(Duration::from_millis(2000)).await;
     }
     Ok(evidence)
 }

@@ -1,6 +1,6 @@
 CARGO ?= cargo
 
-.PHONY: all build release test start engine stop restart reset clean help
+.PHONY: all build release test start start-live tui engine stop restart logs reset clean help
 
 all: release
 
@@ -17,13 +17,20 @@ engine:
 	$(CARGO) run --release --bin zenithsw-engine
 
 start: release
-	@if systemctl --user is-active --quiet zenithsw-engine.service; then \
-		echo "🟢 ZenithSW Engine Daemon is active (systemd)."; \
-	elif ! pgrep -f "target/release/zenithsw-engine" > /dev/null; then \
-		echo "🚀 Auto-launching ZenithSW Engine Daemon via systemd..."; \
-		systemctl --user start zenithsw-engine.service || (nohup ./target/release/zenithsw-engine > data/engine.log 2>&1 &); \
-		sleep 1; \
-	fi
+	@sed -i 's/^DRY_RUN=.*/DRY_RUN=true/' .env
+	@echo "🟢 Menjalankan ZenithSW Engine Daemon (DRY-RUN)..."
+	@systemctl --user restart zenithsw-engine.service
+	@sleep 1
+	@systemctl --user is-active --quiet zenithsw-engine.service && echo "[OK] Engine aktif DRY-RUN (PID: $$(systemctl --user show --property MainPID --value zenithsw-engine.service))." || (echo "[ERROR] Engine gagal start." && exit 1)
+
+start-live: release
+	@sed -i 's/^DRY_RUN=.*/DRY_RUN=false/' .env
+	@echo "🔴 Menjalankan ZenithSW Engine Daemon (LIVE MODE)..."
+	@systemctl --user restart zenithsw-engine.service
+	@sleep 1
+	@systemctl --user is-active --quiet zenithsw-engine.service && echo "[OK] Engine aktif LIVE (PID: $$(systemctl --user show --property MainPID --value zenithsw-engine.service))." || (echo "[ERROR] Engine gagal start." && exit 1)
+
+tui: release
 	@$(CARGO) run --release --bin zenithsw
 
 stop:
@@ -34,9 +41,9 @@ stop:
 
 restart:
 	@echo "Restarting ZenithSW Engine Daemon..."
-	@systemctl --user restart zenithsw-engine.service 2>/dev/null || ./target/release/zenithsw-engine &
+	@systemctl --user restart zenithsw-engine.service
 	@sleep 1
-	@echo "[OK] Engine restarted."
+	@systemctl --user is-active --quiet zenithsw-engine.service && echo "[OK] Engine restarted (PID: $$(systemctl --user show --property MainPID --value zenithsw-engine.service))." || (echo "[ERROR] Engine gagal start." && exit 1)
 
 logs:
 	@journalctl --user -u zenithsw-engine.service -f
@@ -54,10 +61,12 @@ clean:
 
 help:
 	@echo "ZenithSW Commands:"
-	@echo "  make start   - Auto-launches Engine + TUI Dashboard client (zenithsw)"
-	@echo "  make engine  - Run the background shadow daemon directly (zenithsw-engine)"
-	@echo "  make stop    - Stop the background engine daemon"
-	@echo "  make restart - Restart the background engine daemon"
-	@echo "  make test    - Run the entire test suite"
-	@echo "  make reset   - Clean SQLite database and socket"
-	@echo "  make release - Compile optimized release binaries"
+	@echo "  make start      - Jalankan Engine Daemon (DRY-RUN)"
+	@echo "  make start-live - Jalankan Engine Daemon (LIVE MODE)"
+	@echo "  make tui        - Buka TUI Dashboard client (zenithsw)"
+	@echo "  make stop       - Hentikan Engine Daemon"
+	@echo "  make restart    - Restart Engine Daemon"
+	@echo "  make logs       - Stream systemd logs engine"
+	@echo "  make test       - Jalankan unit & integration test"
+	@echo "  make reset      - Bersihkan database SQLite dan socket"
+	@echo "  make release    - Kompilasi biner release"

@@ -655,17 +655,17 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(5),
-            Constraint::Percentage(18),
-            Constraint::Percentage(10),
-            Constraint::Percentage(12),
-            Constraint::Percentage(8),
-            Constraint::Percentage(9),
-            Constraint::Percentage(11),
-            Constraint::Percentage(7),
-            Constraint::Percentage(6),
-            Constraint::Percentage(14),
-            Constraint::Percentage(9),
+            Constraint::Length(5),  // #
+            Constraint::Length(26), // Cluster / Name
+            Constraint::Length(9),  // Source
+            Constraint::Length(25), // Handle
+            Constraint::Length(9),  // Chain
+            Constraint::Length(10), // Tier
+            Constraint::Length(11), // 24h PnL
+            Constraint::Length(9),  // WinRate
+            Constraint::Length(8),  // Trades
+            Constraint::Length(18), // Address
+            Constraint::Length(12), // Status
         ],
     )
     .header(header)
@@ -686,6 +686,11 @@ fn render_tab_wallets(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
+    let radar_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(6)])
+        .split(area);
+
     let header = Row::new(vec![
         "#",
         "Ticker",
@@ -711,6 +716,7 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, projection)| {
+            let is_selected = idx == app.radar_selected_index;
             let token = if projection.token_address.len() > 18 {
                 format!(
                     "{}...{}",
@@ -725,8 +731,33 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
                 crate::radar::RadarStatus::StructureConfirmed => Color::Yellow,
                 crate::radar::RadarStatus::PortfolioOnly => Color::White,
             };
+            let whales_display = match &projection.whales {
+                Some(names) if !names.trim().is_empty() => {
+                    format!("{} (Q:{})", names, projection.qualified_holder_count)
+                }
+                _ => format!(
+                    "Q:{} C:{}",
+                    projection.qualified_holder_count, projection.candidate_holder_count
+                ),
+            };
+            let index_str = if is_selected {
+                format!("▶#{}", idx + 1)
+            } else {
+                format!(" #{}", idx + 1)
+            };
+            let row_style = if is_selected {
+                Style::default().bg(Color::Rgb(25, 45, 65))
+            } else {
+                Style::default()
+            };
             Row::new(vec![
-                Cell::from(format!("#{}", idx + 1)),
+                Cell::from(index_str).style(if is_selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                }),
                 Cell::from(projection.symbol.as_deref().unwrap_or("UNKNOWN")),
                 Cell::from(projection.chain.to_string()),
                 Cell::from(token).style(Style::default().fg(Color::DarkGray)),
@@ -746,10 +777,7 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
                     projection.change_24h_pct,
                     projection.change_1h_pct,
                 )),
-                Cell::from(format!(
-                    "Q:{} C:{}",
-                    projection.qualified_holder_count, projection.candidate_holder_count
-                )),
+                Cell::from(whales_display),
                 Cell::from(projection.independent_cluster_count.to_string()),
                 Cell::from(format!(
                     "{} / {}",
@@ -757,24 +785,25 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
                 ))
                 .style(Style::default().fg(status_color)),
             ])
+            .style(row_style)
         })
         .collect();
 
     let table = Table::new(
         rows,
         [
-            Constraint::Length(4),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Percentage(18),
-            Constraint::Percentage(18),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(14),
-            Constraint::Length(17),
-            Constraint::Length(12),
-            Constraint::Length(9),
-            Constraint::Percentage(24),
+            Constraint::Length(4),  // #
+            Constraint::Length(9),  // Ticker
+            Constraint::Length(9),  // Chain
+            Constraint::Length(18), // Mint
+            Constraint::Length(20), // Pool / DEX
+            Constraint::Length(10), // MCap
+            Constraint::Length(11), // Liquidity
+            Constraint::Length(13), // Price
+            Constraint::Length(22), // 24H / 1H
+            Constraint::Length(28), // Whales
+            Constraint::Length(9),  // Clusters
+            Constraint::Length(28), // Structure / Price Action
         ],
     )
     .header(header)
@@ -790,7 +819,126 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
         )),
     );
 
-    frame.render_widget(table, area);
+    frame.render_widget(table, radar_chunks[0]);
+
+    // Inspector Panel for Selected Token
+    let selected_projection = app.selected_radar_projection();
+    let inspector_title = match selected_projection {
+        Some(p) => format!(
+            " SELECTED TOKEN INSPECTOR [ {} ] ",
+            p.symbol.as_deref().unwrap_or("UNKNOWN")
+        ),
+        None => " SELECTED TOKEN INSPECTOR ".to_string(),
+    };
+    let inspector_block = Block::default().borders(Borders::ALL).title(Span::styled(
+        inspector_title,
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    if let Some(p) = selected_projection {
+        let whales_info = match &p.whales {
+            Some(names) if !names.trim().is_empty() => {
+                format!("{} (Q:{})", names, p.qualified_holder_count)
+            }
+            _ => format!(
+                "Q:{} C:{}",
+                p.qualified_holder_count, p.candidate_holder_count
+            ),
+        };
+
+        let copy_badge = if let Some((msg, instant)) = &app.clipboard_notice {
+            if instant.elapsed().as_secs() < 3 {
+                Span::styled(
+                    format!("  ✨ {msg}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            }
+        } else {
+            Span::raw("")
+        };
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    " Mint Address : ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    &p.token_address,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                copy_badge,
+            ]),
+            Line::from(vec![
+                Span::styled(" Pool Address : ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    p.pool_address.as_deref().unwrap_or("n/a"),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("  |  DEX: ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    p.dex_id.as_deref().unwrap_or("n/a"),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled("  |  Chain: ", Style::default().fg(Color::Yellow)),
+                Span::styled(p.chain.to_string(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Whales       : ", Style::default().fg(Color::Yellow)),
+                Span::styled(whales_info, Style::default().fg(Color::White)),
+                Span::styled("  |  Clusters: ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    p.independent_cluster_count.to_string(),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("  |  Structure: ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{} / {}", p.market_structure, p.price_action),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(" Navigasi     : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "[↑/↓ or j/k]",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" Pilih Koin  |  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "[c]",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " Salin Mint Address ke Clipboard",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ];
+
+        let p_widget = Paragraph::new(lines).block(inspector_block);
+        frame.render_widget(p_widget, radar_chunks[1]);
+    } else {
+        let lines = vec![Line::from(Span::styled(
+            " Tidak ada data radar token yang terpilih.",
+            Style::default().fg(Color::DarkGray),
+        ))];
+        let p_widget = Paragraph::new(lines).block(inspector_block);
+        frame.render_widget(p_widget, radar_chunks[1]);
+    }
 }
 
 fn format_change(change_24h: Option<f64>, change_1h: Option<f64>) -> String {
@@ -814,7 +962,7 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
         "Track",
         "Symbol",
         "Chain",
-        "Contract / Mint Address",
+        "Mint / Contract",
         "Target Whale",
         "Entry Price",
         "Current Price",
@@ -934,17 +1082,17 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(8),
-            Constraint::Percentage(9),
-            Constraint::Percentage(7),
-            Constraint::Percentage(16),
-            Constraint::Percentage(13),
-            Constraint::Percentage(10),
-            Constraint::Percentage(10),
-            Constraint::Percentage(7),
-            Constraint::Percentage(10),
-            Constraint::Percentage(9),
-            Constraint::Percentage(8),
+            Constraint::Length(10), // Track
+            Constraint::Length(10), // Symbol
+            Constraint::Length(9),  // Chain
+            Constraint::Length(19), // Mint / Contract
+            Constraint::Length(26), // Target Whale
+            Constraint::Length(13), // Entry Price
+            Constraint::Length(14), // Current Price
+            Constraint::Length(7),  // Bag %
+            Constraint::Length(10), // PnL ($)
+            Constraint::Length(10), // PnL (%)
+            Constraint::Length(8),  // Status
         ],
     )
     .header(header)
@@ -1263,18 +1411,18 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(9),
-            Constraint::Percentage(7),
-            Constraint::Percentage(7),
-            Constraint::Percentage(8),
-            Constraint::Percentage(8),
-            Constraint::Percentage(15),
-            Constraint::Percentage(12),
-            Constraint::Percentage(9),
-            Constraint::Percentage(9),
-            Constraint::Percentage(8),
-            Constraint::Percentage(8),
-            Constraint::Percentage(13),
+            Constraint::Length(10), // Time
+            Constraint::Length(9),  // Track
+            Constraint::Length(9),  // Chain
+            Constraint::Length(8),  // Action
+            Constraint::Length(10), // Symbol
+            Constraint::Length(17), // Mint
+            Constraint::Length(25), // Whale
+            Constraint::Length(13), // Entry
+            Constraint::Length(13), // Exit
+            Constraint::Length(11), // PnL %
+            Constraint::Length(11), // PnL $
+            Constraint::Length(20), // Exit Reason
         ],
     )
     .header(header)

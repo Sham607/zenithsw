@@ -107,6 +107,11 @@ pub fn apply_ipc_message(app: &mut App, msg: IpcMessage, config: &Config) {
         IpcMessage::RadarSync { mut projections } => {
             projections.retain(|projection| chain_enabled(projection.chain, config));
             app.radar_projections = projections;
+            if app.radar_selected_index >= app.radar_projections.len()
+                && !app.radar_projections.is_empty()
+            {
+                app.radar_selected_index = app.radar_projections.len() - 1;
+            }
         }
         IpcMessage::ActivityBroadcast { activity } => {
             if chain_enabled(activity.chain, config) {

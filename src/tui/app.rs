@@ -51,6 +51,8 @@ pub struct App {
     pub polled_wallets_count: usize,
     pub global_scanned_wallets_count: usize,
     pub candidate_wallets_count: usize,
+    pub radar_selected_index: usize,
+    pub clipboard_notice: Option<(String, Instant)>,
 }
 
 impl Default for App {
@@ -64,7 +66,7 @@ impl App {
         self.is_connected_ipc
             && self
                 .heartbeat_received_at
-                .map(|received| received.elapsed().as_secs() <= 6)
+                .map(|received| received.elapsed().as_secs() <= 10)
                 .unwrap_or(false)
     }
 
@@ -113,6 +115,38 @@ impl App {
             polled_wallets_count: 0,
             global_scanned_wallets_count: 0,
             candidate_wallets_count: 0,
+            radar_selected_index: 0,
+            clipboard_notice: None,
+        }
+    }
+
+    pub fn radar_select_next(&mut self) {
+        if !self.radar_projections.is_empty() {
+            if self.radar_selected_index + 1 < self.radar_projections.len() {
+                self.radar_selected_index += 1;
+            } else {
+                self.radar_selected_index = 0;
+            }
+        }
+    }
+
+    pub fn radar_select_prev(&mut self) {
+        if !self.radar_projections.is_empty() {
+            if self.radar_selected_index == 0 {
+                self.radar_selected_index = self.radar_projections.len().saturating_sub(1);
+            } else {
+                self.radar_selected_index -= 1;
+            }
+        }
+    }
+
+    pub fn selected_radar_projection(&self) -> Option<&crate::radar::RadarProjection> {
+        if self.radar_projections.is_empty() {
+            None
+        } else {
+            self.radar_projections
+                .get(self.radar_selected_index)
+                .or_else(|| self.radar_projections.first())
         }
     }
 

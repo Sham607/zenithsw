@@ -77,11 +77,7 @@ impl SolanaStreamListener {
             .collect();
         // Public fallbacks remain read-capable options; live broadcast uses the same
         // pool only after signature reconciliation.
-        for fallback in [
-            "https://solana-rpc.publicnode.com",
-            "https://rpc.ankr.com/solana",
-            "https://api.mainnet-beta.solana.com",
-        ] {
+        for fallback in ["https://api.mainnet-beta.solana.com"] {
             if !rpc_urls.iter().any(|url| url == fallback) {
                 rpc_urls.push(fallback.to_string());
             }
@@ -597,34 +593,13 @@ impl SolanaStreamListener {
                                     .and_then(|v| v.as_f64())
                                     .unwrap_or(0.0);
 
-                                let quote_sym = pair
-                                    .get("quoteToken")
-                                    .and_then(|q| q.get("symbol"))
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or("")
-                                    .to_uppercase();
-                                let quote_amt = pair
-                                    .get("liquidity")
-                                    .and_then(|l| l.get("quote"))
-                                    .and_then(|v| v.as_f64())
-                                    .unwrap_or(0.0);
+                                // Anti-CLMM Spoof: use DexScreener's liquidity.usd directly as real_quote_usd (half of reported USD liquidity).
+                                // DexScreener already converts quote reserves to USD at live prices, so no static price mapping needed.
+                                let real_quote_usd = liq * 0.5;
 
-                                let real_quote_usd = match quote_sym.as_str() {
-                                    "USDC" | "USDT" | "USD" | "USDG" | "DAI" | "USDS" | "PYUSD" => {
-                                        quote_amt
-                                    }
-                                    "SOL" | "WSOL" => quote_amt * 102.0,
-                                    "ETH" | "WETH" => quote_amt * 2500.0,
-                                    _ => quote_amt.min(liq * 0.5),
-                                };
-
-                                // Anti-CLMM Spoof: If single-sided fake liquidity has < $10k real quote collateral, clamp liquidity to real quote
-                                if dex_id != "pumpfun" {
-                                    if liq > 100_000.0 && (real_quote_usd / liq) < 0.10 {
-                                        liq = real_quote_usd * 2.0;
-                                    } else if real_quote_usd < 10_000.0 {
-                                        liq = real_quote_usd;
-                                    }
+                                // Clamp thin pools: if quote-side USD < $10k, treat that as effective liquidity
+                                if dex_id != "pumpfun" && real_quote_usd < 10_000.0 {
+                                    liq = real_quote_usd;
                                 }
 
                                 // For Pump.fun bonding curves where liquidity object is null/0, derive virtual liquidity from marketCap / fdv

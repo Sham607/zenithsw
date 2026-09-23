@@ -148,28 +148,36 @@ impl IpcServer {
                 tokio::spawn(async move {
                     let (_, mut write_half) = stream.into_split();
 
-                    // Jangan mengirim heartbeat sintetis. TUI harus menunggu
-                    // heartbeat engine aktual agar tidak menampilkan data palsu.
+                    // Kirim heartbeat terbaru jika sudah ada. Jangan drop client bila belum ada
+                    // heartbeat pertama, melainkan teruskan streaming broadcast.
                     let initial_hb = latest_hb_inner.lock().ok().and_then(|guard| guard.clone());
-
-                    let Some(initial_hb) = initial_hb else {
-                        return;
-                    };
-
-                    if let Ok(json) = serde_json::to_string(&initial_hb) {
-                        let _ = write_half.write_all(json.as_bytes()).await;
-                        let _ = write_half.write_all(b"\n").await;
-                        let _ = write_half.flush().await;
+                    if let Some(initial_hb) = initial_hb {
+                        if let Ok(json) = serde_json::to_string(&initial_hb) {
+                            let _ = write_half.write_all(json.as_bytes()).await;
+                            let _ = write_half.write_all(b"\n").await;
+                            let _ = write_half.flush().await;
+                        }
                     }
 
-                    while let Ok(msg_str) = rx.recv().await {
-                        if write_half.write_all(msg_str.as_bytes()).await.is_err() {
-                            break;
+                    loop {
+                        match rx.recv().await {
+                            Ok(msg_str) => {
+                                if write_half.write_all(msg_str.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if write_half.write_all(b"\n").await.is_err() {
+                                    break;
+                                }
+                                let _ = write_half.flush().await;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                eprintln!("[IPC LAG] Client lagged by {n} messages; catching up to latest broadcast stream");
+                                continue;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                break;
+                            }
                         }
-                        if write_half.write_all(b"\n").await.is_err() {
-                            break;
-                        }
-                        let _ = write_half.flush().await;
                     }
                 });
             }

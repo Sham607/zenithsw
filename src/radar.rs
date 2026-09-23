@@ -40,6 +40,16 @@ pub struct RadarMarketSnapshot {
     pub observed_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OhlcvBar {
+    pub timestamp: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RadarStatus {
     PortfolioOnly,
@@ -66,6 +76,7 @@ pub struct RadarProjection {
     pub candidate_holder_count: usize,
     pub independent_cluster_count: usize,
     pub direct_accumulator_count: usize,
+    pub whales: Option<String>,
     pub status: RadarStatus,
 }
 
@@ -208,6 +219,145 @@ pub fn parse_market_snapshot(
     Ok(best)
 }
 
+/// Parse data OHLCV dari response GeckoTerminal API
+pub fn parse_gecko_ohlcv(response: &Value) -> Result<Vec<OhlcvBar>> {
+    let list = response
+        .get("data")
+        .and_then(|d| d.get("attributes"))
+        .and_then(|a| a.get("ohlcv_list"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("gecko response missing ohlcv_list"))?;
+
+    let mut bars = Vec::with_capacity(list.len());
+    for item in list {
+        let arr = item
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("ohlcv item is not an array"))?;
+        if arr.len() < 6 {
+            continue;
+        }
+        let timestamp = arr[0]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("invalid timestamp"))?;
+        let open = arr[1]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("invalid open"))?;
+        let high = arr[2]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("invalid high"))?;
+        let low = arr[3]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("invalid low"))?;
+        let close = arr[4]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("invalid close"))?;
+        let volume = arr[5]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("invalid volume"))?;
+
+        if !open.is_finite()
+            || !high.is_finite()
+            || !low.is_finite()
+            || !close.is_finite()
+            || !volume.is_finite()
+        {
+            continue;
+        }
+        bars.push(OhlcvBar {
+            timestamp,
+            open,
+            high,
+            low,
+            close,
+            volume,
+        });
+    }
+
+    if bars.is_empty() {
+        bail!("no valid ohlcv bars in response");
+    }
+
+    // Urutkan kronologis dari yang terlama ke terbaru
+    bars.sort_by_key(|b| b.timestamp);
+    Ok(bars)
+}
+
+/// Menghitung Market Structure & Price Action dari deret bar lilin secara deterministik
+pub fn compute_market_structure_and_action(bars: &[OhlcvBar]) -> (String, String) {
+    if bars.len() < 5 {
+        return (
+            "UNAVAILABLE_OHLCV".to_string(),
+            "UNAVAILABLE_OHLCV".to_string(),
+        );
+    }
+
+    // 1. Market Structure analysis over available bars
+    let half = bars.len() / 2;
+    let first_half = &bars[..half];
+    let second_half = &bars[half..];
+
+    let early_high = first_half.iter().map(|b| b.high).fold(f64::MIN, f64::max);
+    let early_low = first_half.iter().map(|b| b.low).fold(f64::MAX, f64::min);
+    let late_high = second_half.iter().map(|b| b.high).fold(f64::MIN, f64::max);
+    let late_low = second_half.iter().map(|b| b.low).fold(f64::MAX, f64::min);
+
+    let structure = if early_low > 0.0
+        && ((early_high - early_low) / early_low) < 0.03
+        && late_low > 0.0
+        && ((late_high - late_low) / late_low) < 0.03
+    {
+        "RANGING".to_string()
+    } else if late_high > early_high && late_low > early_low {
+        "BULLISH_HH_HL".to_string()
+    } else if late_high < early_high && late_low < early_low {
+        "BEARISH_LH_LL".to_string()
+    } else if late_high > early_high && late_low < early_low {
+        "EXPANSION_RANGE".to_string()
+    } else {
+        "RANGING".to_string()
+    };
+
+    // 2. Price Action analysis on the latest bar
+    let latest = &bars[bars.len() - 1];
+    let range = latest.high - latest.low;
+    let avg_prior_vol = if bars.len() > 1 {
+        bars[..bars.len() - 1].iter().map(|b| b.volume).sum::<f64>() / (bars.len() - 1) as f64
+    } else {
+        latest.volume
+    };
+    let avg_prior_range = if bars.len() > 1 {
+        bars[..bars.len() - 1]
+            .iter()
+            .map(|b| b.high - b.low)
+            .sum::<f64>()
+            / (bars.len() - 1) as f64
+    } else {
+        range
+    };
+
+    let action = if range <= 0.0 || (avg_prior_range > 0.0 && range < avg_prior_range * 0.4) {
+        "CONSOLIDATION".to_string()
+    } else {
+        let lower_wick = latest.open.min(latest.close) - latest.low;
+        let upper_wick = latest.high - latest.open.max(latest.close);
+
+        if lower_wick / range >= 0.40 && latest.volume >= avg_prior_vol * 0.8 {
+            "ABSORPTION".to_string()
+        } else if upper_wick / range >= 0.50 {
+            "EXHAUSTION".to_string()
+        } else if latest.close > early_high.max(late_high) * 0.98 && latest.volume >= avg_prior_vol
+        {
+            "BREAKOUT".to_string()
+        } else if latest.close >= latest.open {
+            "BULLISH_FLOW".to_string()
+        } else {
+            "BEARISH_FLOW".to_string()
+        }
+    };
+
+    (structure, action)
+}
+
 pub fn reduce_portfolios_to_radar(
     evidence: &[OnChainTokenEvidence],
     markets: &HashMap<(Chain, String), RadarMarketSnapshot>,
@@ -325,6 +475,13 @@ pub fn reduce_portfolio_to_radar(
     } else {
         RadarStatus::PortfolioOnly
     };
+    let mut whale_names: Vec<String> = clusters.iter().cloned().collect();
+    whale_names.sort();
+    let whales = if whale_names.is_empty() {
+        None
+    } else {
+        Some(whale_names.join(", "))
+    };
     Ok(Some(RadarProjection {
         chain: first.chain,
         token_address: canonical_token,
@@ -343,6 +500,7 @@ pub fn reduce_portfolio_to_radar(
         candidate_holder_count: candidate_holders.len(),
         independent_cluster_count: clusters.len(),
         direct_accumulator_count: direct_accumulators.len(),
+        whales,
         status,
     }))
 }
@@ -549,5 +707,80 @@ mod tests {
         assert_eq!(result.qualified_holder_count, 1);
         assert_eq!(result.candidate_holder_count, 1);
         assert_eq!(result.independent_cluster_count, 2);
+    }
+
+    #[test]
+    fn test_parse_gecko_ohlcv_and_compute_structure() {
+        let json = serde_json::json!({
+            "data": {
+                "attributes": {
+                    "ohlcv_list": [
+                        [1700000000, 10.0, 12.0, 9.5, 11.0, 1000.0],
+                        [1700003600, 11.0, 13.0, 10.5, 12.5, 1200.0],
+                        [1700007200, 12.5, 14.0, 12.0, 13.5, 1500.0],
+                        [1700010800, 13.5, 15.0, 13.0, 14.5, 1800.0],
+                        [1700014400, 14.5, 16.0, 14.0, 15.8, 2000.0],
+                        [1700018000, 15.8, 17.5, 15.5, 17.2, 2500.0]
+                    ]
+                }
+            }
+        });
+        let bars = parse_gecko_ohlcv(&json).unwrap();
+        assert_eq!(bars.len(), 6);
+        assert_eq!(bars[0].timestamp, 1700000000);
+        assert_eq!(bars[5].timestamp, 1700018000);
+
+        let (structure, action) = compute_market_structure_and_action(&bars);
+        assert_eq!(structure, "BULLISH_HH_HL");
+        assert_eq!(action, "BREAKOUT");
+    }
+
+    #[test]
+    fn test_compute_market_structure_absorption() {
+        let bars = vec![
+            OhlcvBar {
+                timestamp: 1,
+                open: 10.0,
+                high: 11.0,
+                low: 9.5,
+                close: 10.5,
+                volume: 100.0,
+            },
+            OhlcvBar {
+                timestamp: 2,
+                open: 10.5,
+                high: 11.5,
+                low: 10.0,
+                close: 11.0,
+                volume: 100.0,
+            },
+            OhlcvBar {
+                timestamp: 3,
+                open: 11.0,
+                high: 12.0,
+                low: 10.5,
+                close: 11.5,
+                volume: 100.0,
+            },
+            OhlcvBar {
+                timestamp: 4,
+                open: 11.5,
+                high: 12.5,
+                low: 11.0,
+                close: 12.0,
+                volume: 100.0,
+            },
+            // Latest bar: dips sharply to 8.0, but closes near 12.2 (huge lower wick, absorption)
+            OhlcvBar {
+                timestamp: 5,
+                open: 12.0,
+                high: 12.5,
+                low: 8.0,
+                close: 12.2,
+                volume: 500.0,
+            },
+        ];
+        let (_, action) = compute_market_structure_and_action(&bars);
+        assert_eq!(action, "ABSORPTION");
     }
 }

@@ -68,11 +68,7 @@ impl SolanaExecutor {
             .filter(|url| !url.is_empty())
             .map(ToOwned::to_owned)
             .collect();
-        for fallback in [
-            "https://solana-rpc.publicnode.com",
-            "https://rpc.ankr.com/solana",
-            "https://api.mainnet-beta.solana.com",
-        ] {
+        for fallback in ["https://api.mainnet-beta.solana.com"] {
             if !rpc_urls.iter().any(|url| url == fallback) {
                 rpc_urls.push(fallback.to_string());
             }
@@ -224,11 +220,7 @@ impl SolanaExecutor {
             .filter(|url| !url.is_empty())
             .map(ToOwned::to_owned)
             .collect();
-        for fallback in [
-            "https://solana-rpc.publicnode.com",
-            "https://rpc.ankr.com/solana",
-            "https://api.mainnet-beta.solana.com",
-        ] {
+        for fallback in ["https://api.mainnet-beta.solana.com"] {
             if !rpc_urls.iter().any(|url| url == fallback) {
                 rpc_urls.push(fallback.to_string());
             }

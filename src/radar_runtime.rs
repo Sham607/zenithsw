@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
-const RADAR_INTERVAL_SECS: u64 = 600;
+const RADAR_INTERVAL_SECS: u64 = 120;
 const MAX_MARKET_TOKENS_PER_CYCLE: usize = 50;
 const DEXSCREENER_URL: &str = "https://api.dexscreener.com/latest/dex/tokens/";
 
@@ -31,7 +31,10 @@ impl RadarRuntime {
             config,
             db,
             ipc,
-            market_client: Client::builder().timeout(Duration::from_secs(10)).build()?,
+            market_client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build()?,
         })
     }
 
@@ -55,9 +58,18 @@ impl RadarRuntime {
         let evidence = collect_solana_holdings_read_only(&rpc, &solana_addresses)
             .await
             .context("collector holdings Solana gagal")?;
-        for item in &evidence {
-            self.db.insert_radar_evidence(item)?;
-        }
+        let alias_map = self.db.get_wallet_alias_map().unwrap_or_default();
+        let evidence: Vec<crate::radar::OnChainTokenEvidence> = evidence
+            .into_iter()
+            .map(|mut item| {
+                if let Some(alias) = alias_map.get(&item.wallet_address.trim().to_ascii_lowercase())
+                {
+                    item.cluster_id = Some(alias.clone());
+                }
+                item
+            })
+            .collect();
+        self.db.insert_radar_evidence_batch(&evidence)?;
 
         let mut tokens: Vec<String> = evidence
             .iter()
@@ -69,16 +81,28 @@ impl RadarRuntime {
         tokens.truncate(MAX_MARKET_TOKENS_PER_CYCLE);
         let mut markets = HashMap::new();
         for token in tokens {
-            let response = self
+            let response = match self
                 .market_client
                 .get(format!("{DEXSCREENER_URL}{token}"))
                 .send()
                 .await
-                .with_context(|| format!("market request gagal token={token}"))?;
+            {
+                Ok(resp) => resp,
+                Err(error) => {
+                    eprintln!("[RADAR MARKET SKIP] token={token} request error: {error}");
+                    continue;
+                }
+            };
             if !response.status().is_success() {
                 continue;
             }
-            let body: Value = response.json().await?;
+            let body: Value = match response.json().await {
+                Ok(val) => val,
+                Err(error) => {
+                    eprintln!("[RADAR MARKET SKIP] token={token} json parse error: {error}");
+                    continue;
+                }
+            };
             let observed_at = Utc::now();
             match parse_market_snapshot(Chain::Solana, &token, &body, observed_at) {
                 Ok(Some(snapshot)) => {
@@ -91,6 +115,73 @@ impl RadarRuntime {
                 }
                 Err(error) => {
                     eprintln!("[RADAR MARKET SKIP] token={token} response invalid: {error}");
+                }
+            }
+        }
+
+        // Tier-2: GeckoTerminal OHLCV collection for top qualified tokens
+        let mut priority_tokens: Vec<(String, String, usize, f64)> = Vec::new();
+        for ((chain, token), snapshot) in &markets {
+            if *chain != Chain::Solana {
+                continue;
+            }
+            if let Some(pool_addr) = &snapshot.pool_address {
+                if snapshot.liquidity_usd >= 10_000.0 {
+                    let q_count = evidence
+                        .iter()
+                        .filter(|e| {
+                            e.chain == Chain::Solana
+                                && e.token_address.eq_ignore_ascii_case(token)
+                                && e.qualified_wallet
+                        })
+                        .map(|e| e.wallet_address.trim().to_ascii_lowercase())
+                        .collect::<HashSet<_>>()
+                        .len();
+                    if q_count > 0 {
+                        priority_tokens.push((
+                            token.clone(),
+                            pool_addr.clone(),
+                            q_count,
+                            snapshot.liquidity_usd,
+                        ));
+                    }
+                }
+            }
+        }
+        priority_tokens.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.3.total_cmp(&a.3)));
+        priority_tokens.truncate(5);
+
+        for (token, pool_addr, _, _) in priority_tokens {
+            let gecko_url = format!(
+                "https://api.geckoterminal.com/api/v2/networks/solana/pools/{}/ohlcv/hour?aggregate=1&limit=24",
+                pool_addr
+            );
+            sleep(Duration::from_millis(500)).await;
+            let resp = match self.market_client.get(&gecko_url).send().await {
+                Ok(r) => r,
+                Err(error) => {
+                    eprintln!("[RADAR GECKO OHLCV SKIP] token={token} request error: {error}");
+                    continue;
+                }
+            };
+            if !resp.status().is_success() {
+                continue;
+            }
+            let body: Value = match resp.json().await {
+                Ok(val) => val,
+                Err(error) => {
+                    eprintln!("[RADAR GECKO OHLCV SKIP] token={token} json error: {error}");
+                    continue;
+                }
+            };
+            if let Ok(bars) = crate::radar::parse_gecko_ohlcv(&body) {
+                let (structure, action) = crate::radar::compute_market_structure_and_action(&bars);
+                if let Some(snap) = markets.get_mut(&(Chain::Solana, token.clone())) {
+                    snap.market_structure = structure;
+                    snap.price_action = action;
+                    let _ = self
+                        .db
+                        .insert_radar_market_snapshot(snap, &token, Chain::Solana);
                 }
             }
         }

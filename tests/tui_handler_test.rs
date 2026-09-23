@@ -407,6 +407,7 @@ fn radar_snapshot_replaces_state_and_filters_disabled_chain() {
         candidate_holder_count: 0,
         independent_cluster_count: 1,
         direct_accumulator_count: 1,
+        whales: None,
         status: zenithsw::radar::RadarStatus::PortfolioOnly,
     };
     let robinhood_projection = zenithsw::radar::RadarProjection {
@@ -427,6 +428,7 @@ fn radar_snapshot_replaces_state_and_filters_disabled_chain() {
         candidate_holder_count: 0,
         independent_cluster_count: 1,
         direct_accumulator_count: 1,
+        whales: None,
         status: zenithsw::radar::RadarStatus::StructureConfirmed,
     };
 

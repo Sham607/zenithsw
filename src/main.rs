@@ -97,6 +97,23 @@ async fn main() -> Result<()> {
             }
             Err(error) => state.add_log(format!("TUI DB trades stale: {error}")),
         }
+        match db.get_radar_projections(50) {
+            Ok(mut projections) => {
+                projections.retain(|p| match p.chain {
+                    Chain::Solana => enable_sol,
+                    Chain::Robinhood => enable_rh,
+                    Chain::Base => enable_base,
+                    _ => false,
+                });
+                state.radar_projections = projections;
+                if state.radar_selected_index >= state.radar_projections.len()
+                    && !state.radar_projections.is_empty()
+                {
+                    state.radar_selected_index = state.radar_projections.len() - 1;
+                }
+            }
+            Err(error) => state.add_log(format!("TUI DB radar_projections stale: {error}")),
+        }
     }
 
     // Task 1: Real-Time Periodic Local Database Sync (Ensures live PnL, fresh wallets, activities & trades)
@@ -196,6 +213,25 @@ async fn main() -> Result<()> {
                         }
                         Err(error) => state.add_log(format!("TUI DB signals stale: {error}")),
                     }
+                    match db.get_radar_projections(50) {
+                        Ok(mut projections) => {
+                            projections.retain(|p| match p.chain {
+                                Chain::Solana => enable_sol,
+                                Chain::Robinhood => enable_rh,
+                                Chain::Base => enable_base,
+                                _ => false,
+                            });
+                            state.radar_projections = projections;
+                            if state.radar_selected_index >= state.radar_projections.len()
+                                && !state.radar_projections.is_empty()
+                            {
+                                state.radar_selected_index = state.radar_projections.len() - 1;
+                            }
+                        }
+                        Err(error) => {
+                            state.add_log(format!("TUI DB radar_projections stale: {error}"))
+                        }
+                    }
                 }
                 sleep(Duration::from_millis(1500)).await;
             }
@@ -277,6 +313,42 @@ async fn main() -> Result<()> {
                             KeyCode::Char('5') => state.current_tab = 4,
                             KeyCode::Tab => state.next_tab(),
                             KeyCode::BackTab => state.prev_tab(),
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if state.current_tab == 2 {
+                                    state.radar_select_next();
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if state.current_tab == 2 {
+                                    state.radar_select_prev();
+                                }
+                            }
+                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                if state.current_tab == 2 {
+                                    if let Some(p) = state.selected_radar_projection() {
+                                        let addr = p.token_address.clone();
+                                        use base64::Engine;
+                                        let b64 = base64::engine::general_purpose::STANDARD
+                                            .encode(addr.as_bytes());
+                                        let _ = execute!(
+                                            io::stdout(),
+                                            crossterm::style::Print(format!(
+                                                "\x1b]52;c;{}\x07",
+                                                b64
+                                            ))
+                                        );
+                                        let short_addr = if addr.len() > 12 {
+                                            format!("{}...{}", &addr[..6], &addr[addr.len() - 4..])
+                                        } else {
+                                            addr.clone()
+                                        };
+                                        state.clipboard_notice = Some((
+                                            format!("Disalin ke clipboard: {}", short_addr),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
