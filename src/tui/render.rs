@@ -803,7 +803,7 @@ fn render_tab_radar(frame: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(22), // 24H / 1H
             Constraint::Length(28), // Whales
             Constraint::Length(9),  // Clusters
-            Constraint::Length(28), // Structure / Price Action
+            Constraint::Length(33), // Structure / Price Action
         ],
     )
     .header(header)
