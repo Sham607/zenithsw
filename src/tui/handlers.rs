@@ -115,9 +115,9 @@ pub fn apply_ipc_message(app: &mut App, msg: IpcMessage, config: &Config) {
         }
         IpcMessage::ActivityBroadcast { activity } => {
             if chain_enabled(activity.chain, config) {
-                app.activities.push(activity);
+                app.activities.insert(0, activity);
                 if app.activities.len() > 100 {
-                    app.activities.remove(0);
+                    app.activities.pop();
                 }
             }
         }
@@ -127,9 +127,9 @@ pub fn apply_ipc_message(app: &mut App, msg: IpcMessage, config: &Config) {
         }
         IpcMessage::SignalBroadcast { signal } => {
             if chain_enabled(signal.chain, config) {
-                app.signals.push(signal);
+                app.signals.insert(0, signal);
                 if app.signals.len() > 100 {
-                    app.signals.remove(0);
+                    app.signals.pop();
                 }
             }
         }

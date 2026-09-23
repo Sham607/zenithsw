@@ -236,7 +236,7 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
 
     // Left: Live Whale Activities
     let mut act_items = Vec::new();
-    for act in app.activities.iter().rev().take(15) {
+    for act in app.activities.iter().take(15) {
         let wib_dt = act
             .timestamp
             .with_timezone(&FixedOffset::east_opt(7 * 3600).unwrap());
@@ -398,7 +398,7 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
 
     // Right: Shadow Confluence Signals & Decisions
     let mut sig_items = Vec::new();
-    for sig in app.signals.iter().rev().take(15) {
+    for sig in app.signals.iter().take(15) {
         let (status_color, status_text) = if sig.is_passed {
             (Color::Green, "COPIED [BUY ENTRY] ✅")
         } else {
