@@ -18,14 +18,17 @@ use anyhow::{bail, Result};
 use chrono::Utc;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-/// Transport RPC khusus observasi. Tidak memiliki fallback endpoint dan
-/// menolak method yang dapat mengubah state chain.
+/// Transport RPC khusus observasi. Mendukung round-robin antar endpoint
+/// dan menolak method yang dapat mengubah state chain.
 #[derive(Clone)]
 pub struct ReadOnlyRpcClient {
     client: Client,
     endpoints: Vec<String>,
+    cursor: Arc<AtomicUsize>,
 }
 
 impl ReadOnlyRpcClient {
@@ -48,6 +51,7 @@ impl ReadOnlyRpcClient {
         Ok(Self {
             client: Client::builder().timeout(Duration::from_secs(10)).build()?,
             endpoints,
+            cursor: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -60,7 +64,9 @@ impl ReadOnlyRpcClient {
             bail!("read-only RPC menolak method mutating: {method}");
         }
         let mut last_error = anyhow::anyhow!("read-only RPC endpoint missing");
-        for endpoint in &self.endpoints {
+        let start_idx = self.cursor.fetch_add(1, Ordering::Relaxed) % self.endpoints.len();
+        for i in 0..self.endpoints.len() {
+            let endpoint = &self.endpoints[(start_idx + i) % self.endpoints.len()];
             let response = match self.client.post(endpoint).json(request).send().await {
                 Ok(response) => response,
                 Err(error) => {
@@ -83,6 +89,9 @@ impl ReadOnlyRpcClient {
                 }
             };
             if !status.is_success() {
+                if status.as_u16() == 429 {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                }
                 last_error = anyhow::anyhow!(
                     "RPC HTTP status {status} content_type={content_type} detail={}",
                     serde_json::from_str::<Value>(&body)
@@ -111,6 +120,9 @@ impl ReadOnlyRpcClient {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
+                if code == 429 || code == -32005 || message.to_lowercase().contains("too many requests") || message.to_lowercase().contains("rate limit") {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                }
                 last_error = anyhow::anyhow!("RPC JSON-RPC error code={code} message={message}");
                 continue;
             }
@@ -180,11 +192,22 @@ pub async fn collect_solana_holdings_read_only(
         if address.chain != Chain::Solana {
             continue;
         }
-        for request in [
+        for (sub_id, request) in [
             build_solana_token_accounts_request(&address.address, request_id as u64 * 2 + 1)?,
             build_solana_token_2022_accounts_request(&address.address, request_id as u64 * 2 + 2)?,
-        ] {
-            let response = match client.call(&request).await {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if sub_id > 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let mut response = client.call(&request).await;
+            if response.is_err() {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                response = client.call(&request).await;
+            }
+            let response = match response {
                 Ok(resp) => resp,
                 Err(err) => {
                     eprintln!(
@@ -204,8 +227,7 @@ pub async fn collect_solana_holdings_read_only(
                 }
             }
         }
-        // Jeda 2000ms antar wallet agar RPC publik resmi Solana tetap lancar tanpa rate-limit
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
     }
     Ok(evidence)
 }
@@ -704,6 +726,45 @@ mod tests {
         let client = ReadOnlyRpcClient::new("http://127.0.0.1:1").unwrap();
         let request = json!({"jsonrpc":"2.0","id":1,"method":"sendTransaction"});
         assert!(client.call(&request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_only_client_rotates_endpoints_round_robin() {
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+
+        let c_a = Arc::clone(&count_a);
+        let s_a = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener_a.accept().await {
+                c_a.fetch_add(1, Ordering::Relaxed);
+                use tokio::io::AsyncWriteExt;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}").await;
+            }
+        });
+        let c_b = Arc::clone(&count_b);
+        let s_b = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener_b.accept().await {
+                c_b.fetch_add(1, Ordering::Relaxed);
+                use tokio::io::AsyncWriteExt;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}").await;
+            }
+        });
+
+        let client = ReadOnlyRpcClient::new(&format!("http://{addr_a},http://{addr_b}")).unwrap();
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"getHealth"});
+        let _ = client.call(&req).await;
+        let _ = client.call(&req).await;
+
+        let _ = s_a.await;
+        let _ = s_b.await;
+
+        assert_eq!(count_a.load(Ordering::Relaxed), 1);
+        assert_eq!(count_b.load(Ordering::Relaxed), 1);
     }
 
     #[test]

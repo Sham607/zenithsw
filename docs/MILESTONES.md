@@ -518,3 +518,9 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
 - [x] Verifikasi live daemon:
   - Binary release dikompilasi & daemon di-restart.
   - Hasil observasi radar riil: Proyeksi terpangkas dari 47 token sampah menjadi 11 token berkurasi tinggi (5 `HighPriorityRadar` dari transaksi beli whale riil: X7, EMBERCAT, LYNKS, DURIAL, CONVICTION; dan 6 `StructureConfirmed` bernilai saldo >= $100 USD: EMBER, FLAME, FINE, UCAT, FRIENDS).
+- [x] Round-Robin Pool RPC Publik Nol-Biaya:
+  - Diagnosa kegagalan endpoint: Mayoritas node gratis (publicnode, Chainstack free, Ankr free) memblokir `getTokenAccountsByOwner` (403 Forbidden / Plan Upgrade) karena ketiadaan indeks `--account-index spl-token-owner`.
+  - Endpoint valid diverifikasi: `https://public.rpc.solanavibestation.com` dan `https://api.mainnet-beta.solana.com` lolos 100%.
+  - `src/radar_rpc.rs`: Mengintegrasikan `ReadOnlyRpcClient` dengan cursor atomic round-robin ganda (50:50) failover, jeda adaptif status 429 backoff 1.500ms, serta pacing 2.500ms antar-dompet.
+  - `.env`: Mengaktifkan rotasi `SOLANA_RPC_URL=https://api.mainnet-beta.solana.com,https://public.rpc.solanavibestation.com`.
+  - Verifikasi: Test suite lulus, kompilasi release sukses, daemon aktif lancar tanpa mengorbankan kuota Helius.
