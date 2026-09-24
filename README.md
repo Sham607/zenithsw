@@ -31,9 +31,10 @@ TUI juga melakukan refresh database berkala. Status IPC harus dibedakan dari sna
 
 ### Solana
 
-- **Arsitektur Dual-Channel RPC**:
-  - *Kanal Publik & WebSocket* (`SOLANA_RPC_URL`, `SOLANA_WS_URL`): Menangani beban polling rutin tanda tangan wallet (`getSignaturesForAddress`) dan langganan event tanpa biaya (0 credit Helius).
-  - *Kanal Presisi Eksekusi* (`SOLANA_EXECUTION_RPC_URL`, misal Helius): Diprioritaskan khusus untuk bedah mendalam transaksi whale (`getTransaction` jsonParsed), fetch blockhash kritis (`getLatestBlockhash`), dan broadcast transaksi langsung (`sendTransaction`).
+- **Arsitektur Dual-Channel & Multi-Endpoint Round-Robin RPC**:
+  - *Kanal Publik & WebSocket* (`SOLANA_RPC_URL`, `SOLANA_WS_URL`): Mendukung multi-endpoint yang dipisahkan koma dengan rotasi *atomic round-robin* (`AtomicUsize`), auto-failover, pacing 2.500ms antardompet, dan jeda adaptif HTTP 429 backoff (1.500ms) untuk menangani polling rutin tanda tangan wallet (`getSignaturesForAddress`) dan saldo token (`getTokenAccountsByOwner`) tanpa membakar kuota eksekusi (0 credit Helius).
+  - *Kanal Presisi Eksekusi* (`SOLANA_EXECUTION_RPC_URL`, misal Helius): Didedikasikan eksklusif untuk parsing terurai transaksi whale (`getTransaction` jsonParsed), fetch blockhash kritis (`getLatestBlockhash`), dan broadcast transaksi langsung (`sendTransaction`).
+- **Parser Native SOL Stream**: Menghitung selisih saldo lamports Native SOL fisik (`meta.preBalances` vs `meta.postBalances`) dengan kompensasi netral fee transaksi pada fee payer, mencegah salah klasifikasi transaksi DEX multi-hop/Native SOL sebagai `TRANSFER`.
 - Jupiter/PumpPortal digunakan oleh jalur executor yang tersedia.
 - Konfirmasi transaksi dipolling sebelum posisi dibuka atau ditutup.
 - Balance token direkonsiliasi dari RPC.
@@ -77,9 +78,14 @@ Aturan umum yang dipakai lintas executor:
 - asset blacklist diterapkan sebelum entry;
 - harga, liquidity, market cap, amount, dan slippage harus valid serta finite;
 - satu posisi aktif per token dan chain;
-- satu posisi aktif per token dan chain;
 - multi-lot accumulation didukung dengan weighted VWAP hingga batas `MAX_TOKEN_EXPOSURE` ($50);
 - posisi live hanya boleh dipersist setelah bukti transaksi dan balance on-chain lengkap.
+
+### Dual-Channel Whale Gems Radar
+Sistem radar mendeteksi aset pantauan whale secara asimetris untuk mencegah polusi token *dust* dan *airdrop spam*:
+- **Jalur Saldo Pasif (`StructureConfirmed`)**: Token terdaftar di DexScreener wajib memiliki total nilai saldo kepemilikan whale $\ge$ $100 USD (`ui_amount * price_usd >= 100.0`). Koin debu di bawah $100 USD dibuang dari proyeksi radar.
+- **Jalur Transaksi Aktif (`HighPriorityRadar`)**: Transaksi beli baru (`BUY` / `DirectSwap`) oleh whale $\ge$ $100 USD dalam 24 jam terakhir langsung diproyeksikan ke baris prioritas radar TUI, mendukung token tahap pra-DEX / Pump.fun.
+- **Pruning Otomatis**: Proyeksi radar yang tidak lagi memenuhi kualifikasi dibersihkan otomatis setiap siklus agar data TUI selalu relevan dan bersih.
 
 ### Strategi Exit Terbifurkasi (`SHADOW_EXIT_ENABLED`)
 
@@ -246,7 +252,7 @@ mise exec rust@1.94.1 -- cargo build --release --locked
 git diff --check
 ```
 
-Verifikasi terbaru: **181 library tests & 41 integration tests lulus (total 222 test), 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
+Verifikasi terbaru: **188 library tests & 41 integration tests lulus (total 229 test), 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
 
 ## Credential dan keamanan
 
