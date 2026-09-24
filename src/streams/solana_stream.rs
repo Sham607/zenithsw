@@ -54,6 +54,38 @@ pub fn classify_token_movement(
     }
 }
 
+/// Menghitung selisih saldo Native SOL untuk akun tertentu,
+/// dengan mengompensasi potongan fee transaksi jika akun tersebut adalah fee payer (index 0).
+pub fn extract_native_sol_delta(meta: &Value, transaction: &Value, address: &str) -> f64 {
+    let account_keys = match transaction["message"]["accountKeys"].as_array() {
+        Some(keys) => keys,
+        None => return 0.0,
+    };
+
+    let account_idx = match account_keys.iter().position(|k| {
+        k.as_str() == Some(address) || k["pubkey"].as_str() == Some(address)
+    }) {
+        Some(idx) => idx,
+        None => return 0.0,
+    };
+
+    let pre_balances = match meta["preBalances"].as_array() {
+        Some(arr) => arr,
+        None => return 0.0,
+    };
+    let post_balances = match meta["postBalances"].as_array() {
+        Some(arr) => arr,
+        None => return 0.0,
+    };
+
+    let pre_lamports = pre_balances.get(account_idx).and_then(Value::as_f64).unwrap_or(0.0);
+    let post_lamports = post_balances.get(account_idx).and_then(Value::as_f64).unwrap_or(0.0);
+    let fee_lamports = meta["fee"].as_f64().unwrap_or(0.0);
+
+    let fee_offset = if account_idx == 0 { fee_lamports } else { 0.0 };
+    (post_lamports - pre_lamports + fee_offset) / 1_000_000_000.0
+}
+
 fn get_price_cache() -> &'static PriceCache {
     PRICE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
@@ -329,11 +361,13 @@ impl SolanaStreamListener {
             }
 
             if let Some((mint, delta, bal_before, bal_after)) = best {
-                // Delta quote asset di wallet yang sama = bukti pembayaran swap.
+                let native_sol_delta = extract_native_sol_delta(meta, &tx_result["transaction"], address);
+                // Delta quote asset di wallet yang sama = bukti pembayaran swap (Native SOL + WSOL + Stables).
                 let q = |m: &str| {
                     post_map.get(m).copied().unwrap_or(0.0) - pre_map.get(m).copied().unwrap_or(0.0)
                 };
-                let delta_sol = q("So11111111111111111111111111111111111111112");
+                let delta_wsol = q("So11111111111111111111111111111111111111112");
+                let delta_sol = native_sol_delta + delta_wsol;
                 let delta_stables_usd = q("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
                     + q("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
                     + q("2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo");
@@ -791,6 +825,61 @@ mod tests {
         assert!(!is_collateral_mint(
             "4UHmZGe6X4DZ5dxYGiGXMhi3Sp34uPWtHB7qDMyvRbYB"
         ));
+    }
+
+    #[test]
+    fn extract_native_sol_delta_handles_fee_payer_and_offset() {
+        let meta = serde_json::json!({
+            "preBalances": [1047564054976u64, 1574800u64],
+            "postBalances": [1002564037066u64, 1574800u64],
+            "fee": 17910u64
+        });
+        let tx = serde_json::json!({
+            "message": {
+                "accountKeys": [
+                    {"pubkey": "2UknaPAYpAEP6mbxHRy9mcBgZCHPLWVijQsPBFGJ7Fea", "signer": true},
+                    {"pubkey": "SomeOtherPubkey", "signer": false}
+                ]
+            }
+        });
+        let delta = super::extract_native_sol_delta(&meta, &tx, "2UknaPAYpAEP6mbxHRy9mcBgZCHPLWVijQsPBFGJ7Fea");
+        // -45.0 SOL net delta (fee offset added back to avoid priority fee confusion)
+        assert!((delta - (-45.0)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn extract_native_sol_delta_returns_zero_for_unrelated_address() {
+        let meta = serde_json::json!({
+            "preBalances": [1000000000u64],
+            "postBalances": [500000000u64],
+            "fee": 5000u64
+        });
+        let tx = serde_json::json!({
+            "message": {
+                "accountKeys": ["RandomPubkey"]
+            }
+        });
+        let delta = super::extract_native_sol_delta(&meta, &tx, "NonExistentWallet");
+        assert_eq!(delta, 0.0);
+    }
+
+    #[test]
+    fn buy_with_native_sol_classified_as_buy() {
+        let meta = serde_json::json!({
+            "preBalances": [50000000000u64],
+            "postBalances": [5000000000u64],
+            "fee": 5000u64
+        });
+        let tx = serde_json::json!({
+            "message": {
+                "accountKeys": [{"pubkey": "BuyerWallet", "signer": true}]
+            }
+        });
+        let native_sol = super::extract_native_sol_delta(&meta, &tx, "BuyerWallet");
+        assert_eq!(
+            classify_token_movement(3467944.0, 0.0, native_sol),
+            ActivityType::Buy
+        );
     }
 
     #[test]

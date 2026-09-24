@@ -532,3 +532,16 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
     2. `bunker_veeman_feeder_02` (`8NkMzBchjoxyABfX4kiZoAGtMBRog6iNp9KuwhucTHNd` | 18 hari inaktif)
     3. `bunker_detweiler_sat_02` (`9UXDr5sZwcE2duBKXkzqTbwKknfuycWqpRrV5QZmDWXg` | 14 hari inaktif)
   - Registry kini terkonsolidasi menjadi 17 dompet aktif (13 Tier-S + 4 Tier-A), beban RPC terpangkas 15%, dan daemon `zenithsw-engine` aktif berjalan normal.
+
+## [2026-09-24] Penyelesaian Blindspot Parser Native SOL Stream (Eliminasi False Transfer pada Swap DEX)
+- [x] Masalah: Transaksi swap DEX berbasis Native SOL (seperti pembelian token LinkedInu oleh `bunker_veeman_sat_02` senilai 45 SOL / $5.417 USD) salah diklasifikasikan sebagai `TRANSFER` alih-alih `BUY` karena parser `src/streams/solana_stream.rs` hanya membaca saldo SPL Wrapped SOL (`preTokenBalances` vs `postTokenBalances`) dan buta terhadap pengurangan saldo SOL fisik.
+- [x] Solusi Arsitektur:
+  - Implementasi fungsi `extract_native_sol_delta`: Membaca array `meta.preBalances` dan `meta.postBalances` berdasarkan indeks rekening dompet di `transaction.message.accountKeys`.
+  - Kompensasi Fee Netral: Menghitung offset biaya transaksi (`meta.fee`) khusus untuk fee payer (indeks 0) sehingga biaya gas/priority fee murni tidak disalahartikan sebagai pembayaran swap.
+  - Penyatuan Aliran Quote Asset: `delta_sol = native_sol_delta + delta_wsol`, mendukung multi-hop swap, direct Native SOL, maupun SPL Wrapped SOL.
+- [x] Verifikasi Pengujian:
+  - Unit tests baru: `extract_native_sol_delta_handles_fee_payer_and_offset`, `extract_native_sol_delta_returns_zero_for_unrelated_address`, dan `buy_with_native_sol_classified_as_buy` lulus.
+  - Total pengujian: 229 passed (188 unit + 41 integration across all shards), 0 failed.
+- [x] Verifikasi Database & Operasional:
+  - Binary release dikompilasi (`cargo build --release`) dan daemon `zenithsw-engine.service` di-restart aktif.
+  - Rekam jejak historis token LinkedInu (`id: 672` dan `id: 1041`) di `wallet_activities` dikoreksi menjadi `BUY`.
