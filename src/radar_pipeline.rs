@@ -62,6 +62,7 @@ mod tests {
             observed_at: Utc::now(),
             cluster_id: Some("cluster-1".to_string()),
             qualified_wallet: qualified,
+            ui_amount: Some(10_000.0),
         }
     }
 
@@ -121,6 +122,7 @@ mod tests {
                 min_market_cap_usd: 50_000.0,
                 max_market_cap_usd: 20_000_000.0,
                 min_liquidity_usd: 30_000.0,
+                min_holding_value_usd: 100.0,
             },
         )
         .unwrap();
@@ -160,6 +162,7 @@ mod tests {
                 min_market_cap_usd: 1.0,
                 max_market_cap_usd: 2.0,
                 min_liquidity_usd: 1.0,
+                min_holding_value_usd: 100.0,
             },
         )
         .unwrap();
@@ -179,6 +182,7 @@ mod tests {
                 min_market_cap_usd: 50_000.0,
                 max_market_cap_usd: 20_000_000.0,
                 min_liquidity_usd: 30_000.0,
+                min_holding_value_usd: 100.0,
             },
         )
         .unwrap();
@@ -213,6 +217,7 @@ mod tests {
                 min_market_cap_usd: 1.0,
                 max_market_cap_usd: 2.0,
                 min_liquidity_usd: 1.0,
+                min_holding_value_usd: 100.0,
             }
         )
         .is_err());

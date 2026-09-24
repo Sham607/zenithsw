@@ -500,3 +500,21 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
 - [x] Sinkronisasi TUI / Heartbeat IPC: Menyiarkan parameter aktif yang relevan berdasarkan mode yang sedang dipilih.
 - [x] Test suite: `test_bot_autonomous_exit_full_tp_and_sl_logic` lulus; full regression suite: 222 passed (181 unit + 41 integration across all shards), 0 failed.
 - [x] Kompilasi release binary: `zenithsw` & `zenithsw-engine` sukses.
+
+## [2026-09-24] Integrasi Filter Dual-Channel Whale Gems Radar (Pembersihan Debu & Deteksi Transaksi Riil)
+- [x] Masalah: Radar menampilkan 47 proyeksi token yang didominasi debu saldo sisa (dust) bernilai perak dan spam token airdrop karena sistem meloloskan seluruh koin dengan `amount > 0`.
+- [x] Desain Logika Asimetris (Opsi B + A):
+  - Opsi A (Filter Debu Saldo): Token dengan harga pasar DexScreener wajib memiliki total nilai kepemilikan whale minimal $100 USD (`ui_amount * price_usd >= 100.0`). Koin di bawah $100 USD dibuang dari proyeksi.
+  - Opsi B (Jalur Transaksi Beli Aktif): Transaksi beli baru (`BUY` / `DirectSwap`) oleh whale minimal $100 USD dalam 24 jam terakhir ditarik dari `wallet_activities` dan diproyeksikan langsung sebagai `HighPriorityRadar`.
+  - Pruning otomatis: Proyeksi kadaluarsa (>30 menit) dibersihkan dari `radar_projections` agar token yang tereliminasi tidak menetap selama 24 jam.
+- [x] Eksekusi kode:
+  - `src/radar.rs`: `OnChainTokenEvidence` ditambahkan `ui_amount: Option<f64>`, `RadarPolicy` ditambahkan `min_holding_value_usd: f64`, reduksi mengevaluasi saldo koin per dompet dan status DirectSwap.
+  - `src/radar_rpc.rs`: Parser akun token Solana mengambil nilai desimal riil `uiAmount` dari response RPC.
+  - `src/db.rs`: Penambahan `get_recent_buy_evidence` dan `prune_stale_radar_projections`.
+  - `src/radar_runtime.rs`: Penggabungan bukti holding fisik dan transaksi beli `wallet_activities` 24 jam terakhir.
+- [x] Verifikasi pengujian:
+  - Unit tests baru: `holding_below_min_holding_value_usd_is_excluded` dan `holding_below_min_holding_value_with_direct_swap_is_preserved_as_high_priority` lulus.
+  - Full regression suite: 223 passed (184 unit + 39 integration), 0 failed.
+- [x] Verifikasi live daemon:
+  - Binary release dikompilasi & daemon di-restart.
+  - Hasil observasi radar riil: Proyeksi terpangkas dari 47 token sampah menjadi 11 token berkurasi tinggi (5 `HighPriorityRadar` dari transaksi beli whale riil: X7, EMBERCAT, LYNKS, DURIAL, CONVICTION; dan 6 `StructureConfirmed` bernilai saldo >= $100 USD: EMBER, FLAME, FINE, UCAT, FRIENDS).

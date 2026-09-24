@@ -584,6 +584,16 @@ pub fn parse_solana_token_accounts(
         {
             continue;
         }
+        let token_amount_obj = info.get("tokenAmount");
+        let ui_amount = token_amount_obj
+            .and_then(|v| v.get("uiAmount"))
+            .and_then(Value::as_f64)
+            .or_else(|| {
+                token_amount_obj
+                    .and_then(|v| v.get("uiAmountString"))
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<f64>().ok())
+            });
         validate_observation_identity(owner, mint)?;
         evidence.push(OnChainTokenEvidence {
             chain: Chain::Solana,
@@ -594,6 +604,7 @@ pub fn parse_solana_token_accounts(
             observed_at: Utc::now(),
             cluster_id: None,
             qualified_wallet,
+            ui_amount,
         });
     }
     Ok(evidence)

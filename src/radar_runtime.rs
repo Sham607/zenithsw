@@ -59,7 +59,7 @@ impl RadarRuntime {
             .await
             .context("collector holdings Solana gagal")?;
         let alias_map = self.db.get_wallet_alias_map().unwrap_or_default();
-        let evidence: Vec<crate::radar::OnChainTokenEvidence> = evidence
+        let mut evidence: Vec<crate::radar::OnChainTokenEvidence> = evidence
             .into_iter()
             .map(|mut item| {
                 if let Some(alias) = alias_map.get(&item.wallet_address.trim().to_ascii_lowercase())
@@ -69,6 +69,17 @@ impl RadarRuntime {
                 item
             })
             .collect();
+
+        // Opsi B: Ambil bukti transaksi beli baru (DirectSwap) >= $100 USD dalam 24 jam terakhir
+        let buy_cutoff = Utc::now() - chrono::Duration::hours(24);
+        if let Ok(recent_buys) = self.db.get_recent_buy_evidence(buy_cutoff, 100.0) {
+            for mut buy in recent_buys {
+                if let Some(alias) = alias_map.get(&buy.wallet_address.trim().to_ascii_lowercase()) {
+                    buy.cluster_id = Some(alias.clone());
+                }
+                evidence.push(buy);
+            }
+        }
         self.db.insert_radar_evidence_batch(&evidence)?;
 
         let mut tokens: Vec<String> = evidence
@@ -195,12 +206,15 @@ impl RadarRuntime {
                 min_market_cap_usd: self.config.min_market_cap_usd,
                 max_market_cap_usd: self.config.max_market_cap_usd,
                 min_liquidity_usd: self.config.min_liquidity_usd,
+                min_holding_value_usd: 100.0,
             },
         )?;
         let observed_at = Utc::now();
         for projection in &output.projections {
             self.db.insert_radar_projection(projection, observed_at)?;
         }
+        let prune_cutoff = observed_at - chrono::Duration::minutes(30);
+        let _ = self.db.prune_stale_radar_projections(prune_cutoff);
         self.ipc.broadcast(&IpcMessage::RadarSync {
             projections: output.projections.clone(),
         })?;

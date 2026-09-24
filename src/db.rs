@@ -2161,6 +2161,63 @@ impl SmartWalletDb {
         Ok(results)
     }
 
+    pub fn get_recent_buy_evidence(
+        &self,
+        since: DateTime<Utc>,
+        min_amount_usd: f64,
+    ) -> Result<Vec<OnChainTokenEvidence>> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = since.to_rfc3339();
+        let mut stmt = conn.prepare(
+            "SELECT chain, token_mint, wallet_address, tx_signature, timestamp, wallet_handle, token_amount
+             FROM wallet_activities
+             WHERE activity_type = 'BUY'
+               AND amount_usd >= ?1
+               AND timestamp >= ?2
+               AND token_mint != ''
+               AND token_mint != 'NATIVE'",
+        )?;
+        let rows = stmt.query_map(params![min_amount_usd, cutoff], |row| {
+            let chain_str: String = row.get(0)?;
+            let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
+            let token_mint: String = row.get(1)?;
+            let wallet_address: String = row.get(2)?;
+            let tx_signature: String = row.get(3)?;
+            let timestamp_str: String = row.get(4)?;
+            let observed_at = DateTime::parse_from_rfc3339(&timestamp_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let handle: String = row.get(5)?;
+            let token_amount: f64 = row.get(6).unwrap_or(0.0);
+            Ok(OnChainTokenEvidence {
+                chain,
+                token_address: token_mint,
+                wallet_address,
+                kind: crate::radar::RadarEvidenceKind::DirectSwap,
+                tx_id: Some(tx_signature),
+                observed_at,
+                cluster_id: Some(handle),
+                qualified_wallet: true,
+                ui_amount: if token_amount > 0.0 { Some(token_amount) } else { None },
+            })
+        })?;
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r?);
+        }
+        Ok(results)
+    }
+
+    pub fn prune_stale_radar_projections(&self, before: DateTime<Utc>) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = before.to_rfc3339();
+        let pruned = conn.execute(
+            "DELETE FROM radar_projections WHERE observed_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(pruned)
+    }
+
     pub fn get_radar_projections(&self, limit: usize) -> Result<Vec<RadarProjection>> {
         let conn = self.conn.lock().unwrap();
         let cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();

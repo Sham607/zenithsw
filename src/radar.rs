@@ -12,7 +12,7 @@ pub enum RadarEvidenceKind {
     TokenReceipt,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OnChainTokenEvidence {
     pub chain: Chain,
     pub token_address: String,
@@ -22,6 +22,7 @@ pub struct OnChainTokenEvidence {
     pub observed_at: DateTime<Utc>,
     pub cluster_id: Option<String>,
     pub qualified_wallet: bool,
+    pub ui_amount: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +86,7 @@ pub struct RadarPolicy {
     pub min_market_cap_usd: f64,
     pub max_market_cap_usd: f64,
     pub min_liquidity_usd: f64,
+    pub min_holding_value_usd: f64,
 }
 
 impl RadarPolicy {
@@ -92,9 +94,11 @@ impl RadarPolicy {
         if !self.min_market_cap_usd.is_finite()
             || !self.max_market_cap_usd.is_finite()
             || !self.min_liquidity_usd.is_finite()
+            || !self.min_holding_value_usd.is_finite()
             || self.min_market_cap_usd <= 0.0
             || self.max_market_cap_usd < self.min_market_cap_usd
             || self.min_liquidity_usd <= 0.0
+            || self.min_holding_value_usd < 0.0
         {
             bail!("radar market policy invalid");
         }
@@ -444,28 +448,62 @@ pub fn reduce_portfolio_to_radar(
     let mut candidate_holders = HashSet::new();
     let mut clusters = HashSet::new();
     let mut direct_accumulators = HashSet::new();
+
+    let mut wallet_holdings: HashMap<String, f64> = HashMap::new();
+    let mut wallet_has_direct_swap: HashSet<String> = HashSet::new();
+    let mut wallet_clusters: HashMap<String, String> = HashMap::new();
+    let mut wallet_is_qualified: HashMap<String, bool> = HashMap::new();
+
     for item in evidence {
         let wallet = item.wallet_address.trim().to_ascii_lowercase();
         if wallet.is_empty() {
             bail!("radar evidence wallet identity missing");
         }
         if item.qualified_wallet {
-            qualified_holders.insert(wallet.clone());
+            wallet_is_qualified.insert(wallet.clone(), true);
+        } else {
+            wallet_is_qualified.entry(wallet.clone()).or_insert(false);
         }
         if let Some(cluster) = &item.cluster_id {
             if !cluster.trim().is_empty() {
-                clusters.insert(cluster.trim().to_string());
+                wallet_clusters.insert(wallet.clone(), cluster.trim().to_string());
             }
         }
         if item.kind == RadarEvidenceKind::DirectSwap {
-            direct_accumulators.insert(wallet);
+            wallet_has_direct_swap.insert(wallet.clone());
+        }
+        if item.kind == RadarEvidenceKind::TokenHolding {
+            if let Some(amount) = item.ui_amount {
+                *wallet_holdings.entry(wallet.clone()).or_insert(0.0) += amount;
+            }
         }
     }
-    for item in evidence.iter().filter(|item| !item.qualified_wallet) {
-        let wallet = item.wallet_address.trim().to_ascii_lowercase();
-        if !qualified_holders.contains(&wallet) {
-            candidate_holders.insert(wallet);
+
+    for (wallet, &is_qualified) in &wallet_is_qualified {
+        let has_swap = wallet_has_direct_swap.contains(wallet);
+        let total_holding_tokens = wallet_holdings.get(wallet).copied().unwrap_or(0.0);
+        let passes_holding_value = match market.price_usd {
+            Some(price) => (total_holding_tokens * price) >= policy.min_holding_value_usd,
+            None => true,
+        };
+
+        if has_swap || passes_holding_value {
+            if has_swap {
+                direct_accumulators.insert(wallet.clone());
+            }
+            if is_qualified {
+                qualified_holders.insert(wallet.clone());
+            } else {
+                candidate_holders.insert(wallet.clone());
+            }
+            if let Some(cluster) = wallet_clusters.get(wallet) {
+                clusters.insert(cluster.clone());
+            }
         }
+    }
+
+    if qualified_holders.is_empty() && candidate_holders.is_empty() {
+        return Ok(None);
     }
 
     let status = if market.price_usd.is_some() && !direct_accumulators.is_empty() {
@@ -519,6 +557,7 @@ mod tests {
             observed_at: Utc::now(),
             cluster_id: Some(format!("cluster-{wallet}")),
             qualified_wallet: qualified,
+            ui_amount: Some(10_000.0),
         }
     }
 
@@ -582,6 +621,7 @@ mod tests {
             min_market_cap_usd: 50_000.0,
             max_market_cap_usd: 20_000_000.0,
             min_liquidity_usd: 30_000.0,
+            min_holding_value_usd: 100.0,
         }
     }
 
@@ -607,20 +647,6 @@ mod tests {
     }
 
     #[test]
-    fn price_missing_still_allows_portfolio_only() {
-        let result = reduce_portfolio_to_radar(
-            &[evidence(RadarEvidenceKind::TokenHolding, "wallet-a", true)],
-            &market(None),
-            policy(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(result.status, RadarStatus::PortfolioOnly);
-        assert_eq!(result.qualified_holder_count, 1);
-        assert_eq!(result.price_usd, None);
-    }
-
-    #[test]
     fn direct_swap_with_price_is_high_priority_but_not_entry() {
         let result = reduce_portfolio_to_radar(
             &[evidence(RadarEvidenceKind::DirectSwap, "wallet-a", true)],
@@ -630,6 +656,32 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(result.status, RadarStatus::HighPriorityRadar);
+        assert_eq!(result.qualified_holder_count, 1);
+        assert_eq!(result.direct_accumulator_count, 1);
+    }
+
+    #[test]
+    fn holding_below_min_holding_value_usd_is_excluded() {
+        let mut item = evidence(RadarEvidenceKind::TokenHolding, "wallet-a", true);
+        item.ui_amount = Some(50.0); // 50 * 0.1 = $5.0 < $100.0
+        let result = reduce_portfolio_to_radar(&[item], &market(Some(0.1)), policy()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn holding_below_min_holding_value_with_direct_swap_is_preserved_as_high_priority() {
+        let mut holding_item = evidence(RadarEvidenceKind::TokenHolding, "wallet-a", true);
+        holding_item.ui_amount = Some(50.0); // $5.0 < $100.0
+        let swap_item = evidence(RadarEvidenceKind::DirectSwap, "wallet-a", true);
+        let result = reduce_portfolio_to_radar(
+            &[holding_item, swap_item],
+            &market(Some(0.1)),
+            policy(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.status, RadarStatus::HighPriorityRadar);
+        assert_eq!(result.qualified_holder_count, 1);
         assert_eq!(result.direct_accumulator_count, 1);
     }
 
