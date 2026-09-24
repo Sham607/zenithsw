@@ -524,3 +524,11 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
   - `src/radar_rpc.rs`: Mengintegrasikan `ReadOnlyRpcClient` dengan cursor atomic round-robin ganda (50:50) failover, jeda adaptif status 429 backoff 1.500ms, serta pacing 2.500ms antar-dompet.
   - `.env`: Mengaktifkan rotasi `SOLANA_RPC_URL=https://api.mainnet-beta.solana.com,https://public.rpc.solanavibestation.com`.
   - Verifikasi: Test suite lulus, kompilasi release sukses, daemon aktif lancar tanpa mengorbankan kuota Helius.
+- [x] Audit On-Chain & Purge Registry Whale Panutan:
+  - Backup resmi dibuat: `data/wallet_registry.db.bak_20260924_purge`.
+  - Evaluasi 20 dompet panutan via RPC Solana: 17 dompet terverifikasi aktif (transaksi hari ini / <4 hari), sedangkan 3 dompet terbukti mati suri >14 hari tanpa aktivitas.
+  - Eliminasi 3 dompet mati suri dari `data/wallet_registry.db`:
+    1. `bunker_veeman_feeder_01` (`42e6KaraNpvvHUrcUt33GcQYmxaPN6vp5HdT39xVYiJR` | 39 hari inaktif)
+    2. `bunker_veeman_feeder_02` (`8NkMzBchjoxyABfX4kiZoAGtMBRog6iNp9KuwhucTHNd` | 18 hari inaktif)
+    3. `bunker_detweiler_sat_02` (`9UXDr5sZwcE2duBKXkzqTbwKknfuycWqpRrV5QZmDWXg` | 14 hari inaktif)
+  - Registry kini terkonsolidasi menjadi 17 dompet aktif (13 Tier-S + 4 Tier-A), beban RPC terpangkas 15%, dan daemon `zenithsw-engine` aktif berjalan normal.
