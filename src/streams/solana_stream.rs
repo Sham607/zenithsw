@@ -62,9 +62,10 @@ pub fn extract_native_sol_delta(meta: &Value, transaction: &Value, address: &str
         None => return 0.0,
     };
 
-    let account_idx = match account_keys.iter().position(|k| {
-        k.as_str() == Some(address) || k["pubkey"].as_str() == Some(address)
-    }) {
+    let account_idx = match account_keys
+        .iter()
+        .position(|k| k.as_str() == Some(address) || k["pubkey"].as_str() == Some(address))
+    {
         Some(idx) => idx,
         None => return 0.0,
     };
@@ -78,8 +79,14 @@ pub fn extract_native_sol_delta(meta: &Value, transaction: &Value, address: &str
         None => return 0.0,
     };
 
-    let pre_lamports = pre_balances.get(account_idx).and_then(Value::as_f64).unwrap_or(0.0);
-    let post_lamports = post_balances.get(account_idx).and_then(Value::as_f64).unwrap_or(0.0);
+    let pre_lamports = pre_balances
+        .get(account_idx)
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let post_lamports = post_balances
+        .get(account_idx)
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let fee_lamports = meta["fee"].as_f64().unwrap_or(0.0);
 
     let fee_offset = if account_idx == 0 { fee_lamports } else { 0.0 };
@@ -129,13 +136,8 @@ impl SolanaStreamListener {
         }
     }
 
-    fn get_rpc_url(&self) -> String {
-        let idx = self.current_rpc_idx.load(Ordering::Relaxed) % self.rpc_urls.len();
-        self.rpc_urls[idx].clone()
-    }
-
-    fn rotate_rpc(&self) {
-        self.current_rpc_idx.fetch_add(1, Ordering::Relaxed);
+    fn next_rpc_index(&self) -> usize {
+        self.current_rpc_idx.fetch_add(1, Ordering::Relaxed) % self.rpc_urls.len()
     }
 
     /// Checks the latest on-chain transaction for a Solana smart wallet with Multi-RPC Failover
@@ -171,9 +173,10 @@ impl SolanaStreamListener {
                 "params": [address, { "limit": 1 }]
             });
             let mut sig_items = None;
-            for _ in 0..self.rpc_urls.len() {
-                let rpc = self.get_rpc_url();
-                match self.client.post(&rpc).json(&sig_payload).send().await {
+            let start_idx = self.next_rpc_index();
+            for offset in 0..self.rpc_urls.len() {
+                let rpc = &self.rpc_urls[(start_idx + offset) % self.rpc_urls.len()];
+                match self.client.post(rpc).json(&sig_payload).send().await {
                     Ok(res) if res.status().is_success() => {
                         if let Ok(sig_json) = res.json::<Value>().await {
                             if let Some(arr) = sig_json["result"].as_array() {
@@ -182,7 +185,7 @@ impl SolanaStreamListener {
                             }
                         }
                     }
-                    _ => self.rotate_rpc(),
+                    _ => {}
                 }
             }
             let Some(arr) = sig_items.filter(|arr| !arr.is_empty()) else {
@@ -266,9 +269,10 @@ impl SolanaStreamListener {
 
         // Fallback ke pool RPC publik jika eksekusi Helius tidak tersedia / gagal
         if tx_result.is_none() {
-            for _ in 0..self.rpc_urls.len() {
-                let rpc = self.get_rpc_url();
-                match self.client.post(&rpc).json(&tx_payload).send().await {
+            let start_idx = self.next_rpc_index();
+            for offset in 0..self.rpc_urls.len() {
+                let rpc = &self.rpc_urls[(start_idx + offset) % self.rpc_urls.len()];
+                match self.client.post(rpc).json(&tx_payload).send().await {
                     Ok(res) if res.status().is_success() => {
                         if let Ok(tx_json) = res.json::<Value>().await {
                             if !tx_json["result"].is_null() {
@@ -277,9 +281,7 @@ impl SolanaStreamListener {
                             }
                         }
                     }
-                    _ => {
-                        self.rotate_rpc();
-                    }
+                    _ => {}
                 }
             }
         }
@@ -361,7 +363,8 @@ impl SolanaStreamListener {
             }
 
             if let Some((mint, delta, bal_before, bal_after)) = best {
-                let native_sol_delta = extract_native_sol_delta(meta, &tx_result["transaction"], address);
+                let native_sol_delta =
+                    extract_native_sol_delta(meta, &tx_result["transaction"], address);
                 // Delta quote asset di wallet yang sama = bukti pembayaran swap (Native SOL + WSOL + Stables).
                 let q = |m: &str| {
                     post_map.get(m).copied().unwrap_or(0.0) - pre_map.get(m).copied().unwrap_or(0.0)
@@ -842,7 +845,11 @@ mod tests {
                 ]
             }
         });
-        let delta = super::extract_native_sol_delta(&meta, &tx, "2UknaPAYpAEP6mbxHRy9mcBgZCHPLWVijQsPBFGJ7Fea");
+        let delta = super::extract_native_sol_delta(
+            &meta,
+            &tx,
+            "2UknaPAYpAEP6mbxHRy9mcBgZCHPLWVijQsPBFGJ7Fea",
+        );
         // -45.0 SOL net delta (fee offset added back to avoid priority fee confusion)
         assert!((delta - (-45.0)).abs() < 0.0001);
     }

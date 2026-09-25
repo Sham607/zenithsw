@@ -28,10 +28,7 @@ use sha3::{Digest, Keccak256};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MIN_GAS_RESERVE_WEI: u128 = 2_000_000_000_000_000; // 0.002 ETH
 const V3_FEE_TIERS: &[u32] = &[100, 500, 3000, 10000];
-const SLIPPAGE_BPS: u128 = 50; // 0.5%
-const DEADLINE_SECS: u64 = 120;
 
 struct V3SingleParams<'a> {
     token_in: &'a str,
@@ -516,10 +513,10 @@ impl EvmExecutor {
         let wallet = self.wallet_address()?;
         let amount_in = self.trade_amount_wei()?;
         let native_balance = parse_hex_quantity(&rpc.get_balance(&wallet, "latest").await?)?;
-        if native_balance < amount_in.saturating_add(MIN_GAS_RESERVE_WEI) {
+        if native_balance < amount_in.saturating_add(self.config.evm_gas_reserve_wei) {
             bail!(
                 "saldo native ETH tidak cukup; butuh {} wei, punya {}",
-                amount_in + MIN_GAS_RESERVE_WEI,
+                amount_in + self.config.evm_gas_reserve_wei,
                 native_balance
             );
         }
@@ -541,8 +538,9 @@ impl EvmExecutor {
         routes.sort_by_key(|route| std::cmp::Reverse(route.amount_out()));
         let best = routes.remove(0);
         let amount_out = best.amount_out();
-        let amount_out_min = amount_out.saturating_mul(10_000 - SLIPPAGE_BPS) / 10_000;
-        let deadline = now_unix()?.saturating_add(DEADLINE_SECS);
+        let amount_out_min =
+            amount_out.saturating_mul(10_000 - self.config.evm_slippage_bps) / 10_000;
+        let deadline = now_unix()?.saturating_add(self.config.evm_deadline_secs);
         println!("[ROBINHOOD] best route: {:?}", best);
         println!("[ROBINHOOD] amountOut={amount_out} amountOutMin={amount_out_min}");
 
@@ -723,7 +721,7 @@ impl EvmExecutor {
         let wallet = self.wallet_address()?;
         let amount_in = self.trade_amount_wei()?;
         let balance = parse_hex_quantity(&rpc.get_balance(&wallet, "latest").await?)?;
-        if balance < amount_in.saturating_add(MIN_GAS_RESERVE_WEI) {
+        if balance < amount_in.saturating_add(self.config.evm_gas_reserve_wei) {
             bail!("saldo ETH tidak cukup untuk live Robinhood BUY");
         }
         let routes = self.probe_routes(&rpc, &signal.token_mint, amount_in).await;
@@ -731,8 +729,11 @@ impl EvmExecutor {
             .into_iter()
             .max_by_key(RouteKind::amount_out)
             .ok_or_else(|| anyhow!("tidak ada route Robinhood tervalidasi"))?;
-        let amount_out_min = best.amount_out().saturating_mul(10_000 - SLIPPAGE_BPS) / 10_000;
-        let deadline = now_unix()?.saturating_add(DEADLINE_SECS);
+        let amount_out_min = best
+            .amount_out()
+            .saturating_mul(10_000 - self.config.evm_slippage_bps)
+            / 10_000;
+        let deadline = now_unix()?.saturating_add(self.config.evm_deadline_secs);
         let (calldata, router, value) = match &best {
             RouteKind::V3Single {
                 token_in,

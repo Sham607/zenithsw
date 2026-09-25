@@ -783,7 +783,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(config_stream.stream_poll_interval_ms)).await;
         }
     });
 
@@ -846,9 +846,11 @@ async fn main() -> Result<()> {
                         }
                     };
 
-                    // Sanity check: Discard single-tick anomaly if price jumps > 500% in one tick from an established price
+                    // Sanity check: Discard single-tick anomaly if price jumps > configured multiplier in one tick from an established price
                     if live_price > 0.0 {
-                        if pos.current_price > 0.0 && live_price > pos.current_price * 5.0 {
+                        if pos.current_price > 0.0
+                            && live_price > pos.current_price * config_pos.price_sanity_spike_mult
+                        {
                             eprintln!(
                                 "[PRICE SANITY GUARD 🛡️] Suspicious price spike for {} (${:.6} -> ${:.6}). Discarding unverified tick.",
                                 pos.token_symbol, pos.current_price, live_price
@@ -932,22 +934,22 @@ async fn main() -> Result<()> {
 
                         if config_pos.shadow_exit_enabled {
                             // =========================================================================
-                            // MODE A: WHALE SHADOW & RUNNER PROTOCOL (Multi-tier 50-25-25 + Moonbag)
+                            // MODE A: WHALE SHADOW & RUNNER PROTOCOL (Configured Multi-Tier Exit + Moonbag)
                             // =========================================================================
 
-                            // 1. Tier 1 Auto Take Profit (Sell 50% of initial position at +100% PnL to free-roll initial capital)
+                            // 1. Tier 1 Auto Take Profit (Sell configured % of initial position at TP1 PnL to free-roll initial capital)
                             if pos.unrealized_pnl_pct >= config_pos.take_profit_pct
                                 && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
                                 && pos.remaining_portion_pct >= 90.0
                             {
-                                println!("[AUTO-TP 1 (+{:.0}%) 🎯] Position {} ({}) reached +{:.1}% >= +{:.0}%! Selling 50% to secure capital (Free-Roll Mode)!",
-                                    config_pos.take_profit_pct, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.take_profit_pct);
+                                println!("[AUTO-TP 1 (+{:.0}%) 🎯] Position {} ({}) reached +{:.1}% >= +{:.0}%! Selling {:.0}% to secure capital (Free-Roll Mode)!",
+                                    config_pos.take_profit_pct, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.take_profit_pct, config_pos.tp1_portion_pct);
                                 match pos.chain {
                                     Chain::Solana => {
                                         if let Err(error) = sol_exec_pos
                                             .execute_partial_shadow_sell(
                                                 &pos.id,
-                                                50.0,
+                                                config_pos.tp1_portion_pct,
                                                 "AUTO_TP_50_FREE_ROLL",
                                                 live_price,
                                             )
@@ -960,7 +962,7 @@ async fn main() -> Result<()> {
                                         if let Err(error) = evm_exec_pos
                                             .execute_partial_shadow_sell(
                                                 &pos.id,
-                                                50.0,
+                                                config_pos.tp1_portion_pct,
                                                 "AUTO_TP_50_FREE_ROLL",
                                                 live_price,
                                             )
@@ -972,21 +974,23 @@ async fn main() -> Result<()> {
                                 }
                             }
 
-                            // 2. Tier 2 Moonbag Take Profit (Sell 25% of initial at configured TP2 PnL, leaving runner)
+                            // 2. Tier 2 Moonbag Take Profit (Sell configured % of initial at configured TP2 PnL, leaving runner)
                             let tp2_target_pnl = config_pos.take_profit_2_pct;
+                            let remaining_after_tp1 = 100.0 - config_pos.tp1_portion_pct;
+                            let moonbag_portion = remaining_after_tp1 - config_pos.tp2_portion_pct;
                             if pos.unrealized_pnl_pct >= tp2_target_pnl
                                 && pos.status == "PARTIAL_EXIT"
-                                && pos.remaining_portion_pct > 35.0
-                                && pos.remaining_portion_pct <= 55.0
+                                && pos.remaining_portion_pct > (moonbag_portion + 5.0)
+                                && pos.remaining_portion_pct <= (remaining_after_tp1 + 5.0)
                             {
-                                println!("[AUTO-TP 2 (+{:.0}%) 🚀] Position {} ({}) hit +{:.1}%! Selling 25% of initial position to lock moonbag gains!",
-                                    tp2_target_pnl, pos.id, pos.token_symbol, pos.unrealized_pnl_pct);
+                                println!("[AUTO-TP 2 (+{:.0}%) 🚀] Position {} ({}) hit +{:.1}%! Selling {:.0}% of initial position to lock moonbag gains!",
+                                    tp2_target_pnl, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.tp2_portion_pct);
                                 match pos.chain {
                                     Chain::Solana => {
                                         if let Err(error) = sol_exec_pos
                                             .execute_partial_shadow_sell(
                                                 &pos.id,
-                                                25.0,
+                                                config_pos.tp2_portion_pct,
                                                 "AUTO_TP_25_RUNNER_LOCK",
                                                 live_price,
                                             )
@@ -999,7 +1003,7 @@ async fn main() -> Result<()> {
                                         if let Err(error) = evm_exec_pos
                                             .execute_partial_shadow_sell(
                                                 &pos.id,
-                                                25.0,
+                                                config_pos.tp2_portion_pct,
                                                 "AUTO_TP_25_RUNNER_LOCK",
                                                 live_price,
                                             )
@@ -1012,12 +1016,13 @@ async fn main() -> Result<()> {
                             }
 
                             // 3. Tier 3 Catastrophic Peak Drawdown Guard on Runner / Moonbag
-                            // If price drops beyond configured % from peak after a 2x+ pump, dump remaining portion to prevent roundtripping to zero
+                            // If price drops beyond configured % from peak after a configured multiplier pump, dump remaining portion to prevent roundtripping to zero
                             let peak_drawdown_ratio = 1.0 - (config_pos.peak_drawdown_pct / 100.0);
                             if pos.status == "PARTIAL_EXIT"
-                                && pos.peak_price >= pos.entry_price * 2.0
+                                && pos.peak_price
+                                    >= pos.entry_price * config_pos.runner_min_pump_mult
                                 && pos.current_price <= pos.peak_price * peak_drawdown_ratio
-                                && pos.remaining_portion_pct <= 55.0
+                                && pos.remaining_portion_pct <= (remaining_after_tp1 + 5.0)
                             {
                                 println!("[PEAK DRAWDOWN GUARD 🛡️] Position {} ({}) dropped >{:.0}% from peak (${:.6} -> ${:.6})! Dumping remaining {:.0}% to lock profit!",
                                     pos.id, pos.token_symbol, config_pos.peak_drawdown_pct, pos.peak_price, pos.current_price, pos.remaining_portion_pct);
@@ -1050,12 +1055,14 @@ async fn main() -> Result<()> {
                             }
 
                             // 4. Profit-Lock Floor on Moonbag (locked once profit reaches the configured floor)
-                            // STRICT SAFETY: Must have reached at least +100% PnL initially and current PnL must be positive (> +5.0%)
+                            // STRICT SAFETY: Must have reached at least configured pump multiplier initially and current PnL must be positive (>= profit_lock_min_current_pnl_pct)
                             if pos.status == "PARTIAL_EXIT"
-                                && pos.peak_price >= pos.entry_price * 2.0
+                                && pos.peak_price
+                                    >= pos.entry_price * config_pos.runner_min_pump_mult
                                 && pos.unrealized_pnl_pct <= config_pos.profit_lock_floor_pct
-                                && pos.unrealized_pnl_pct >= 5.0
-                                && pos.remaining_portion_pct <= 55.0
+                                && pos.unrealized_pnl_pct
+                                    >= config_pos.profit_lock_min_current_pnl_pct
+                                && pos.remaining_portion_pct <= (remaining_after_tp1 + 5.0)
                             {
                                 println!("[PROFIT-LOCK FLOOR 🛡️] Position {} ({}) moonbag dropped to +{:.1}% (<= +{:.0}%)! Closing remaining portion to guarantee green trade!",
                                     pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.profit_lock_floor_pct);
@@ -1353,42 +1360,48 @@ async fn main() -> Result<()> {
 
     // Background worker for async on-chain balance & latency polling
     tokio::spawn(async move {
+        let mut last_known_sol_balance = 0.0;
         loop {
+            let solana_latency_start = Instant::now();
             let (wallet_pubkey, wallet_sol_balance) =
                 if let Ok((_, pubkey)) = sol_exec_metrics.get_keypair() {
-                    let bal = sol_exec_metrics
-                        .get_native_balance(&pubkey)
-                        .await
-                        .unwrap_or(0.0);
+                    let bal = match sol_exec_metrics.get_native_balance(&pubkey).await {
+                        Ok(b) => {
+                            last_known_sol_balance = b;
+                            b
+                        }
+                        Err(_) => last_known_sol_balance,
+                    };
                     (pubkey, bal)
                 } else {
                     (String::new(), 0.0)
                 };
+            let solana_latency_ms =
+                u64::try_from(solana_latency_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
             let sol_price_usd = sol_exec_metrics.get_sol_price().await.unwrap_or(0.0);
 
-            let solana_latency_start = Instant::now();
-            let onchain_tokens = if wallet_pubkey.is_empty() {
+            let onchain_tokens = if wallet_pubkey.is_empty() || config_hb.dry_run {
                 Vec::new()
             } else {
                 sol_exec_metrics
                     .get_all_wallet_token_balances(&wallet_pubkey)
                     .await
             };
-            let solana_latency_ms =
-                u64::try_from(solana_latency_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
             let mut total_tokens_usd = 0.0;
-            for (mint, amt) in onchain_tokens {
-                match SolanaStreamListener::fetch_token_price(&mint).await {
-                    Ok((_, price, _, _)) if price > 0.0 => {
-                        total_tokens_usd += amt * price;
-                    }
-                    Ok((_, price, _, _)) => {
-                        eprintln!("[HEARTBEAT PRICE SKIP] mint={mint} price={price} — tidak dihitung ke equity");
-                    }
-                    Err(error) => {
-                        eprintln!("[HEARTBEAT PRICE FAILED] mint={mint} error={error}");
+            if !config_hb.dry_run {
+                for (mint, amt) in onchain_tokens {
+                    match SolanaStreamListener::fetch_token_price(&mint).await {
+                        Ok((_, price, _, _)) if price > 0.0 => {
+                            total_tokens_usd += amt * price;
+                        }
+                        Ok((_, price, _, _)) => {
+                            eprintln!("[HEARTBEAT PRICE SKIP] mint={mint} price={price} — tidak dihitung ke equity");
+                        }
+                        Err(error) => {
+                            eprintln!("[HEARTBEAT PRICE FAILED] mint={mint} error={error}");
+                        }
                     }
                 }
             }
@@ -1473,7 +1486,15 @@ async fn main() -> Result<()> {
             let robinhood_latency_ms = metrics.robinhood_latency_ms;
             let total_tokens_usd = metrics.total_tokens_usd;
 
-            let open_positions_usd: f64 = if total_tokens_usd > 0.0 {
+            let open_positions_usd: f64 = if config_hb.dry_run {
+                active_positions
+                    .iter()
+                    .map(|p| {
+                        (p.amount_usd * (p.remaining_portion_pct / 100.0))
+                            * (1.0 + p.unrealized_pnl_pct / 100.0)
+                    })
+                    .sum()
+            } else if total_tokens_usd > 0.0 {
                 total_tokens_usd
             } else {
                 active_positions
@@ -1638,6 +1659,29 @@ async fn main() -> Result<()> {
             }
 
             sleep(Duration::from_secs(2)).await;
+        }
+    });
+
+    // Task 5: Database Self-Maintenance Worker (Runs every 1 hour)
+    let db_maintenance = db.clone();
+    tokio::spawn(async move {
+        // Run initial maintenance 10s after daemon boots
+        sleep(Duration::from_secs(10)).await;
+        loop {
+            match db_maintenance.run_database_maintenance() {
+                Ok(report) => {
+                    println!(
+                        "[DB MAINTENANCE ✅] Pruned: evidence={} stale_holdings={} snapshots={} | WAL checkpoint & optimize OK",
+                        report.deleted_evidence,
+                        report.deleted_stale_holdings,
+                        report.deleted_snapshots
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[DB MAINTENANCE ERROR ⚠️] Database maintenance gagal: {error}");
+                }
+            }
+            sleep(Duration::from_secs(3600)).await;
         }
     });
 

@@ -120,7 +120,11 @@ impl ReadOnlyRpcClient {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                if code == 429 || code == -32005 || message.to_lowercase().contains("too many requests") || message.to_lowercase().contains("rate limit") {
+                if code == 429
+                    || code == -32005
+                    || message.to_lowercase().contains("too many requests")
+                    || message.to_lowercase().contains("rate limit")
+                {
                     tokio::time::sleep(Duration::from_millis(1500)).await;
                 }
                 last_error = anyhow::anyhow!("RPC JSON-RPC error code={code} message={message}");

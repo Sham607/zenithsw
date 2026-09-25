@@ -673,13 +673,10 @@ mod tests {
         let mut holding_item = evidence(RadarEvidenceKind::TokenHolding, "wallet-a", true);
         holding_item.ui_amount = Some(50.0); // $5.0 < $100.0
         let swap_item = evidence(RadarEvidenceKind::DirectSwap, "wallet-a", true);
-        let result = reduce_portfolio_to_radar(
-            &[holding_item, swap_item],
-            &market(Some(0.1)),
-            policy(),
-        )
-        .unwrap()
-        .unwrap();
+        let result =
+            reduce_portfolio_to_radar(&[holding_item, swap_item], &market(Some(0.1)), policy())
+                .unwrap()
+                .unwrap();
         assert_eq!(result.status, RadarStatus::HighPriorityRadar);
         assert_eq!(result.qualified_holder_count, 1);
         assert_eq!(result.direct_accumulator_count, 1);

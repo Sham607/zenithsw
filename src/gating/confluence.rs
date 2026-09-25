@@ -134,13 +134,13 @@ impl ConfluenceEngine {
             });
         }
 
-        // 1c. Max Token Exposure Check on Active Positions ($50.0 max)
+        // 1c. Max Token Exposure Check on Active Positions
         // Note: Re-entry / DCA is explicitly allowed across distinct whales or the same accumulating whale
         if let Ok(active_positions) = self.db.get_active_positions() {
             if let Some(pos) = active_positions.iter().find(|p| {
                 p.token_mint.eq_ignore_ascii_case(&activity.token_mint) && p.chain == activity.chain
             }) {
-                let max_exposure_usd = 50.0;
+                let max_exposure_usd = self.config.max_token_exposure_usd;
                 let projected_exposure = pos.amount_usd + self.config.position_size_usd;
                 if !projected_exposure.is_finite() || projected_exposure > max_exposure_usd {
                     return Ok(ShadowSignal {
@@ -310,11 +310,11 @@ impl ConfluenceEngine {
         }
 
         // 2. Multi-Wallet Confluence Rule:
-        // By default ("TIER_S_OR_DUAL_A"): Tier-S & Tier-A solo direct execution; Tier-B requires >= 2 multi-wallet confluence
+        // By default ("TIER_S_OR_DUAL_A"): Tier-S & Tier-A solo direct execution; Tier-B requires >= min_confluence_buyers
         // If "ALL_TIERS_SOLO" or "ALLOW_ALL": Tier-B is also allowed to trigger solo
         let confluence_count = self
             .db
-            .count_recent_buyers_for_mint(&activity.token_mint, 300)
+            .count_recent_buyers_for_mint(&activity.token_mint, self.config.confluence_window_secs)
             .unwrap_or(1);
 
         let allow_solo = self
@@ -326,12 +326,15 @@ impl ConfluenceEngine {
                 .confluence_mode
                 .eq_ignore_ascii_case("ALLOW_ALL");
 
-        if !allow_solo && wallet.tier == WalletTier::TierB && confluence_count < 2 {
+        if !allow_solo
+            && wallet.tier == WalletTier::TierB
+            && confluence_count < self.config.tier_b_min_confluence_buyers
+        {
             is_passed = false;
             if rejection_reason.is_none() {
                 rejection_reason = Some(format!(
-                    "TIER_B_CONFLUENCE_REQUIRED (Tier: {}, Buyers: {} < 2)",
-                    wallet.tier, confluence_count
+                    "TIER_B_CONFLUENCE_REQUIRED (Tier: {}, Buyers: {} < {})",
+                    wallet.tier, confluence_count, self.config.tier_b_min_confluence_buyers
                 ));
             }
         }

@@ -545,3 +545,37 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
 - [x] Verifikasi Database & Operasional:
   - Binary release dikompilasi (`cargo build --release`) dan daemon `zenithsw-engine.service` di-restart aktif.
   - Rekam jejak historis token LinkedInu (`id: 672` dan `id: 1041`) di `wallet_activities` dikoreksi menjadi `BUY`.
+
+## [2026-09-25] Isolasi Total Kuota RPC: Dedicated Portfolio RPC & Penstabilan Equity TUI pada Mode Simulasi
+- [x] Masalah: Tampilan saldo portofolio pada TUI berkedip dan drop ke `0.0` karena rate limit HTTP 429 (`Solana RPC 540/756 fail=0 429=216`) dari pemindaian token akun fisik ke node RPC publik gratisan tiap 15 detik, padahal engine berjalan dalam mode simulasi (`DRY_RUN=true`).
+- [x] Solusi Arsitektur:
+  - Penambahan parameter konfigurasi `SOLANA_PORTFOLIO_RPC_URL`: Mengalokasikan endpoint RPC sekunder Helius khusus untuk pemindaian akun dompet bot sendiri, menjaga kanal `SOLANA_EXECUTION_RPC_URL` tetap steril hanya untuk eksekusi transaksi trading riil.
+  - Perutean Cerdas di `SolanaExecutor::post_rpc`: Permintaan baca saldo (`getBalance`, `getTokenAccountsByOwner`, `getTokenAccountBalance`, `getAccountInfo`) otomatis dialirkan ke `SOLANA_PORTFOLIO_RPC_URL` terlebih dahulu dengan fallback ke `rpc_urls`.
+  - Penyeleksian Mode `DRY_RUN` di Heartbeat Worker (`src/bin/engine.rs`): Pada mode simulasi, pembacaan token fisik on-chain dimatikan (`Vec::new()`) dan total modal portofolio (`open_positions_usd`) dihitung murni dari posisi virtual terbuka di database (`active_positions`), mencegah eksekusi kueri token kosong sisa uji coba.
+  - Proteksi Nilai Saldo SOL Transien: Menyimpan nilai saldo SOL valid terakhir jika terjadi kegagalan jaringan sementara agar tampilan antarmuka TUI tidak anjlok ke 0.
+- [x] Verifikasi Pengujian & Kompilasi:
+  - Test suite penuh: 229 passed (188 unit + 41 integration across all shards), 0 failed.
+  - Binary release dikompilasi sukses (`cargo build --release`).
+- [x] Verifikasi Operasional & IPC:
+  - File `.env` dan `.env.example` diperbarui dengan parameter `SOLANA_PORTFOLIO_RPC_URL`.
+  - Daemon `zenithsw-engine.service` di-restart dengan sukses (PID 251918).
+  - Probe socket IPC `/tmp/zenithsw.sock` mengonfirmasi: `Solana RPC: 3/3 fail=0 429=0`, `Equity USD: 117.93` (stabil dari 6 posisi virtual aktif), dan error 429 tereliminasi sepenuhnya.
+
+## [2026-09-25] Resolusi Bloat Database trading_state.db, Upsert TokenHolding Radar, & Self-Maintenance Otomatis
+- [x] Masalah:
+  - File `data/trading_state.db` membengkak hingga 706MB (+ WAL 209MB) akibat penumpukan 1.608.182 baris pada tabel `radar_evidence` (1.608.123 `TokenHolding`, 59 `DirectSwap`).
+  - Polling radar tiap 120s menyedot ~5.812 saldo akun token dari 17 whale dan menyimpannya berulang kali dengan timestamp baru.
+  - Query `DELETE` inline tanpa indeks pada kolom `observed_at` memicu full table scan dan lock contention SQLite, menahan thread IPC dan memicu status `[ENGINE: STALE HEARTBEAT 🔴]` di TUI.
+- [x] Solusi Teknis & Arsitektur:
+  - Pemisahan Karakter Data: Event transaksi `DirectSwap` (59 baris) dipertahankan utuh (*append-only*), sedangkan state saldo `TokenHolding` dialihkan ke model *upsert* berbasis `(chain, token_address, wallet_address)` (memperbarui saldo dan `observed_at` terbaru). Token baru lahir milik whale tetap tersimpan tanpa memicu ledakan baris.
+  - Penghapusan Inline Delete: Operasi `DELETE` dihapus total dari alur tulis `insert_radar_evidence_batch` agar hot-path ingestion tidak tertahan lock database.
+  - Indeks Database: Menambahkan indeks `idx_radar_evidence_observed_at` dan `idx_radar_market_observed_at` pada `src/db.rs`.
+  - Worker Self-Maintenance Berkala (Task 5 di `src/bin/engine.rs`): Menjalankan pembersihan terjadwal setiap 1 jam via method `run_database_maintenance()`. Pruning menghapus evidence kadaluarsa (>24 jam) dengan tetap menjaga record snapshot teranyar untuk tiap holding token aktif, menghapus riwayat market kadaluarsa (>7 hari), serta mengeksekusi `PRAGMA wal_checkpoint(PASSIVE)` dan `PRAGMA optimize`.
+  - Migrasi Data: Menjalankan skrip migrasi pemadatan dengan backup aman (`trading_state.db.bak_before_maintenance`), menyusutkan ukuran database dari >915MB menjadi 4.2MB (WAL 302KB).
+- [x] Verifikasi Pengujian & Kompilasi:
+  - Unit test `test_radar_evidence_upsert_and_maintenance` dibuat dan lulus.
+  - Test suite penuh: 229 passed (188 unit + 41 integration across all shards), 0 failed.
+  - Binary release dikompilasi sukses (`cargo build --release`).
+- [x] Verifikasi Operasional & IPC:
+  - Daemon `zenithsw-engine.service` diaktifkan kembali (PID 275002).
+  - Probe socket IPC mengonfirmasi stream heartbeat beruntun tanpa delay (`heartbeat_seq: 6..79`), responsivitas sub-detik, dan tidak ada lagi fenomena stale heartbeat.

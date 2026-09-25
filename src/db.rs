@@ -34,6 +34,13 @@ pub struct ExecutionIntentMetadata {
     pub expiry: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DatabaseMaintenanceReport {
+    pub deleted_evidence: usize,
+    pub deleted_stale_holdings: usize,
+    pub deleted_snapshots: usize,
+}
+
 pub struct SmartWalletDb {
     conn: Mutex<Connection>,
     wallet_conn: Option<Mutex<Connection>>,
@@ -441,6 +448,11 @@ impl SmartWalletDb {
              );
              CREATE INDEX IF NOT EXISTS idx_radar_evidence_token
                  ON radar_evidence(chain, token_address, observed_at);
+             CREATE INDEX IF NOT EXISTS idx_radar_evidence_observed
+                 ON radar_evidence(observed_at);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_radar_evidence_holding
+                 ON radar_evidence(chain, token_address, wallet_address)
+                 WHERE evidence_kind = 'TokenHolding';
              CREATE TABLE IF NOT EXISTS radar_market_snapshots (
                  chain TEXT NOT NULL,
                  token_address TEXT NOT NULL,
@@ -450,6 +462,8 @@ impl SmartWalletDb {
                  observed_at TEXT NOT NULL,
                  PRIMARY KEY(chain, token_address, observed_at)
              );
+             CREATE INDEX IF NOT EXISTS idx_radar_market_observed
+                 ON radar_market_snapshots(observed_at);
              CREATE TABLE IF NOT EXISTS radar_projections (
                  chain TEXT NOT NULL,
                  token_address TEXT NOT NULL,
@@ -537,8 +551,29 @@ impl SmartWalletDb {
         }
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_intents_signature
-             ON execution_intents(signature) WHERE signature IS NOT NULL;",
+             ON execution_intents(signature) WHERE signature IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_radar_evidence_observed
+                 ON radar_evidence(observed_at);
+             CREATE INDEX IF NOT EXISTS idx_radar_market_observed
+                 ON radar_market_snapshots(observed_at);",
         )?;
+        let _ = conn.execute(
+            "DELETE FROM radar_evidence
+             WHERE evidence_kind = 'TokenHolding'
+               AND id NOT IN (
+                   SELECT max(id)
+                   FROM radar_evidence
+                   WHERE evidence_kind = 'TokenHolding'
+                   GROUP BY chain, token_address, wallet_address
+               )",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_radar_evidence_holding
+             ON radar_evidence(chain, token_address, wallet_address)
+             WHERE evidence_kind = 'TokenHolding';",
+            [],
+        );
 
         let wallet_conn = if trading_path == wallet_path {
             None
@@ -765,7 +800,37 @@ impl SmartWalletDb {
             );
             CREATE INDEX IF NOT EXISTS idx_execution_intents_state ON execution_intents(state);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_intents_tx_hash ON execution_intents(tx_hash) WHERE tx_hash IS NOT NULL;
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_intents_signature ON execution_intents(signature) WHERE signature IS NOT NULL;",
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_intents_signature ON execution_intents(signature) WHERE signature IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS radar_evidence (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 chain TEXT NOT NULL,
+                 token_address TEXT NOT NULL,
+                 wallet_address TEXT NOT NULL,
+                 evidence_kind TEXT NOT NULL,
+                 tx_id TEXT,
+                 observed_at TEXT NOT NULL,
+                 cluster_id TEXT,
+                 qualified_wallet INTEGER NOT NULL CHECK (qualified_wallet IN (0,1)),
+                 UNIQUE(chain, token_address, wallet_address, evidence_kind, tx_id, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_radar_evidence_token
+                 ON radar_evidence(chain, token_address, observed_at);
+            CREATE INDEX IF NOT EXISTS idx_radar_evidence_observed
+                 ON radar_evidence(observed_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_radar_evidence_holding
+                 ON radar_evidence(chain, token_address, wallet_address)
+                 WHERE evidence_kind = 'TokenHolding';
+            CREATE TABLE IF NOT EXISTS radar_market_snapshots (
+                 chain TEXT NOT NULL,
+                 token_address TEXT NOT NULL,
+                 market_cap_usd REAL NOT NULL,
+                 liquidity_usd REAL NOT NULL,
+                 price_usd REAL,
+                 observed_at TEXT NOT NULL,
+                 PRIMARY KEY(chain, token_address, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_radar_market_observed
+                 ON radar_market_snapshots(observed_at);",
         )?;
 
         Ok(Self {
@@ -1246,28 +1311,40 @@ impl SmartWalletDb {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare_cached(
+            let mut stmt_holding = tx.prepare_cached(
+                "INSERT INTO radar_evidence
+                 (chain, token_address, wallet_address, evidence_kind, tx_id, observed_at, cluster_id, qualified_wallet)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(chain, token_address, wallet_address) WHERE evidence_kind = 'TokenHolding'
+                 DO UPDATE SET
+                     observed_at = excluded.observed_at,
+                     cluster_id = excluded.cluster_id,
+                     qualified_wallet = excluded.qualified_wallet",
+            )?;
+            let mut stmt_event = tx.prepare_cached(
                 "INSERT OR IGNORE INTO radar_evidence
                  (chain, token_address, wallet_address, evidence_kind, tx_id, observed_at, cluster_id, qualified_wallet)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for evidence in evidence_list {
-                stmt.execute(params![
+                let kind_str = format!("{:?}", evidence.kind);
+                let p = params![
                     evidence.chain.to_string(),
                     evidence.token_address,
                     evidence.wallet_address,
-                    format!("{:?}", evidence.kind),
+                    kind_str,
                     evidence.tx_id,
                     evidence.observed_at.to_rfc3339(),
                     evidence.cluster_id,
                     evidence.qualified_wallet as i32,
-                ])?;
+                ];
+                if evidence.kind == crate::radar::RadarEvidenceKind::TokenHolding {
+                    stmt_holding.execute(p)?;
+                } else {
+                    stmt_event.execute(p)?;
+                }
             }
         }
-        let _ = tx.execute(
-            "DELETE FROM radar_evidence WHERE observed_at < datetime('now', '-24 hours')",
-            [],
-        );
         tx.commit()?;
         Ok(())
     }
@@ -2198,7 +2275,11 @@ impl SmartWalletDb {
                 observed_at,
                 cluster_id: Some(handle),
                 qualified_wallet: true,
-                ui_amount: if token_amount > 0.0 { Some(token_amount) } else { None },
+                ui_amount: if token_amount > 0.0 {
+                    Some(token_amount)
+                } else {
+                    None
+                },
             })
         })?;
         let mut results = Vec::new();
@@ -2216,6 +2297,39 @@ impl SmartWalletDb {
             params![cutoff],
         )?;
         Ok(pruned)
+    }
+
+    pub fn run_database_maintenance(&self) -> Result<DatabaseMaintenanceReport> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff_24h = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let cutoff_48h = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+
+        let deleted_evidence = conn.execute(
+            "DELETE FROM radar_evidence WHERE observed_at < ?1 AND evidence_kind != 'TokenHolding'",
+            params![cutoff_24h],
+        )?;
+        let deleted_stale_holdings = conn.execute(
+            "DELETE FROM radar_evidence WHERE observed_at < ?1 AND evidence_kind = 'TokenHolding'",
+            params![cutoff_48h],
+        )?;
+        let deleted_snapshots = conn.execute(
+            "DELETE FROM radar_market_snapshots WHERE observed_at < ?1",
+            params![cutoff_24h],
+        )?;
+        let _ = conn.execute("PRAGMA wal_checkpoint(PASSIVE)", []);
+        let _ = conn.execute("PRAGMA optimize", []);
+
+        if let Some(w_conn) = &self.wallet_conn {
+            let guard = w_conn.lock().unwrap();
+            let _ = guard.execute("PRAGMA wal_checkpoint(PASSIVE)", []);
+            let _ = guard.execute("PRAGMA optimize", []);
+        }
+
+        Ok(DatabaseMaintenanceReport {
+            deleted_evidence,
+            deleted_stale_holdings,
+            deleted_snapshots,
+        })
     }
 
     pub fn get_radar_projections(&self, limit: usize) -> Result<Vec<RadarProjection>> {
@@ -2660,5 +2774,76 @@ mod scan_address_tests {
             extract_whale_alias("bunker_detweiler_sat_01", "@0xdetweiler"),
             "detweiler"
         );
+    }
+
+    #[test]
+    fn test_radar_evidence_upsert_and_maintenance() {
+        use crate::radar::{OnChainTokenEvidence, RadarEvidenceKind};
+        use chrono::Utc;
+
+        let db = super::SmartWalletDb::new_in_memory().unwrap();
+
+        let holding1 = OnChainTokenEvidence {
+            chain: Chain::Solana,
+            token_address: "TokenA".to_string(),
+            wallet_address: "Wallet1".to_string(),
+            kind: RadarEvidenceKind::TokenHolding,
+            tx_id: None,
+            observed_at: Utc::now() - chrono::Duration::hours(50),
+            cluster_id: Some("whales".to_string()),
+            qualified_wallet: true,
+            ui_amount: Some(100.0),
+        };
+
+        db.insert_radar_evidence_batch(std::slice::from_ref(&holding1))
+            .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM radar_evidence", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(conn);
+
+        let mut holding1_updated = holding1.clone();
+        holding1_updated.observed_at = Utc::now();
+        db.insert_radar_evidence_batch(&[holding1_updated]).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM radar_evidence", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "TokenHolding must be upserted, not duplicated");
+        drop(conn);
+
+        let swap = OnChainTokenEvidence {
+            chain: Chain::Solana,
+            token_address: "TokenA".to_string(),
+            wallet_address: "Wallet1".to_string(),
+            kind: RadarEvidenceKind::DirectSwap,
+            tx_id: Some("tx_sig_123".to_string()),
+            observed_at: Utc::now() - chrono::Duration::hours(30),
+            cluster_id: Some("whales".to_string()),
+            qualified_wallet: true,
+            ui_amount: Some(50.0),
+        };
+        db.insert_radar_evidence_batch(&[swap]).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM radar_evidence", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        drop(conn);
+
+        let report = db.run_database_maintenance().unwrap();
+        assert_eq!(report.deleted_evidence, 1);
+        assert_eq!(report.deleted_stale_holdings, 0);
+
+        let conn = db.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM radar_evidence", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "Only fresh TokenHolding remains");
     }
 }

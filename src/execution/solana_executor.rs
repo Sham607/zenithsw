@@ -220,10 +220,8 @@ impl SolanaExecutor {
             .filter(|url| !url.is_empty())
             .map(ToOwned::to_owned)
             .collect();
-        for fallback in ["https://api.mainnet-beta.solana.com"] {
-            if !rpc_urls.iter().any(|url| url == fallback) {
-                rpc_urls.push(fallback.to_string());
-            }
+        if rpc_urls.is_empty() {
+            rpc_urls.push("https://api.mainnet-beta.solana.com".to_string());
         }
         let count = rpc_urls.len();
         if count == 0 {
@@ -233,12 +231,40 @@ impl SolanaExecutor {
         let is_blockhash =
             payload.get("method").and_then(Value::as_str) == Some("getLatestBlockhash");
 
-        // Prioritas kanal presisi (Helius) untuk broadcast transaksi riil dan fetch blockhash kritis
+        // Prioritas kanal presisi (Helius Execution) untuk broadcast transaksi riil dan fetch blockhash kritis
         if is_broadcast || is_blockhash {
             if let Some(ref exec_rpc) = self.config.solana_execution_rpc_url {
                 self.rpc_requests.fetch_add(1, Ordering::Relaxed);
                 if let Ok(res) = self.client.post(exec_rpc).json(payload).send().await {
                     if res.status().is_success() {
+                        if let Ok(json) = res.json::<Value>().await {
+                            if json.get("error").is_none() && json.get("result").is_some() {
+                                self.rpc_successes.fetch_add(1, Ordering::Relaxed);
+                                return Ok(json);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prioritas kanal khusus (Helius Portfolio) untuk pembacaan saldo & kepemilikan akun token
+        let is_portfolio_read = matches!(
+            payload.get("method").and_then(Value::as_str),
+            Some(
+                "getBalance"
+                    | "getTokenAccountsByOwner"
+                    | "getTokenAccountBalance"
+                    | "getAccountInfo"
+            )
+        );
+        if is_portfolio_read {
+            if let Some(ref portfolio_rpc) = self.config.solana_portfolio_rpc_url {
+                self.rpc_requests.fetch_add(1, Ordering::Relaxed);
+                if let Ok(res) = self.client.post(portfolio_rpc).json(payload).send().await {
+                    if res.status().as_u16() == 429 {
+                        self.rpc_rate_limited.fetch_add(1, Ordering::Relaxed);
+                    } else if res.status().is_success() {
                         if let Ok(json) = res.json::<Value>().await {
                             if json.get("error").is_none() && json.get("result").is_some() {
                                 self.rpc_successes.fetch_add(1, Ordering::Relaxed);
@@ -759,7 +785,7 @@ impl SolanaExecutor {
             "denominatedInSol": if action == "buy" { "true" } else { "false" },
             "amount": amount,
             "slippage": slippage_pct,
-            "priorityFee": 0.005,
+            "priorityFee": self.config.solana_pumpfun_priority_fee,
             "pool": "pump"
         });
 
@@ -982,7 +1008,7 @@ impl SolanaExecutor {
                             "buy",
                             &signal.token_mint,
                             amount_native_sol,
-                            15.0,
+                            self.config.solana_pumpfun_slippage_pct,
                             &user_pubkey,
                         )
                         .await
@@ -1028,7 +1054,12 @@ impl SolanaExecutor {
                     );
 
                     match self
-                        .fetch_jupiter_quote(wsol_mint, &signal.token_mint, amount_lamports, 100)
+                        .fetch_jupiter_quote(
+                            wsol_mint,
+                            &signal.token_mint,
+                            amount_lamports,
+                            self.config.solana_buy_slippage_bps,
+                        )
                         .await
                     {
                         Ok(quote) => {
@@ -1366,15 +1397,15 @@ impl SolanaExecutor {
                             return Ok(());
                         }
 
-                        // Dynamic slippage: 500 bps for emergency cutloss, 300 bps for trailing/dump, 250 bps for TP
+                        // Dynamic slippage configured via config
                         let slippage_bps: u16 = if exit_reason.contains("EMERGENCY")
                             || exit_reason.contains("HARD_SL")
                         {
-                            500
+                            self.config.solana_sl_slippage_bps
                         } else if exit_reason.contains("PEAK") || exit_reason.contains("DUMP") {
-                            300
+                            self.config.solana_trailing_slippage_bps
                         } else {
-                            250
+                            self.config.solana_tp_slippage_bps
                         };
 
                         let is_pump_token = pos.token_mint.ends_with("pump");
@@ -1390,7 +1421,7 @@ impl SolanaExecutor {
                                     "sell",
                                     &pos.token_mint,
                                     sell_tokens_float,
-                                    15.0,
+                                    self.config.solana_pumpfun_slippage_pct,
                                     &user_pubkey,
                                     &signing_key,
                                 )

@@ -74,7 +74,8 @@ impl RadarRuntime {
         let buy_cutoff = Utc::now() - chrono::Duration::hours(24);
         if let Ok(recent_buys) = self.db.get_recent_buy_evidence(buy_cutoff, 100.0) {
             for mut buy in recent_buys {
-                if let Some(alias) = alias_map.get(&buy.wallet_address.trim().to_ascii_lowercase()) {
+                if let Some(alias) = alias_map.get(&buy.wallet_address.trim().to_ascii_lowercase())
+                {
                     buy.cluster_id = Some(alias.clone());
                 }
                 evidence.push(buy);
@@ -206,14 +207,14 @@ impl RadarRuntime {
                 min_market_cap_usd: self.config.min_market_cap_usd,
                 max_market_cap_usd: self.config.max_market_cap_usd,
                 min_liquidity_usd: self.config.min_liquidity_usd,
-                min_holding_value_usd: 100.0,
+                min_holding_value_usd: self.config.radar_min_holding_value_usd,
             },
         )?;
         let observed_at = Utc::now();
         for projection in &output.projections {
             self.db.insert_radar_projection(projection, observed_at)?;
         }
-        let prune_cutoff = observed_at - chrono::Duration::minutes(30);
+        let prune_cutoff = observed_at - chrono::Duration::minutes(self.config.radar_prune_minutes);
         let _ = self.db.prune_stale_radar_projections(prune_cutoff);
         self.ipc.broadcast(&IpcMessage::RadarSync {
             projections: output.projections.clone(),

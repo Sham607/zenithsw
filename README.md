@@ -85,6 +85,7 @@ Aturan umum yang dipakai lintas executor:
 Sistem radar mendeteksi aset pantauan whale secara asimetris untuk mencegah polusi token *dust* dan *airdrop spam*:
 - **Jalur Saldo Pasif (`StructureConfirmed`)**: Token terdaftar di DexScreener wajib memiliki total nilai saldo kepemilikan whale $\ge$ $100 USD (`ui_amount * price_usd >= 100.0`). Koin debu di bawah $100 USD dibuang dari proyeksi radar.
 - **Jalur Transaksi Aktif (`HighPriorityRadar`)**: Transaksi beli baru (`BUY` / `DirectSwap`) oleh whale $\ge$ $100 USD dalam 24 jam terakhir langsung diproyeksikan ke baris prioritas radar TUI, mendukung token tahap pra-DEX / Pump.fun.
+- **Deduplikasi State & Transaksi Bersih**: Saldo snapshot kepemilikan whale (`TokenHolding`) dikelola melalui *upsert* berbasis `(chain, token_address, wallet_address)`. Ini menjaga pembacaan token baru whale tanpa membengkakkan database secara eksponensial. Transaksi pembelian whale (`DirectSwap`) tetap dipertahankan penuh (*append-only*).
 - **Pruning Otomatis**: Proyeksi radar yang tidak lagi memenuhi kualifikasi dibersihkan otomatis setiap siklus agar data TUI selalu relevan dan bersih.
 
 ### Strategi Exit Terbifurkasi (`SHADOW_EXIT_ENABLED`)
@@ -220,6 +221,12 @@ data/candidate_wallet_registry.db kandidat belum dipromosikan
 ```
 
 Kedua database memakai SQLite WAL. Jangan menghapus atau mereset database tanpa backup dan persetujuan eksplisit. `make reset` bersifat destruktif terhadap state runtime dan tidak boleh dipakai sembarangan.
+
+### Self-Maintenance & Health Guard Database
+- **Indexing Kolom Timestamp**: Kolom `observed_at` pada tabel `radar_evidence` dan `radar_market_history` diproteksi indeks SQLite B-tree untuk mencegah degradasi performa (*full-table scan*) saat pembersihan data.
+- **Background Maintenance Worker**: Dijalankan secara terisolasi oleh background task setiap 1 jam (`src/bin/engine.rs`).
+- **Pruning Terjadwal**: Menghapus `radar_evidence` kadaluarsa (>24 jam) dengan menyisakan state snapshot token teranyar, memangkas `radar_market_history` (>7 hari), serta mengeksekusi `PRAGMA wal_checkpoint(PASSIVE)` dan `PRAGMA optimize`.
+- **Zero Heartbeat Lock Contention**: Operasi `DELETE` dan optimasi I/O besar dipindahkan seluruhnya dari alur tulis streaming/radar ke background worker, menjaga IPC heartbeat TUI tetap lancar (`<10ms`) tanpa risiko *stale heartbeat*.
 
 ## Menjalankan
 

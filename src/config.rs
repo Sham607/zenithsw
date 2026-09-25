@@ -10,6 +10,7 @@ pub struct Config {
     pub solana_rpc_url: String,
     pub solana_ws_url: String,
     pub solana_execution_rpc_url: Option<String>,
+    pub solana_portfolio_rpc_url: Option<String>,
     pub solana_private_key: Option<String>,
 
     // Robinhood Chain settings
@@ -26,28 +27,52 @@ pub struct Config {
     pub min_liquidity_usd: f64,   // Min $30,000 liquidity in pool
     pub position_size_usd: f64,   // $15 default position size
     pub min_whale_buy_usd: f64,   // Min $250 whale order size to filter dust transactions
+    pub max_token_exposure_usd: f64, // Max $50 aggregated exposure per token mint
     pub max_price_impact_pct: f64, // Max 15.0% price impact on pool to prevent buying local tops
+    pub price_sanity_spike_mult: f64, // Max single-tick price multiplier (e.g. 5.0x / 500%)
     pub min_market_cap_usd: f64,  // Min $50k market cap
     pub max_market_cap_usd: f64,  // Max $20M market cap
+    pub confluence_window_secs: i64, // Window for confluence counting (e.g. 300s)
+    pub tier_b_min_confluence_buyers: u32, // Minimum buyers for Tier-B solo trigger (e.g. 2)
     pub trailing_stop_pct: f64,   // 10% trailing stop
     pub trailing_stop_trigger_pct: f64, // Activation threshold for trailing stop (e.g. 35%)
     pub stop_loss_pct: f64,       // 15% stop loss
     pub take_profit_pct: f64,     // 100% take profit trigger (50% partial exit)
     pub take_profit_2_pct: f64,   // Tier 2 take profit (e.g. 300% / 4x)
-    pub liquidity_drain_usd: f64, // Floor for emergency exit on liquidity collapse
-    pub peak_drawdown_pct: f64,   // Max drop % from peak for moonbag exit (e.g. 50%)
-    pub profit_lock_floor_pct: f64, // Minimum positive profit floor on moonbag (e.g. 20%)
-    pub whale_full_dump_pct: f64, // Whale sell % triggering 100% mirror dump (e.g. 95%)
+    pub tp1_portion_pct: f64,     // Portion % to exit at TP1 (e.g. 50%)
+    pub tp2_portion_pct: f64,     // Portion % to exit at TP2 (e.g. 25%)
+    pub runner_min_pump_mult: f64, // Minimum pump multiplier from entry to arm runner protections (e.g. 2.0x)
+    pub profit_lock_min_current_pnl_pct: f64, // Minimum current PnL % to trigger profit-lock floor exit (e.g. 5%)
+    pub liquidity_drain_usd: f64,             // Floor for emergency exit on liquidity collapse
+    pub peak_drawdown_pct: f64,               // Max drop % from peak for moonbag exit (e.g. 50%)
+    pub profit_lock_floor_pct: f64,           // Minimum positive profit floor on moonbag (e.g. 20%)
+    pub whale_full_dump_pct: f64,             // Whale sell % triggering 100% mirror dump (e.g. 95%)
+
+    // On-Chain Execution Parameters
+    pub solana_buy_slippage_bps: u16, // Jupiter buy slippage bps (e.g. 100 bps)
+    pub solana_tp_slippage_bps: u16,  // Jupiter TP sell slippage bps (e.g. 250 bps)
+    pub solana_trailing_slippage_bps: u16, // Jupiter trailing sell slippage bps (e.g. 300 bps)
+    pub solana_sl_slippage_bps: u16,  // Jupiter emergency hard SL slippage bps (e.g. 500 bps)
+    pub solana_pumpfun_slippage_pct: f64, // PumpPortal slippage % (e.g. 15.0%)
+    pub solana_pumpfun_priority_fee: f64, // PumpPortal priority fee SOL (e.g. 0.005 SOL)
+    pub evm_slippage_bps: u128,       // EVM swap slippage bps (e.g. 50 bps)
+    pub evm_gas_reserve_wei: u128,    // EVM minimum gas reserve in wei (e.g. 0.002 ETH)
+    pub evm_deadline_secs: u64,       // EVM swap deadline in seconds (e.g. 120s)
+
+    // Radar Parameters
+    pub radar_min_holding_value_usd: f64, // Min holding USD to qualify for radar projection (e.g. 100.0)
+    pub radar_prune_minutes: i64,         // Radar stale projection prune cutoff minutes (e.g. 30)
+
     pub quarantine_base_minutes: u64, // Base cooldown duration for failed tokens
-    pub quarantine_max_minutes: u64, // Maximum cooldown cap for failed tokens
+    pub quarantine_max_minutes: u64,  // Maximum cooldown cap for failed tokens
     pub demote_consecutive_losses: u32, // Number of consecutive losses to demote whale
     pub demote_catastrophic_loss_pct: f64, // Single-trade loss % to trigger demotion
-    pub shadow_exit_enabled: bool, // Mirror sell when whale dumps
-    pub bot_take_profit_pct: f64, // Bot autonomous 100% TP (when shadow_exit_enabled=false)
-    pub bot_stop_loss_pct: f64,   // Bot autonomous 100% SL (when shadow_exit_enabled=false)
+    pub shadow_exit_enabled: bool,    // Mirror sell when whale dumps
+    pub bot_take_profit_pct: f64,     // Bot autonomous 100% TP (when shadow_exit_enabled=false)
+    pub bot_stop_loss_pct: f64,       // Bot autonomous 100% SL (when shadow_exit_enabled=false)
     pub bot_trailing_stop_trigger_pct: f64, // Bot autonomous trailing trigger
-    pub bot_trailing_stop_pct: f64, // Bot autonomous trailing drop %
-    pub confluence_mode: String,  // "TIER_S_OR_DUAL_A"
+    pub bot_trailing_stop_pct: f64,   // Bot autonomous trailing drop %
+    pub confluence_mode: String,      // "TIER_S_OR_DUAL_A"
     pub dry_run: bool,
     pub sim_initial_balance: f64, // Virtual cash balance in dry_run mode
     /// Live Robinhood gate tambahan; tidak cukup sendiri untuk broadcast.
@@ -185,8 +210,11 @@ fn optional_positive_f64(name: &str) -> Result<Option<f64>> {
 
 fn optional_positive_u64(name: &str) -> Result<()> {
     if let Ok(value) = env::var(name) {
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(());
+        }
         let parsed = value
-            .trim()
             .parse::<u64>()
             .map_err(|error| anyhow::anyhow!("{name} tidak valid: {error}"))?;
         if parsed == 0 {
@@ -199,6 +227,9 @@ fn optional_positive_u64(name: &str) -> Result<()> {
 fn optional_hex_address(name: &str) -> Result<()> {
     if let Ok(value) = env::var(name) {
         let value = value.trim();
+        if value.is_empty() {
+            return Ok(());
+        }
         if value.len() != 42
             || !value.starts_with("0x")
             || !value[2..]
@@ -248,6 +279,13 @@ impl Config {
         if let Some(ref url) = solana_execution_rpc_url {
             validate_url("SOLANA_EXECUTION_RPC_URL", url, &["http://", "https://"])?;
         }
+        let solana_portfolio_rpc_url = env::var("SOLANA_PORTFOLIO_RPC_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(ref url) = solana_portfolio_rpc_url {
+            validate_url("SOLANA_PORTFOLIO_RPC_URL", url, &["http://", "https://"])?;
+        }
         let robinhood_rpc_url = required("ROBINHOOD_RPC_URL")?;
         validate_url(
             "ROBINHOOD_RPC_URL",
@@ -265,18 +303,38 @@ impl Config {
         let min_liquidity_usd = parse_value("MIN_LIQUIDITY_USD", 15000.0f64)?;
         let position_size_usd = parse_value("POSITION_SIZE_USD", 10.0f64)?;
         let min_whale_buy_usd = parse_value("MIN_WHALE_BUY_USD", 50.0f64)?;
+        let max_token_exposure_usd = parse_value("MAX_TOKEN_EXPOSURE_USD", 50.0f64)?;
         let max_price_impact_pct = parse_value("MAX_PRICE_IMPACT_PCT", 15.0f64)?;
+        let price_sanity_spike_mult = parse_value("PRICE_SANITY_SPIKE_MULT", 5.0f64)?;
         let min_market_cap_usd = parse_value("MIN_MARKET_CAP_USD", 50000.0f64)?;
         let max_market_cap_usd = parse_value("MAX_MARKET_CAP_USD", 20000000.0f64)?;
+        let confluence_window_secs = parse_value("CONFLUENCE_WINDOW_SECS", 300i64)?;
+        let tier_b_min_confluence_buyers = parse_value("TIER_B_MIN_CONFLUENCE_BUYERS", 2u32)?;
         let trailing_stop_pct = parse_value("TRAILING_STOP_PCT", 10.0f64)?;
         let trailing_stop_trigger_pct = parse_value("TRAILING_STOP_TRIGGER_PCT", 35.0f64)?;
         let stop_loss_pct = parse_value("STOP_LOSS_PCT", 15.0f64)?;
         let take_profit_pct = parse_value("TAKE_PROFIT_PCT", 100.0f64)?;
         let take_profit_2_pct = parse_value("TAKE_PROFIT_2_PCT", 300.0f64)?;
+        let tp1_portion_pct = parse_value("TP1_PORTION_PCT", 50.0f64)?;
+        let tp2_portion_pct = parse_value("TP2_PORTION_PCT", 25.0f64)?;
+        let runner_min_pump_mult = parse_value("RUNNER_MIN_PUMP_MULT", 2.0f64)?;
+        let profit_lock_min_current_pnl_pct =
+            parse_value("PROFIT_LOCK_MIN_CURRENT_PNL_PCT", 5.0f64)?;
         let liquidity_drain_usd = parse_value("LIQUIDITY_DRAIN_USD", 10000.0f64)?;
         let peak_drawdown_pct = parse_value("PEAK_DRAWDOWN_PCT", 50.0f64)?;
         let profit_lock_floor_pct = parse_value("PROFIT_LOCK_FLOOR_PCT", 20.0f64)?;
         let whale_full_dump_pct = parse_value("WHALE_FULL_DUMP_PCT", 95.0f64)?;
+        let solana_buy_slippage_bps = parse_value("SOLANA_BUY_SLIPPAGE_BPS", 100u16)?;
+        let solana_tp_slippage_bps = parse_value("SOLANA_TP_SLIPPAGE_BPS", 250u16)?;
+        let solana_trailing_slippage_bps = parse_value("SOLANA_TRAILING_SLIPPAGE_BPS", 300u16)?;
+        let solana_sl_slippage_bps = parse_value("SOLANA_SL_SLIPPAGE_BPS", 500u16)?;
+        let solana_pumpfun_slippage_pct = parse_value("SOLANA_PUMPFUN_SLIPPAGE_PCT", 15.0f64)?;
+        let solana_pumpfun_priority_fee = parse_value("SOLANA_PUMPFUN_PRIORITY_FEE", 0.005f64)?;
+        let evm_slippage_bps = parse_value("EVM_SLIPPAGE_BPS", 50u128)?;
+        let evm_gas_reserve_wei = parse_value("EVM_GAS_RESERVE_WEI", 2_000_000_000_000_000u128)?;
+        let evm_deadline_secs = parse_value("EVM_DEADLINE_SECS", 120u64)?;
+        let radar_min_holding_value_usd = parse_value("RADAR_MIN_HOLDING_VALUE_USD", 100.0f64)?;
+        let radar_prune_minutes = parse_value("RADAR_PRUNE_MINUTES", 30i64)?;
         let bot_take_profit_pct = parse_value("BOT_TAKE_PROFIT_PCT", 50.0f64)?;
         let bot_stop_loss_pct = parse_value("BOT_STOP_LOSS_PCT", 20.0f64)?;
         let bot_trailing_stop_trigger_pct = parse_value("BOT_TRAILING_STOP_TRIGGER_PCT", 30.0f64)?;
@@ -291,7 +349,9 @@ impl Config {
             ("MIN_LIQUIDITY_USD", min_liquidity_usd),
             ("POSITION_SIZE_USD", position_size_usd),
             ("MIN_WHALE_BUY_USD", min_whale_buy_usd),
+            ("MAX_TOKEN_EXPOSURE_USD", max_token_exposure_usd),
             ("MAX_PRICE_IMPACT_PCT", max_price_impact_pct),
+            ("PRICE_SANITY_SPIKE_MULT", price_sanity_spike_mult),
             ("MIN_MARKET_CAP_USD", min_market_cap_usd),
             ("MAX_MARKET_CAP_USD", max_market_cap_usd),
             ("TRAILING_STOP_PCT", trailing_stop_pct),
@@ -299,10 +359,20 @@ impl Config {
             ("STOP_LOSS_PCT", stop_loss_pct),
             ("TAKE_PROFIT_PCT", take_profit_pct),
             ("TAKE_PROFIT_2_PCT", take_profit_2_pct),
+            ("TP1_PORTION_PCT", tp1_portion_pct),
+            ("TP2_PORTION_PCT", tp2_portion_pct),
+            ("RUNNER_MIN_PUMP_MULT", runner_min_pump_mult),
+            (
+                "PROFIT_LOCK_MIN_CURRENT_PNL_PCT",
+                profit_lock_min_current_pnl_pct,
+            ),
             ("LIQUIDITY_DRAIN_USD", liquidity_drain_usd),
             ("PEAK_DRAWDOWN_PCT", peak_drawdown_pct),
             ("PROFIT_LOCK_FLOOR_PCT", profit_lock_floor_pct),
             ("WHALE_FULL_DUMP_PCT", whale_full_dump_pct),
+            ("SOLANA_PUMPFUN_SLIPPAGE_PCT", solana_pumpfun_slippage_pct),
+            ("SOLANA_PUMPFUN_PRIORITY_FEE", solana_pumpfun_priority_fee),
+            ("RADAR_MIN_HOLDING_VALUE_USD", radar_min_holding_value_usd),
             ("BOT_TAKE_PROFIT_PCT", bot_take_profit_pct),
             ("BOT_STOP_LOSS_PCT", bot_stop_loss_pct),
             (
@@ -315,6 +385,32 @@ impl Config {
             if !value.is_finite() || value <= 0.0 {
                 anyhow::bail!("{name} harus finite dan lebih besar dari nol");
             }
+        }
+        if tp1_portion_pct >= 100.0 {
+            anyhow::bail!("TP1_PORTION_PCT harus kurang dari 100");
+        }
+        if tp2_portion_pct >= 100.0 {
+            anyhow::bail!("TP2_PORTION_PCT harus kurang dari 100");
+        }
+        if tp1_portion_pct + tp2_portion_pct >= 100.0 {
+            anyhow::bail!(
+                "TP1_PORTION_PCT + TP2_PORTION_PCT harus kurang dari 100 untuk menyisakan moonbag"
+            );
+        }
+        if runner_min_pump_mult <= 1.0 {
+            anyhow::bail!("RUNNER_MIN_PUMP_MULT harus lebih besar dari 1.0");
+        }
+        if confluence_window_secs <= 0 {
+            anyhow::bail!("CONFLUENCE_WINDOW_SECS harus lebih besar dari nol");
+        }
+        if tier_b_min_confluence_buyers == 0 {
+            anyhow::bail!("TIER_B_MIN_CONFLUENCE_BUYERS harus lebih besar dari nol");
+        }
+        if evm_deadline_secs == 0 {
+            anyhow::bail!("EVM_DEADLINE_SECS harus lebih besar dari nol");
+        }
+        if radar_prune_minutes <= 0 {
+            anyhow::bail!("RADAR_PRUNE_MINUTES harus lebih besar dari nol");
         }
         if quarantine_base_minutes == 0 {
             anyhow::bail!("QUARANTINE_BASE_MINUTES harus lebih besar dari nol");
@@ -385,6 +481,7 @@ impl Config {
             solana_rpc_url,
             solana_ws_url,
             solana_execution_rpc_url,
+            solana_portfolio_rpc_url,
             solana_private_key: env::var("SOLANA_PRIVATE_KEY").ok(),
             robinhood_rpc_url,
             robinhood_ws_url,
@@ -399,18 +496,37 @@ impl Config {
             min_liquidity_usd,
             position_size_usd,
             min_whale_buy_usd,
+            max_token_exposure_usd,
             max_price_impact_pct,
+            price_sanity_spike_mult,
             min_market_cap_usd,
             max_market_cap_usd,
+            confluence_window_secs,
+            tier_b_min_confluence_buyers,
             trailing_stop_pct,
             trailing_stop_trigger_pct,
             stop_loss_pct,
             take_profit_pct,
             take_profit_2_pct,
+            tp1_portion_pct,
+            tp2_portion_pct,
+            runner_min_pump_mult,
+            profit_lock_min_current_pnl_pct,
             liquidity_drain_usd,
             peak_drawdown_pct,
             profit_lock_floor_pct,
             whale_full_dump_pct,
+            solana_buy_slippage_bps,
+            solana_tp_slippage_bps,
+            solana_trailing_slippage_bps,
+            solana_sl_slippage_bps,
+            solana_pumpfun_slippage_pct,
+            solana_pumpfun_priority_fee,
+            evm_slippage_bps,
+            evm_gas_reserve_wei,
+            evm_deadline_secs,
+            radar_min_holding_value_usd,
+            radar_prune_minutes,
             quarantine_base_minutes,
             quarantine_max_minutes,
             demote_consecutive_losses,
