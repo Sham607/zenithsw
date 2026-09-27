@@ -10,8 +10,10 @@ use chrono::Utc;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 const RADAR_INTERVAL_SECS: u64 = 120;
@@ -23,6 +25,9 @@ pub struct RadarRuntime {
     db: Arc<SmartWalletDb>,
     ipc: Arc<IpcServer>,
     market_client: Client,
+    dead_tokens: Arc<RwLock<HashMap<String, Instant>>>,
+    holding_cursor: AtomicUsize,
+    market_cache: Arc<RwLock<HashMap<(Chain, String), (crate::radar::RadarMarketSnapshot, Instant)>>>,
 }
 
 impl RadarRuntime {
@@ -35,6 +40,9 @@ impl RadarRuntime {
                 .timeout(Duration::from_secs(10))
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 .build()?,
+            dead_tokens: Arc::new(RwLock::new(HashMap::new())),
+            holding_cursor: AtomicUsize::new(0),
+            market_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -112,7 +120,7 @@ impl RadarRuntime {
             }
         }
 
-        let mut candidates: Vec<TokenScanCandidate> = token_stats
+        let candidates: Vec<TokenScanCandidate> = token_stats
             .into_iter()
             .map(
                 |(token_address, (has_direct_swap, wallets, latest_observed_at))| {
@@ -126,20 +134,55 @@ impl RadarRuntime {
             )
             .collect();
 
-        candidates.sort_by(|a, b| {
-            b.has_direct_swap
-                .cmp(&a.has_direct_swap)
-                .then_with(|| b.wallet_count.cmp(&a.wallet_count))
+        let dead_cutoff = Duration::from_secs(3600);
+        let dead_snapshot = {
+            let dead = self.dead_tokens.read().await;
+            dead.clone()
+        };
+
+        let mut direct_candidates = Vec::new();
+        let mut holding_candidates = Vec::new();
+
+        for candidate in candidates {
+            if candidate.has_direct_swap {
+                direct_candidates.push(candidate);
+            } else {
+                let is_dead = dead_snapshot
+                    .get(&candidate.token_address)
+                    .map(|t| t.elapsed() < dead_cutoff)
+                    .unwrap_or(false);
+                if !is_dead {
+                    holding_candidates.push(candidate);
+                }
+            }
+        }
+
+        direct_candidates.sort_by(|a, b| b.latest_observed_at.cmp(&a.latest_observed_at));
+        holding_candidates.sort_by(|a, b| {
+            b.wallet_count
+                .cmp(&a.wallet_count)
                 .then_with(|| b.latest_observed_at.cmp(&a.latest_observed_at))
         });
 
-        let tokens: Vec<String> = candidates
-            .into_iter()
-            .take(MAX_MARKET_TOKENS_PER_CYCLE)
-            .map(|c| c.token_address)
-            .collect();
-        let mut markets = HashMap::new();
+        let mut tokens: Vec<String> = Vec::new();
+        for c in direct_candidates {
+            tokens.push(c.token_address);
+        }
+
+        let remaining_slots = MAX_MARKET_TOKENS_PER_CYCLE.saturating_sub(tokens.len());
+        if remaining_slots > 0 && !holding_candidates.is_empty() {
+            let cursor = self
+                .holding_cursor
+                .fetch_add(remaining_slots, Ordering::Relaxed);
+            let start = cursor % holding_candidates.len();
+            for i in 0..remaining_slots.min(holding_candidates.len()) {
+                let idx = (start + i) % holding_candidates.len();
+                tokens.push(holding_candidates[idx].token_address.clone());
+            }
+        }
+
         for token in tokens {
+            sleep(Duration::from_millis(50)).await;
             let response = match self
                 .market_client
                 .get(format!("{DEXSCREENER_URL}{token}"))
@@ -153,6 +196,12 @@ impl RadarRuntime {
                 }
             };
             if !response.status().is_success() {
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    self.dead_tokens
+                        .write()
+                        .await
+                        .insert(token.clone(), Instant::now());
+                }
                 continue;
             }
             let body: Value = match response.json().await {
@@ -167,14 +216,34 @@ impl RadarRuntime {
                 Ok(Some(snapshot)) => {
                     self.db
                         .insert_radar_market_snapshot(&snapshot, &token, Chain::Solana)?;
-                    markets.insert((Chain::Solana, token), snapshot);
+                    let mut cache = self.market_cache.write().await;
+                    cache.insert((Chain::Solana, token.clone()), (snapshot, Instant::now()));
                 }
                 Ok(None) => {
                     eprintln!("[RADAR MARKET SKIP] token={token} tidak memiliki pair Solana valid");
+                    self.dead_tokens
+                        .write()
+                        .await
+                        .insert(token.clone(), Instant::now());
                 }
                 Err(error) => {
                     eprintln!("[RADAR MARKET SKIP] token={token} response invalid: {error}");
+                    if error.to_string().contains("missing pairs") {
+                        self.dead_tokens
+                            .write()
+                            .await
+                            .insert(token.clone(), Instant::now());
+                    }
                 }
+            }
+        }
+
+        let mut markets = HashMap::new();
+        {
+            let mut cache = self.market_cache.write().await;
+            cache.retain(|_, (_, instant)| instant.elapsed() < Duration::from_secs(1800));
+            for (k, (snap, _)) in cache.iter() {
+                markets.insert(k.clone(), snap.clone());
             }
         }
 
@@ -236,11 +305,16 @@ impl RadarRuntime {
             if let Ok(bars) = crate::radar::parse_gecko_ohlcv(&body) {
                 let (structure, action) = crate::radar::compute_market_structure_and_action(&bars);
                 if let Some(snap) = markets.get_mut(&(Chain::Solana, token.clone())) {
-                    snap.market_structure = structure;
-                    snap.price_action = action;
+                    snap.market_structure = structure.clone();
+                    snap.price_action = action.clone();
                     let _ = self
                         .db
                         .insert_radar_market_snapshot(snap, &token, Chain::Solana);
+                }
+                let mut cache = self.market_cache.write().await;
+                if let Some(cached) = cache.get_mut(&(Chain::Solana, token.clone())) {
+                    cached.0.market_structure = structure;
+                    cached.0.price_action = action;
                 }
             }
         }

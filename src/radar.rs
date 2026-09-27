@@ -149,6 +149,7 @@ pub fn parse_market_snapshot(
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("market response missing pairs"))?;
     let mut best: Option<RadarMarketSnapshot> = None;
+    let mut last_error: Option<anyhow::Error> = None;
     for pair in pairs {
         if pair.get("chainId").and_then(Value::as_str) != Some(market_chain_id(chain)) {
             continue;
@@ -167,7 +168,13 @@ pub fn parse_market_snapshot(
         if !token_matches {
             continue;
         }
-        let market_cap_usd = finite_number(pair.get("marketCap"), "marketCap")?;
+        let market_cap_usd = match finite_number(pair.get("marketCap"), "marketCap") {
+            Ok(v) => v,
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        };
         let pool_address = pair
             .get("pairAddress")
             .and_then(Value::as_str)
@@ -189,15 +196,26 @@ pub fn parse_market_snapshot(
         let change_24h_pct = price_change("h24");
         let change_6h_pct = price_change("h6");
         let change_1h_pct = price_change("h1");
-        let liquidity_usd = finite_number(
+        let liquidity_usd = match finite_number(
             pair.get("liquidity").and_then(|value| value.get("usd")),
             "liquidity.usd",
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        };
         let price_usd = match pair.get("priceUsd") {
             None | Some(Value::Null) => None,
-            Some(value) => {
-                Some(finite_number(Some(value), "priceUsd")?).filter(|price| *price > 0.0)
-            }
+            Some(value) => match finite_number(Some(value), "priceUsd") {
+                Ok(price) if price > 0.0 => Some(price),
+                Ok(_) => None,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            },
         };
         if best
             .as_ref()
@@ -218,6 +236,11 @@ pub fn parse_market_snapshot(
                 price_action: "UNAVAILABLE_OHLCV".to_string(),
                 observed_at,
             });
+        }
+    }
+    if best.is_none() {
+        if let Some(err) = last_error {
+            return Err(err);
         }
     }
     Ok(best)
@@ -597,6 +620,21 @@ mod tests {
             "pairs": [{"chainId": "solana", "baseToken": {"address": "Mint111"}, "fdv": 1000000, "liquidity": {"usd": 0}}]
         });
         assert!(parse_market_snapshot(Chain::Solana, "Mint111", &response, Utc::now()).is_err());
+    }
+
+    #[test]
+    fn market_parser_skips_broken_pool_and_keeps_valid_pool() {
+        let response = serde_json::json!({
+            "pairs": [
+                {"chainId": "solana", "baseToken": {"address": "Mint111"}, "liquidity": {"usd": 50000}, "priceUsd": "0.10"},
+                {"chainId": "solana", "baseToken": {"address": "Mint111"}, "marketCap": 1000000, "liquidity": {"usd": 40000}, "priceUsd": "0.10"}
+            ]
+        });
+        let snapshot = parse_market_snapshot(Chain::Solana, "Mint111", &response, Utc::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.market_cap_usd, 1000000.0);
+        assert_eq!(snapshot.liquidity_usd, 40000.0);
     }
 
     fn market(price_usd: Option<f64>) -> RadarMarketSnapshot {
