@@ -89,6 +89,7 @@ fn get_mock_config() -> Config {
         quarantine_max_minutes: 240,
         demote_consecutive_losses: 2,
         demote_catastrophic_loss_pct: 30.0,
+        copytrade_allowed_whales: vec![],
         shadow_exit_enabled: true,
         bot_take_profit_pct: 50.0,
         bot_stop_loss_pct: 20.0,
@@ -1650,4 +1651,113 @@ async fn test_bot_autonomous_exit_full_tp_and_sl_logic() {
     assert_eq!(sl_trade.exit_reason, "BOT_HARD_SL_CUTLOSS");
     assert_eq!(sl_trade.portion_sold_pct, 100.0);
     assert!((sl_trade.pnl_pct - (-22.0)).abs() < 1e-4);
+}
+
+#[tokio::test]
+async fn test_copytrade_allowed_whales_whitelist_gating() {
+    let mut config = get_mock_config();
+    config.copytrade_allowed_whales = vec!["solstice".to_string(), "detweiler".to_string()];
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let confluence = ConfluenceEngine::new(config, db);
+
+    let solstice_wallet = SmartWallet {
+        id: Some(1),
+        rank: 1,
+        name: "Solstice".to_string(),
+        handle: "bunker_solstice_main_01".to_string(),
+        chain: Chain::Solana,
+        address: "4ugDhHJ8XDXAeABmrNmGffFaLbJb9BkPyiFGVSV9ocwo".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 10000.0,
+        win_rate_pct: 75.0,
+        total_trades: 20,
+        source: "MANUAL".to_string(),
+        reputation_score: 95.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: Utc::now(),
+        execution_track: ExecutionTrack::FastLane,
+    };
+
+    let unipcs_wallet = SmartWallet {
+        id: Some(2),
+        rank: 2,
+        name: "Unipcs".to_string(),
+        handle: "bunker_unipcs_sat_01".to_string(),
+        chain: Chain::Solana,
+        address: "AcUJM6Aq6M2aojWiit7P2Ed48VN6k3XqJG9gT3datSss".to_string(),
+        tier: WalletTier::TierS,
+        pnl_24h_usd: 10000.0,
+        win_rate_pct: 75.0,
+        total_trades: 20,
+        source: "MANUAL".to_string(),
+        reputation_score: 95.0,
+        is_active: true,
+        last_seen_at: None,
+        updated_at: Utc::now(),
+        execution_track: ExecutionTrack::FastLane,
+    };
+
+    let activity_solstice = WalletActivity {
+        id: None,
+        wallet_handle: solstice_wallet.handle.clone(),
+        wallet_address: solstice_wallet.address.clone(),
+        chain: Chain::Solana,
+        activity_type: ActivityType::Buy,
+        token_symbol: "TESTSOL".to_string(),
+        token_mint: "Sol1111111111111111111111111111111111111111".to_string(),
+        amount_usd: 500.0,
+        token_amount: 1000.0,
+        execution_price_usd: 0.5,
+        whale_balance_before: 0.0,
+        whale_balance_after: 1000.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "sig_solstice".to_string(),
+        timestamp: Utc::now(),
+        source_reference: None,
+        parser_version: None,
+        finality: None,
+    };
+
+    let sig_solstice = confluence
+        .evaluate_activity_with_mcap(&activity_solstice, &solstice_wallet, 0.5, 50000.0, 100000.0)
+        .unwrap();
+    assert!(sig_solstice.is_passed, "Solstice buy harus lolos whitelist");
+
+    let activity_unipcs = WalletActivity {
+        id: None,
+        wallet_handle: unipcs_wallet.handle.clone(),
+        wallet_address: unipcs_wallet.address.clone(),
+        chain: Chain::Solana,
+        activity_type: ActivityType::Buy,
+        token_symbol: "TESTUNI".to_string(),
+        token_mint: "Uni1111111111111111111111111111111111111111".to_string(),
+        amount_usd: 500.0,
+        token_amount: 1000.0,
+        execution_price_usd: 0.5,
+        whale_balance_before: 0.0,
+        whale_balance_after: 1000.0,
+        sell_ratio_pct: 0.0,
+        tx_signature: "sig_unipcs".to_string(),
+        timestamp: Utc::now(),
+        source_reference: None,
+        parser_version: None,
+        finality: None,
+    };
+
+    let sig_unipcs = confluence
+        .evaluate_activity_with_mcap(&activity_unipcs, &unipcs_wallet, 0.5, 50000.0, 100000.0)
+        .unwrap();
+    assert!(
+        !sig_unipcs.is_passed,
+        "Unipcs buy harus ditolak whitelist eksekusi"
+    );
+    assert!(
+        sig_unipcs
+            .rejection_reason
+            .as_ref()
+            .unwrap()
+            .contains("REJECTED_COPYTRADE_DISABLED_MONITOR_ONLY"),
+        "Alasan penolakan harus MONITOR_ONLY"
+    );
 }

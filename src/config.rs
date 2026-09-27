@@ -67,12 +67,13 @@ pub struct Config {
     pub quarantine_max_minutes: u64,  // Maximum cooldown cap for failed tokens
     pub demote_consecutive_losses: u32, // Number of consecutive losses to demote whale
     pub demote_catastrophic_loss_pct: f64, // Single-trade loss % to trigger demotion
-    pub shadow_exit_enabled: bool,    // Mirror sell when whale dumps
-    pub bot_take_profit_pct: f64,     // Bot autonomous 100% TP (when shadow_exit_enabled=false)
-    pub bot_stop_loss_pct: f64,       // Bot autonomous 100% SL (when shadow_exit_enabled=false)
+    pub copytrade_allowed_whales: Vec<String>, // Whitelist substring pattern for copytrade execution (default empty = allow all)
+    pub shadow_exit_enabled: bool,             // Mirror sell when whale dumps
+    pub bot_take_profit_pct: f64, // Bot autonomous 100% TP (when shadow_exit_enabled=false)
+    pub bot_stop_loss_pct: f64,   // Bot autonomous 100% SL (when shadow_exit_enabled=false)
     pub bot_trailing_stop_trigger_pct: f64, // Bot autonomous trailing trigger
-    pub bot_trailing_stop_pct: f64,   // Bot autonomous trailing drop %
-    pub confluence_mode: String,      // "TIER_S_OR_DUAL_A"
+    pub bot_trailing_stop_pct: f64, // Bot autonomous trailing drop %
+    pub confluence_mode: String,  // "TIER_S_OR_DUAL_A"
     pub dry_run: bool,
     pub sim_initial_balance: f64, // Virtual cash balance in dry_run mode
     /// Live Robinhood gate tambahan; tidak cukup sendiri untuk broadcast.
@@ -343,6 +344,12 @@ impl Config {
         let quarantine_max_minutes = parse_value("QUARANTINE_MAX_MINUTES", 240u64)?;
         let demote_consecutive_losses = parse_value("DEMOTE_CONSECUTIVE_LOSSES", 2u32)?;
         let demote_catastrophic_loss_pct = parse_value("DEMOTE_CATASTROPHIC_LOSS_PCT", 30.0f64)?;
+        let copytrade_allowed_whales = env::var("COPYTRADE_ALLOWED_WHALES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<String>>();
 
         for (name, value) in [
             ("MAX_PRICE_DELTA_PCT", max_price_delta_pct),
@@ -531,6 +538,7 @@ impl Config {
             quarantine_max_minutes,
             demote_consecutive_losses,
             demote_catastrophic_loss_pct,
+            copytrade_allowed_whales,
             shadow_exit_enabled: parse_bool("SHADOW_EXIT_ENABLED", true)?,
             bot_take_profit_pct,
             bot_stop_loss_pct,

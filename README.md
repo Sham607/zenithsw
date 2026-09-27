@@ -86,7 +86,14 @@ Sistem radar mendeteksi aset pantauan whale secara asimetris untuk mencegah polu
 - **Jalur Saldo Pasif (`StructureConfirmed`)**: Token terdaftar di DexScreener wajib memiliki total nilai saldo kepemilikan whale $\ge$ $100 USD (`ui_amount * price_usd >= 100.0`). Koin debu di bawah $100 USD dibuang dari proyeksi radar.
 - **Jalur Transaksi Aktif (`HighPriorityRadar`)**: Transaksi beli baru (`BUY` / `DirectSwap`) oleh whale $\ge$ $100 USD dalam 24 jam terakhir langsung diproyeksikan ke baris prioritas radar TUI, mendukung token tahap pra-DEX / Pump.fun.
 - **Deduplikasi State & Transaksi Bersih**: Saldo snapshot kepemilikan whale (`TokenHolding`) dikelola melalui *upsert* berbasis `(chain, token_address, wallet_address)`. Ini menjaga pembacaan token baru whale tanpa membengkakkan database secara eksponensial. Transaksi pembelian whale (`DirectSwap`) tetap dipertahankan penuh (*append-only*).
+- **Prioritisasi Pemindaian Pasar Cerdas**: Kuota pemindaian harga DexScreener (`MAX_MARKET_TOKENS_PER_CYCLE`) diprioritaskan ketat berdasarkan: (1) token dengan aktivitas `DirectSwap` 24 jam terakhir, (2) jumlah dompet whale unik (`wallet_count`), dan (3) timestamp observasi teranyar (`latest_observed_at`).
 - **Pruning Otomatis**: Proyeksi radar yang tidak lagi memenuhi kualifikasi dibersihkan otomatis setiap siklus agar data TUI selalu relevan dan bersih.
+
+### Copytrade Execution Whitelist Guard (`COPYTRADE_ALLOWED_WHALES`)
+Mendukung segregasi antara pemantauan intelijen radar dan eksekusi order:
+- Parameter `COPYTRADE_ALLOWED_WHALES` (daftar substring handle yang dipisahkan koma, misal: `solstice,detweiler`) membatasi eksekusi transaksi otomatis hanya pada klaster whale terpilih.
+- Sinyal beli dari whale di luar whitelist otomatis ditolak secara fail-closed dengan alasan `REJECTED_COPYTRADE_DISABLED_MONITOR_ONLY` sehingga aktivitas mereka tetap dapat dipantau di radar/TUI tanpa memicu pembelian aset.
+- Default kosong (`""`) berarti mengeksekusi seluruh whale berkualifikasi Tier-S/A yang lolos gating konfluensi.
 
 ### Strategi Exit Terbifurkasi (`SHADOW_EXIT_ENABLED`)
 
@@ -259,7 +266,7 @@ mise exec rust@1.94.1 -- cargo build --release --locked
 git diff --check
 ```
 
-Verifikasi terbaru: **188 library tests & 41 integration tests lulus (total 229 test), 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
+Verifikasi terbaru: **189 library tests & 39 integration tests lulus (total 228 test), 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
 
 ## Credential dan keamanan
 

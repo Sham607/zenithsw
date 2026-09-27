@@ -119,6 +119,7 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         quarantine_max_minutes: 240,
         demote_consecutive_losses: 2,
         demote_catastrophic_loss_pct: 30.0,
+        copytrade_allowed_whales: vec![],
         shadow_exit_enabled: true,
         bot_take_profit_pct: 50.0,
         bot_stop_loss_pct: 20.0,

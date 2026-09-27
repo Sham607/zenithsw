@@ -60,6 +60,7 @@ fn test_config() -> Config {
         quarantine_max_minutes: 240,
         demote_consecutive_losses: 2,
         demote_catastrophic_loss_pct: 30.0,
+        copytrade_allowed_whales: vec![],
         sim_initial_balance: 100.0,
         shadow_exit_enabled: true,
         bot_take_profit_pct: 50.0,

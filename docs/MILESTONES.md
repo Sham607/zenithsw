@@ -579,3 +579,23 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
 - [x] Verifikasi Operasional & IPC:
   - Daemon `zenithsw-engine.service` diaktifkan kembali (PID 275002).
   - Probe socket IPC mengonfirmasi stream heartbeat beruntun tanpa delay (`heartbeat_seq: 6..79`), responsivitas sub-detik, dan tidak ada lagi fenomena stale heartbeat.
+
+## [2026-09-27] Whitelist Filter Eksekusi Copytrade (COPYTRADE_ALLOWED_WHALES) & Prioritisasi Pemindaian Radar Market
+- [x] Masalah & Kebutuhan Operasional:
+  - User ingin membatasi eksekusi transaksi otomatis hanya pada klaster whale terpercaya tertentu (misal: `@bunker_solstice` dan `@bunker_detweiler`), sementara whale lain tetap ingin dipantau aktivitasnya di radar/TUI tanpa memicu pembelian aset otomatis (*monitor-only*).
+  - Siklus pemindaian harga pasar DexScreener (`MAX_MARKET_TOKENS_PER_CYCLE = 25`) sebelumnya hanya mengurutkan token secara alfabetis, sehingga token yang baru saja dibeli whale (`DirectSwap`) berisiko terlewat dari siklus pemindaian cepat jika jumlah holding token whale melebihi batas siklus.
+- [x] Solusi Teknis & Arsitektur:
+  - Whitelist Eksekusi Whale (`src/config.rs` & `src/gating/confluence.rs`):
+    - Penambahan variabel lingkungan `COPYTRADE_ALLOWED_WHALES` (daftar substring handle yang dipisahkan koma, case-insensitive).
+    - Pemeriksaan gating Check B0 pada `ConfluenceEngine::evaluate_activity_with_mcap`: jika whitelist aktif dan handle dompet tidak cocok, sinyal ditolak secara fail-closed dengan alasan `REJECTED_COPYTRADE_DISABLED_MONITOR_ONLY (@handle)`.
+  - Prioritisasi Pemindaian Radar Pasar (`src/radar_runtime.rs`):
+    - Struktur data `TokenScanCandidate` mengagregasi bukti token berdasarkan: status `has_direct_swap`, jumlah dompet paus pemegang (`wallet_count`), dan timestamp observasi teranyar (`latest_observed_at`).
+    - Pengurutan berbobot memastikan token yang sedang diakumulasi aktif selalu masuk prioritas utama kuota pemindaian DexScreener.
+- [x] Verifikasi Pengujian & Kompilasi:
+  - Unit test baru: `test_copytrade_allowed_whales_whitelist_gating` di `tests/simulation_test.rs` memvalidasi bahwa handle yang lolos dieksekusi normal dan handle di luar daftar ditolak dengan status monitor-only.
+  - Penyesuaian mock konfigurasi di `tests/dual_track_test.rs`, `tests/simulation_test.rs`, dan `tests/tui_handler_test.rs`.
+  - Full regression test suite: 228 passed (189 unit + 39 integration), 0 failed.
+  - Kompilasi release binary sukses (`cargo build --release`).
+- [x] Verifikasi Dokumentasi & Lingkungan:
+  - `.env.example` diperbarui dengan parameter `COPYTRADE_ALLOWED_WHALES`.
+  - `README.md` diperbarui dengan dokumentasi fitur whitelist eksekusi dan pemindaian berprioritas radar.

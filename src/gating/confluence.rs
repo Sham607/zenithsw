@@ -295,6 +295,25 @@ impl ConfluenceEngine {
         }
 
         // Gating Check B: Strict Execution Whitelist Guard
+        // 0. Copytrade Whale Execution Whitelist Guard (jika dikonfigurasi)
+        if !self.config.copytrade_allowed_whales.is_empty() {
+            let handle_lower = wallet.handle.to_ascii_lowercase();
+            let is_allowed = self
+                .config
+                .copytrade_allowed_whales
+                .iter()
+                .any(|pat| handle_lower.contains(pat));
+            if !is_allowed {
+                is_passed = false;
+                if rejection_reason.is_none() {
+                    rejection_reason = Some(format!(
+                        "REJECTED_COPYTRADE_DISABLED_MONITOR_ONLY (@{})",
+                        wallet.handle
+                    ));
+                }
+            }
+        }
+
         // 1. Unverified automated sources (only generic auto-indexers without Tier-S reputation) are blocked
         // Tier-S clusters and validated shadow arms are explicitly permitted to execute
         if wallet.tier != WalletTier::TierS

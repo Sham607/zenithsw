@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::db::{deduplicate_scan_addresses, SmartWalletDb, WalletScanAddress};
 use crate::ipc::{IpcMessage, IpcServer};
 use crate::models::Chain;
-use crate::radar::{parse_market_snapshot, RadarPolicy};
+use crate::radar::{parse_market_snapshot, RadarEvidenceKind, RadarPolicy};
 use crate::radar_pipeline::run_read_only_pipeline;
 use crate::radar_rpc::{build_read_only_rpc_client, collect_solana_holdings_read_only};
 use anyhow::{Context, Result};
@@ -83,14 +83,61 @@ impl RadarRuntime {
         }
         self.db.insert_radar_evidence_batch(&evidence)?;
 
-        let mut tokens: Vec<String> = evidence
-            .iter()
-            .map(|item| item.token_address.clone())
-            .collect::<HashSet<_>>()
+        // Prioritaskan kandidat pemindaian pasar berdasarkan relevansi sinyal:
+        // 1. DirectSwap (pembelian paus aktif 24 jam terakhir)
+        // 2. Konfluensi (jumlah dompet paus unik)
+        // 3. Kebaruan observasi (observed_at terbaru)
+        struct TokenScanCandidate {
+            token_address: String,
+            has_direct_swap: bool,
+            wallet_count: usize,
+            latest_observed_at: chrono::DateTime<Utc>,
+        }
+
+        let mut token_stats: HashMap<String, (bool, HashSet<String>, chrono::DateTime<Utc>)> =
+            HashMap::new();
+
+        for item in &evidence {
+            let entry = token_stats
+                .entry(item.token_address.clone())
+                .or_insert_with(|| (false, HashSet::new(), item.observed_at));
+            if item.kind == RadarEvidenceKind::DirectSwap {
+                entry.0 = true;
+            }
+            entry
+                .1
+                .insert(item.wallet_address.trim().to_ascii_lowercase());
+            if item.observed_at > entry.2 {
+                entry.2 = item.observed_at;
+            }
+        }
+
+        let mut candidates: Vec<TokenScanCandidate> = token_stats
             .into_iter()
+            .map(
+                |(token_address, (has_direct_swap, wallets, latest_observed_at))| {
+                    TokenScanCandidate {
+                        token_address,
+                        has_direct_swap,
+                        wallet_count: wallets.len(),
+                        latest_observed_at,
+                    }
+                },
+            )
             .collect();
-        tokens.sort();
-        tokens.truncate(MAX_MARKET_TOKENS_PER_CYCLE);
+
+        candidates.sort_by(|a, b| {
+            b.has_direct_swap
+                .cmp(&a.has_direct_swap)
+                .then_with(|| b.wallet_count.cmp(&a.wallet_count))
+                .then_with(|| b.latest_observed_at.cmp(&a.latest_observed_at))
+        });
+
+        let tokens: Vec<String> = candidates
+            .into_iter()
+            .take(MAX_MARKET_TOKENS_PER_CYCLE)
+            .map(|c| c.token_address)
+            .collect();
         let mut markets = HashMap::new();
         for token in tokens {
             let response = match self
