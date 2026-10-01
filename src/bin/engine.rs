@@ -858,6 +858,37 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
+                        // Downward sanity check: Warn on extreme single-tick drop (>50% drop in one tick)
+                        if pos.current_price > 0.0 && live_price < pos.current_price * 0.50 {
+                            eprintln!(
+                                "[PRICE SANITY GUARD 🛡️] Extreme price drop for {} (${:.6} -> ${:.6}, -{:.1}% in single tick). Debouncing 1500ms with fresh oracle recheck...",
+                                pos.token_symbol,
+                                pos.current_price,
+                                live_price,
+                                ((pos.current_price - live_price) / pos.current_price) * 100.0
+                            );
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            let fresh_check = match pos.chain {
+                                Chain::Solana => {
+                                    SolanaStreamListener::fetch_token_price_fresh(&pos.token_mint)
+                                        .await
+                                        .ok()
+                                }
+                                _ => None,
+                            };
+                            if let Some((_, fresh_p, fresh_liq, _)) = fresh_check {
+                                if fresh_p >= pos.current_price * 0.50
+                                    && fresh_liq >= config_pos.liquidity_drain_usd
+                                {
+                                    println!(
+                                        "[PRICE SANITY GUARD 🛡️] False price crash rejected for {} (${:.6} recovered vs glitched ${:.6}). Tick discarded!",
+                                        pos.token_symbol, fresh_p, live_price
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
                         pos.current_price = live_price;
                         pos.peak_price = pos.peak_price.max(live_price);
                         if pos.entry_price > 0.0 {
@@ -900,8 +931,59 @@ async fn main() -> Result<()> {
                             && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
                         {
                             println!(
-                                "[LIQUIDITY DRAIN GUARD 🚨] Position {} ({}) pool liquidity dropped to ${:.0} (<${:.0})! Emergency dumping to avoid rug-pull trap!",
+                                "[LIQUIDITY DRAIN ⏳] Position {} ({}) reported pool liquidity ${:.0} (<${:.0}). Debouncing 1500ms to verify on-chain before emergency dump...",
                                 pos.id, pos.token_symbol, live_liquidity, config_pos.liquidity_drain_usd
+                            );
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+
+                            let is_verified_drain = match pos.chain {
+                                Chain::Solana => {
+                                    let fresh_market =
+                                        SolanaStreamListener::fetch_token_price_fresh(
+                                            &pos.token_mint,
+                                        )
+                                        .await
+                                        .ok();
+                                    if let Some((_, _fresh_p, fresh_liq, _)) = fresh_market {
+                                        if fresh_liq >= config_pos.liquidity_drain_usd {
+                                            println!(
+                                                "[LIQUIDITY DRAIN REJECTED 🛡️] {} liquidity recovered to ${:.0} on recheck. False alarm discarded!",
+                                                pos.token_symbol, fresh_liq
+                                            );
+                                            false
+                                        } else {
+                                            // Secondary check: verify Jupiter realizable route
+                                            match sol_exec_pos
+                                                .get_fresh_exit_quote(&pos.token_mint, 0)
+                                                .await
+                                            {
+                                                Ok(q)
+                                                    if q.estimated_out_lamports > 0
+                                                        && q.price_impact_pct < 50.0 =>
+                                                {
+                                                    println!(
+                                                        "[LIQUIDITY DRAIN REJECTED 🛡️] {} Jupiter route verified active (impact: {:.1}%, out: {:.4} SOL). DexScreener anomaly discarded!",
+                                                        pos.token_symbol, q.price_impact_pct, q.estimated_out_sol
+                                                    );
+                                                    false
+                                                }
+                                                _ => true,
+                                            }
+                                        }
+                                    } else {
+                                        true
+                                    }
+                                }
+                                _ => true,
+                            };
+
+                            if !is_verified_drain {
+                                continue;
+                            }
+
+                            println!(
+                                "[LIQUIDITY DRAIN GUARD 🚨] Confirmed pool liquidity collapse for {} (<${:.0})! Emergency dumping to avoid rug-pull trap!",
+                                pos.token_symbol, config_pos.liquidity_drain_usd
                             );
                             match pos.chain {
                                 Chain::Solana => {
@@ -1150,7 +1232,56 @@ async fn main() -> Result<()> {
                             let hard_sl_trigger =
                                 pos.unrealized_pnl_pct <= -config_pos.stop_loss_pct;
                             if hard_sl_trigger && pos.status != "CLOSED" {
-                                println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) hit {:.1}% <= -{:.1}%! Force closing immediately to protect capital!",
+                                println!(
+                                    "[SL CONFIRMATION ⏳] Position {} ({}) hit {:.1}% <= -{:.1}%. Awaiting 1200ms debounce to filter flash wicks...",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct
+                                );
+                                sleep(Duration::from_millis(1200)).await;
+
+                                // Re-verify with fresh price fetch (bypass cache)
+                                let recheck_price = match pos.chain {
+                                    Chain::Solana => SolanaStreamListener::fetch_token_price_fresh(
+                                        &pos.token_mint,
+                                    )
+                                    .await
+                                    .map(|(_, p, _, _)| p)
+                                    .ok(),
+                                    _ => None,
+                                };
+
+                                if let Some(fresh_p) = recheck_price {
+                                    if fresh_p > 0.0 && pos.entry_price > 0.0 {
+                                        let fresh_pnl =
+                                            ((fresh_p - pos.entry_price) / pos.entry_price) * 100.0;
+                                        pos.current_price = fresh_p;
+                                        pos.unrealized_pnl_pct = fresh_pnl;
+                                        let _ = db_pos_tracker.upsert_position(pos);
+
+                                        if fresh_pnl > -config_pos.stop_loss_pct {
+                                            println!(
+                                                "[SL FLASH-WICK REJECTED 🛡️] Position {} ({}) recovered to ${:.6} ({:.1}% > -{:.1}%). Cut-loss cancelled!",
+                                                pos.id, pos.token_symbol, fresh_p, fresh_pnl, config_pos.stop_loss_pct
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                // Check Jupiter realizable quote for Solana
+                                if pos.chain == Chain::Solana {
+                                    if let Ok(quote) =
+                                        sol_exec_pos.get_fresh_exit_quote(&pos.token_mint, 0).await
+                                    {
+                                        if quote.price_impact_pct > 30.0 {
+                                            eprintln!(
+                                                "[SL REALIZABLE WARNING ⚠️] Token {} Jupiter price impact is severe ({:.1}%). Realizable out: {:.4} SOL",
+                                                pos.token_symbol, quote.price_impact_pct, quote.estimated_out_sol
+                                            );
+                                        }
+                                    }
+                                }
+
+                                println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) confirmed breach at {:.1}% <= -{:.1}%! Force closing immediately to protect capital!",
                                     pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct);
                                 match pos.chain {
                                     Chain::Solana => {
@@ -1158,7 +1289,7 @@ async fn main() -> Result<()> {
                                             .execute_shadow_sell(
                                                 &pos.id,
                                                 "EMERGENCY_HARD_SL_CUTLOSS",
-                                                live_price,
+                                                pos.current_price,
                                             )
                                             .await
                                         {
@@ -1170,7 +1301,7 @@ async fn main() -> Result<()> {
                                             .execute_shadow_sell(
                                                 &pos.id,
                                                 "EMERGENCY_HARD_SL_CUTLOSS",
-                                                live_price,
+                                                pos.current_price,
                                             )
                                             .await
                                         {
@@ -1178,6 +1309,7 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 }
+                                continue;
                             }
                         } else {
                             // =========================================================================
@@ -1275,7 +1407,56 @@ async fn main() -> Result<()> {
                                 && pos.unrealized_pnl_pct <= -config_pos.bot_stop_loss_pct
                             {
                                 println!(
-                                    "[BOT EMERGENCY SL 🛑] Position {} ({}) hit {:.1}% <= -{:.1}%! Force closing 100% immediately!",
+                                    "[SL CONFIRMATION ⏳] Position {} ({}) hit {:.1}% <= -{:.1}%. Awaiting 1200ms debounce to filter flash wicks...",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.bot_stop_loss_pct
+                                );
+                                sleep(Duration::from_millis(1200)).await;
+
+                                // Re-verify with fresh price fetch (bypass cache)
+                                let recheck_price = match pos.chain {
+                                    Chain::Solana => SolanaStreamListener::fetch_token_price_fresh(
+                                        &pos.token_mint,
+                                    )
+                                    .await
+                                    .map(|(_, p, _, _)| p)
+                                    .ok(),
+                                    _ => None,
+                                };
+
+                                if let Some(fresh_p) = recheck_price {
+                                    if fresh_p > 0.0 && pos.entry_price > 0.0 {
+                                        let fresh_pnl =
+                                            ((fresh_p - pos.entry_price) / pos.entry_price) * 100.0;
+                                        pos.current_price = fresh_p;
+                                        pos.unrealized_pnl_pct = fresh_pnl;
+                                        let _ = db_pos_tracker.upsert_position(pos);
+
+                                        if fresh_pnl > -config_pos.bot_stop_loss_pct {
+                                            println!(
+                                                "[SL FLASH-WICK REJECTED 🛡️] Position {} ({}) recovered to ${:.6} ({:.1}% > -{:.1}%). Cut-loss cancelled!",
+                                                pos.id, pos.token_symbol, fresh_p, fresh_pnl, config_pos.bot_stop_loss_pct
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                // Check Jupiter realizable quote for Solana
+                                if pos.chain == Chain::Solana {
+                                    if let Ok(quote) =
+                                        sol_exec_pos.get_fresh_exit_quote(&pos.token_mint, 0).await
+                                    {
+                                        if quote.price_impact_pct > 30.0 {
+                                            eprintln!(
+                                                "[SL REALIZABLE WARNING ⚠️] Token {} Jupiter price impact is severe ({:.1}%). Realizable out: {:.4} SOL",
+                                                pos.token_symbol, quote.price_impact_pct, quote.estimated_out_sol
+                                            );
+                                        }
+                                    }
+                                }
+
+                                println!(
+                                    "[BOT EMERGENCY SL 🛑] Position {} ({}) confirmed breach at {:.1}% <= -{:.1}%! Force closing 100% immediately!",
                                     pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.bot_stop_loss_pct
                                 );
                                 match pos.chain {
@@ -1284,7 +1465,7 @@ async fn main() -> Result<()> {
                                             .execute_shadow_sell(
                                                 &pos.id,
                                                 "BOT_HARD_SL_CUTLOSS",
-                                                live_price,
+                                                pos.current_price,
                                             )
                                             .await
                                         {
@@ -1296,7 +1477,7 @@ async fn main() -> Result<()> {
                                             .execute_shadow_sell(
                                                 &pos.id,
                                                 "BOT_HARD_SL_CUTLOSS",
-                                                live_price,
+                                                pos.current_price,
                                             )
                                             .await
                                         {

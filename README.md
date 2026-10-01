@@ -87,6 +87,8 @@ Sistem radar mendeteksi aset pantauan whale secara asimetris untuk mencegah polu
 - **Jalur Transaksi Aktif (`HighPriorityRadar`)**: Transaksi beli baru (`BUY` / `DirectSwap`) oleh whale $\ge$ $100 USD dalam 24 jam terakhir langsung diproyeksikan ke baris prioritas radar TUI, mendukung token tahap pra-DEX / Pump.fun.
 - **Deduplikasi State & Transaksi Bersih**: Saldo snapshot kepemilikan whale (`TokenHolding`) dikelola melalui *upsert* berbasis `(chain, token_address, wallet_address)`. Ini menjaga pembacaan token baru whale tanpa membengkakkan database secara eksponensial. Transaksi pembelian whale (`DirectSwap`) tetap dipertahankan penuh (*append-only*).
 - **Prioritisasi Pemindaian Pasar Cerdas**: Kuota pemindaian harga DexScreener (`MAX_MARKET_TOKENS_PER_CYCLE`) diprioritaskan ketat berdasarkan: (1) token dengan aktivitas `DirectSwap` 24 jam terakhir, (2) jumlah dompet whale unik (`wallet_count`), dan (3) timestamp observasi teranyar (`latest_observed_at`).
+- **Rotasi Antrean & Anti-Starvation**: Kandidat holding token dirotasi secara *round-robin* melalui `holding_cursor: AtomicUsize` agar seluruh aset terpantau adil. Token mati (HTTP 404 / tanpa pool valid) dikarantina selama 1 jam (`dead_tokens`), membebaskan kuota untuk token aktif.
+- **In-Memory Market Cache & Ekspansi Analisis**: Menyimpan snapshot pasar dan struktur GeckoTerminal OHLCV di RAM (`market_cache`, TTL 30 menit). Analisis mendalam struktur pasar diperluas dari 5 token menjadi 15 token prioritas teratas.
 - **Pruning Otomatis**: Proyeksi radar yang tidak lagi memenuhi kualifikasi dibersihkan otomatis setiap siklus agar data TUI selalu relevan dan bersih.
 
 ### Copytrade Execution Whitelist Guard (`COPYTRADE_ALLOWED_WHALES`)
@@ -115,7 +117,9 @@ ZenithSW mengisolasi aturan keluar menjadi dua mode operasional:
      - `BOT_TRAILING_STOP_EXIT`: Gain mencapai `BOT_TRAILING_STOP_TRIGGER_PCT` lalu drop $\ge$ `BOT_TRAILING_STOP_PCT` dari peak $\rightarrow$ Jual 100% kunci profit.
 
 3. **Global Safety Guard (Berlaku di Kedua Mode)**:
-   - `LIQUIDITY_DRAIN_EXIT`: Jika likuiditas pool anjlok di bawah ambang `LIQUIDITY_DRAIN_USD` (anti jebakan *rug-pull*), posisi langsung didump 100%.
+   - `PRICE_SANITY_GUARD`: Mendeteksi crash harga instan anomali (>50% drop dalam 1 tick). Melakukan jeda debounce 1.500ms dan verifikasi ulang oracle segar tanpa cache (`fetch_token_price_fresh`). Menolak tick glitch/palsu.
+   - `LIQUIDITY_DRAIN_EXIT`: Jika likuiditas pool anjlok di bawah ambang `LIQUIDITY_DRAIN_USD` (anti jebakan *rug-pull*), engine melakukan debounce 1.500ms dan memeriksa rute realizable Jupiter (`get_fresh_exit_quote`). Posisi hanya didump jika keruntuhan likuiditas terkonfirmasi riil di DEX aggregator.
+   - `ANTI_FLASH_WICK_SL_GUARD`: Pemicu Stop Loss (mode shadow maupun bot) melewati debounce 1.200ms dengan verifikasi harga live tanpa cache untuk menyaring *flash wick whipsaw*. Jika PnL pulih di atas ambang batas, cut-loss dibatalkan otomatis. Serta memberikan warning jika price impact exit Jupiter >30%.
 
 
 Parameter runtime dibaca dari `.env`/secret manager melalui `Config::load()`. Gunakan `.env.example` sebagai referensi nama variabel. Jangan commit `.env`, private key, API key, atau database runtime.
@@ -266,7 +270,7 @@ mise exec rust@1.94.1 -- cargo build --release --locked
 git diff --check
 ```
 
-Verifikasi terbaru: **189 library tests & 39 integration tests lulus (total 228 test), 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
+Verifikasi terbaru: **190 library tests & 42 integration tests lulus (total 232 test), 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
 
 ## Credential dan keamanan
 

@@ -599,3 +599,44 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
 - [x] Verifikasi Dokumentasi & Lingkungan:
   - `.env.example` diperbarui dengan parameter `COPYTRADE_ALLOWED_WHALES`.
   - `README.md` diperbarui dengan dokumentasi fitur whitelist eksekusi dan pemindaian berprioritas radar.
+
+## [2026-09-27] Penyempurnaan Robustness Parser Multi-Pool DexScreener, Rotasi Antrean Radar, & Eliminasi Dead Token Starvation
+- [x] Masalah:
+  - Pada `parse_market_snapshot`, jika ada pool pertama yang mengembalikan data invalid atau parsial (misal `marketCap` null), operator `?` langsung membatalkan parsing seluruh response, mengabaikan pool valid lain yang lebih likuid.
+  - Kandidat token saldo (`holding_candidates`) yang melebihi kuota pemindaian per siklus (`MAX_MARKET_TOKENS_PER_CYCLE = 50`) mengalami *queue starvation* (token di urutan bawah tidak pernah terpindai).
+  - Token mati (HTTP 404 atau tidak memiliki pool DEX valid) terus dipindai berulang kali, memboroskan kuota siklus.
+- [x] Solusi Arsitektur:
+  - Error Handling Per-Pool: `parse_market_snapshot` di `src/radar.rs` menangani error parsing pool secara parsial (`match`), melompati pool cacat, dan memilih pool dengan likuiditas USD tertinggi yang valid.
+  - Round-Robin Holding Cursor: Mengimplementasikan `holding_cursor: AtomicUsize` untuk merotasi antrean kandidat saldo secara adil di setiap siklus pemindaian pasar DexScreener.
+  - Dead Token Tracking & 1-Hour Cooldown: Struktur `dead_tokens: Arc<RwLock<HashMap<String, Instant>>>` mencatat token 404 / tanpa pair dan mengabaikannya selama 3.600 detik (1 jam) agar tidak menyedot jatah pemindaian aset aktif.
+  - In-Memory Market Cache (TTL 30 Menit): Menyimpan snapshot pasar DexScreener & GeckoTerminal OHLCV di RAM (`market_cache`) selama 1.800 detik agar data struktur pasar dan aksi harga tidak hilang saat rotasi antrean.
+- [x] Verifikasi Pengujian & Kompilasi:
+  - Unit test baru `market_parser_skips_broken_pool_and_keeps_valid_pool` lulus.
+  - Full regression test suite lulus: 228 passed, 0 failed.
+
+## [2026-10-01] Price Sanity Guard, Anti-Flash-Wick SL Debounce, & Verifikasi Likuiditas Realizable Jupiter
+- [x] Masalah Operasional:
+  - False Price Crash Glitch: DexScreener sewaktu-waktu mengalami tick anomali sesaat (>50% drop dalam 1 tick) yang dapat memicu trigger Stop Loss palsu dan cut-loss dini.
+  - Flash Wick Whipsaw: Volatilitas sesaat pada Solana DEX sering kali menyentuh ambang batas SL (-35%) dalam hitungan milidetik sebelum memantul kembali, menutup posisi di harga terendah.
+  - False Liquidity Drain: Likuiditas pool yang dilaporkan 0 atau turun drastis di DexScreener akibat keterlambatan indeks sering memicu *emergency dump*, padahal rute pool Jupiter riil masih sehat dan likuid.
+- [x] Solusi Arsitektur & Safety Guards:
+  - Downward Price Sanity Guard (`src/bin/engine.rs`):
+    - Mendeteksi anomali penurunan harga instan >50% dalam 1 tick tunggal.
+    - Menjalankan debounce 1.500ms dan melakukan verifikasi harga oracle segar tanpa cache (`SolanaStreamListener::fetch_token_price_fresh`). Jika harga pulih dan likuiditas sehat, tick glitch ditolak dan dibuang.
+  - Anti-Flash-Wick SL Debounce & Re-Verification (`src/bin/engine.rs`):
+    - Pemicu Stop Loss (baik `EMERGENCY_HARD_SL_CUTLOSS` pada mode shadow maupun `BOT_HARD_SL_CUTLOSS` pada mode bot) kini melewati jeda debounce 1.200ms untuk menyaring flash wick sesaat.
+    - Mengambil harga live segar dari RPC/DexScreener membypass cache in-memory 3s TTL. Jika PnL terverifikasi pulih di atas ambang batas SL, aksi cut-loss dibatalkan otomatis.
+    - Verifikasi rute likuiditas Jupiter (`get_fresh_exit_quote`): Memberikan peringatan dini jika *price impact* rute exit melebihi 30%.
+  - Verifikasi Realizable Liquidity Drain (`src/bin/engine.rs`):
+    - Saat likuiditas pool dilaporkan anjlok di bawah `LIQUIDITY_DRAIN_USD`, engine melakukan debounce 1.500ms dan re-fetch market.
+    - Mengecek rute exit Jupiter (`get_fresh_exit_quote`): Jika rute masih aktif dengan *price impact* < 50% dan output SOL > 0, anomali DexScreener ditolak dan posisi tetap dipertahankan.
+  - Fetcher Uncached & Max Liquidity Matcher (`src/streams/solana_stream.rs` & `src/execution/solana_executor.rs`):
+    - Fungsi `fetch_token_price_fresh`: Bypass cache in-memory 3s TTL untuk verifikasi kritis.
+    - Penelusuran fallback pencarian DexScreener kini mengevaluasi seluruh pair hasil pencarian dan memilih pair dengan likuiditas USD tertinggi (`max_liq`).
+    - Fungsi `get_fresh_exit_quote`: Membaca quote realizable Jupiter dengan membypass cache internal 60s (`bypass_cache = true`).
+  - Ekspansi Kuota Analisis Struktur Pasar (`src/radar_runtime.rs`):
+    - Kuota prioritas pengumpulan GeckoTerminal OHLCV Tier-2 diperluas dari 5 token menjadi 15 token teratas (`priority_tokens.truncate(15)`).
+- [x] Verifikasi Pengujian & Kompilasi:
+  - `cargo fmt --all -- --check`: Lolos.
+  - `cargo clippy --all-targets -- -D warnings`: Lolos (0 warning, 0 error).
+  - Full test suite: 232 passed (190 unit + 42 integration across all suites), 0 failed.

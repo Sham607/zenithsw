@@ -635,11 +635,31 @@ impl SolanaExecutor {
         token_mint: &str,
         token_amount_raw: u64,
     ) -> Result<CachedRealizableQuote> {
+        self.get_exit_quote_internal(token_mint, token_amount_raw, false)
+            .await
+    }
+
+    /// Fetches a fresh realizable exit quote from Jupiter bypassing cache.
+    pub async fn get_fresh_exit_quote(
+        &self,
+        token_mint: &str,
+        token_amount_raw: u64,
+    ) -> Result<CachedRealizableQuote> {
+        self.get_exit_quote_internal(token_mint, token_amount_raw, true)
+            .await
+    }
+
+    async fn get_exit_quote_internal(
+        &self,
+        token_mint: &str,
+        token_amount_raw: u64,
+        bypass_cache: bool,
+    ) -> Result<CachedRealizableQuote> {
         let wsol_mint = "So11111111111111111111111111111111111111112";
         let now = Instant::now();
 
-        // 1. Check cache freshness (< 60 seconds)
-        {
+        // 1. Check cache freshness (< 60 seconds) unless bypass_cache is requested
+        if !bypass_cache {
             let guard = self
                 .quote_cache
                 .lock()

@@ -20,6 +20,9 @@ const RADAR_INTERVAL_SECS: u64 = 120;
 const MAX_MARKET_TOKENS_PER_CYCLE: usize = 50;
 const DEXSCREENER_URL: &str = "https://api.dexscreener.com/latest/dex/tokens/";
 
+type MarketCacheEntry = (crate::radar::RadarMarketSnapshot, Instant);
+type MarketCacheMap = HashMap<(Chain, String), MarketCacheEntry>;
+
 pub struct RadarRuntime {
     config: Config,
     db: Arc<SmartWalletDb>,
@@ -27,7 +30,7 @@ pub struct RadarRuntime {
     market_client: Client,
     dead_tokens: Arc<RwLock<HashMap<String, Instant>>>,
     holding_cursor: AtomicUsize,
-    market_cache: Arc<RwLock<HashMap<(Chain, String), (crate::radar::RadarMarketSnapshot, Instant)>>>,
+    market_cache: Arc<RwLock<MarketCacheMap>>,
 }
 
 impl RadarRuntime {
@@ -277,7 +280,7 @@ impl RadarRuntime {
             }
         }
         priority_tokens.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.3.total_cmp(&a.3)));
-        priority_tokens.truncate(5);
+        priority_tokens.truncate(15);
 
         for (token, pool_addr, _, _) in priority_tokens {
             let gecko_url = format!(

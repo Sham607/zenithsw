@@ -566,11 +566,25 @@ impl SolanaStreamListener {
 
     /// Fetches live price & aggregated liquidity with multi-pool scanning & in-memory TTL caching (DexScreener + Search Fallback)
     pub async fn fetch_token_price(mint: &str) -> Result<(String, f64, f64, f64)> {
-        // Step 1: Check in-memory price cache (TTL 3 seconds)
-        if let Ok(cache) = get_price_cache().read() {
-            if let Some((sym, price, liq, mcap, ts)) = cache.get(mint) {
-                if ts.elapsed() < Duration::from_secs(3) {
-                    return Ok((sym.clone(), *price, *liq, *mcap));
+        Self::fetch_token_price_internal(mint, false).await
+    }
+
+    /// Fetches live price bypassing in-memory cache to verify sudden price crashes / stop-loss ticks
+    pub async fn fetch_token_price_fresh(mint: &str) -> Result<(String, f64, f64, f64)> {
+        Self::fetch_token_price_internal(mint, true).await
+    }
+
+    async fn fetch_token_price_internal(
+        mint: &str,
+        bypass_cache: bool,
+    ) -> Result<(String, f64, f64, f64)> {
+        // Step 1: Check in-memory price cache (TTL 3 seconds) unless bypass_cache is requested
+        if !bypass_cache {
+            if let Ok(cache) = get_price_cache().read() {
+                if let Some((sym, price, liq, mcap, ts)) = cache.get(mint) {
+                    if ts.elapsed() < Duration::from_secs(3) {
+                        return Ok((sym.clone(), *price, *liq, *mcap));
+                    }
                 }
             }
         }
@@ -688,40 +702,56 @@ impl SolanaStreamListener {
             }
         }
 
-        // Source 2: DexScreener Search Endpoint Fallback with strict baseToken matching
+        // Source 2: DexScreener Search Endpoint Fallback with strict baseToken matching & max liquidity selection
         let search_url = format!("https://api.dexscreener.com/latest/dex/search?q={}", mint);
         if let Ok(res) = client.get(&search_url).send().await {
-            if let Ok(json) = res.json::<Value>().await {
-                if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
-                    if let Some(pair) = pairs.iter().find(|p| {
-                        p.get("baseToken")
-                            .and_then(|b| b.get("address"))
-                            .and_then(|s| s.as_str())
-                            .map(|addr| addr.eq_ignore_ascii_case(mint))
-                            .unwrap_or(false)
-                    }) {
-                        let symbol = pair
-                            .get("baseToken")
-                            .and_then(|b| b.get("symbol"))
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("TOKEN")
-                            .to_string();
-                        let price_usd: f64 = pair
-                            .get("priceUsd")
-                            .and_then(|p| p.as_str())
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0.0);
-                        let liquidity_usd: f64 = pair
-                            .get("liquidity")
-                            .and_then(|l| l.get("usd"))
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0);
-                        let mcap: f64 = pair
-                            .get("marketCap")
-                            .or_else(|| pair.get("fdv"))
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0);
-                        if price_usd > 0.0 && liquidity_usd > 0.0 {
+            if res.status().is_success() {
+                if let Ok(json) = res.json::<Value>().await {
+                    if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
+                        let mut best_pair: Option<(String, f64, f64, f64)> = None;
+                        let mut max_liq = 0.0;
+
+                        for pair in pairs {
+                            let matches_mint = pair
+                                .get("baseToken")
+                                .and_then(|b| b.get("address"))
+                                .and_then(|s| s.as_str())
+                                .map(|addr| addr.eq_ignore_ascii_case(mint))
+                                .unwrap_or(false);
+
+                            if !matches_mint {
+                                continue;
+                            }
+
+                            let symbol = pair
+                                .get("baseToken")
+                                .and_then(|b| b.get("symbol"))
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("TOKEN")
+                                .to_string();
+                            let price_usd: f64 = pair
+                                .get("priceUsd")
+                                .and_then(|p| p.as_str())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0.0);
+                            let liquidity_usd: f64 = pair
+                                .get("liquidity")
+                                .and_then(|l| l.get("usd"))
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
+                            let mcap: f64 = pair
+                                .get("marketCap")
+                                .or_else(|| pair.get("fdv"))
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
+
+                            if price_usd > 0.0 && liquidity_usd > max_liq {
+                                max_liq = liquidity_usd;
+                                best_pair = Some((symbol, price_usd, liquidity_usd, mcap));
+                            }
+                        }
+
+                        if let Some((symbol, price_usd, liquidity_usd, mcap)) = best_pair {
                             if let Ok(mut cache) = get_price_cache().write() {
                                 cache.insert(
                                     mint.to_string(),
