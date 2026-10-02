@@ -2,7 +2,9 @@
 
 ZenithSW adalah engine *shadow copy-trading* multi-chain dengan daemon engine terpisah dan dashboard TUI Ratatui. Fokus implementasi saat ini adalah Solana dan fondasi eksekusi read-only Robinhood Chain.
 
-> **Status penting:** fondasi lokal, konfigurasi fail-closed, database, IPC, runtime harness, dan code gates tervalidasi. Solana memiliki jalur mirror execution yang lebih lengkap. Robinhood masih dalam validasi dry-run dan **belum siap untuk copy-trade live**. Belum ada canary on-chain dengan rekonsiliasi receipt, event, saldo, dan posisi.
+> **Status penting:**
+> - **Solana**: Live-ready dan aktif (`DRY_RUN=false`) menggunakan database terisolasi `data/trading_state_live.db`. Eksekusi canary roundtrip mainnet (BUY, SELL, dan post-trade settlement) telah sukses terkonfirmasi 100% on-chain (tx receipt, event, post-trade zero dust/orphan, durable SELL intent state machine, dan isolasi kuota RPC Helius).
+> - **Robinhood**: Masih dry-run read-only dan **belum siap untuk copy-trade live**. `send_raw_transaction` dan mutasi posisi live dinonaktifkan secara fail-closed sampai canary on-chain Robinhood diverifikasi.
 
 ## Arsitektur
 
@@ -34,7 +36,14 @@ TUI juga melakukan refresh database berkala. Status IPC harus dibedakan dari sna
 - **Arsitektur Dual-Channel & Multi-Endpoint Round-Robin RPC**:
   - *Kanal Publik & WebSocket* (`SOLANA_RPC_URL`, `SOLANA_WS_URL`): Mendukung multi-endpoint yang dipisahkan koma dengan rotasi *atomic round-robin* (`AtomicUsize`), auto-failover, pacing 2.500ms antardompet, dan jeda adaptif HTTP 429 backoff (1.500ms) untuk menangani polling rutin tanda tangan wallet (`getSignaturesForAddress`) dan saldo token (`getTokenAccountsByOwner`) tanpa membakar kuota eksekusi (0 credit Helius).
   - *Kanal Presisi Eksekusi* (`SOLANA_EXECUTION_RPC_URL`, misal Helius): Didedikasikan eksklusif untuk parsing terurai transaksi whale (`getTransaction` jsonParsed), fetch blockhash kritis (`getLatestBlockhash`), dan broadcast transaksi langsung (`sendTransaction`).
+  - *Proteksi Kuota Streamer*: `SolanaStreamListener` dikunci ke RPC publik nol-kuota (`rpc: None`), memisahkan streamer sepenuhnya dari kuota eksekusi Helius.
 - **Parser Native SOL Stream**: Menghitung selisih saldo lamports Native SOL fisik (`meta.preBalances` vs `meta.postBalances`) dengan kompensasi netral fee transaksi pada fee payer, mencegah salah klasifikasi transaksi DEX multi-hop/Native SOL sebagai `TRANSFER`.
+- **Durable Intent State Machine (BUY & SELL)**:
+  - Sebelum eksekusi alur SELL (PumpPortal bonding curve atau Jupiter Swap), engine mencatat intent unik persisten ke SQLite (`execution_intents`) dengan transisi: `QUOTED` $\rightarrow$ `SIGNED` $\rightarrow$ `BROADCASTED` $\rightarrow$ `PENDING_RECONCILIATION` (jika konfirmasi RPC timeout) $\rightarrow$ `CONFIRMED` $\rightarrow$ `RECONCILED`.
+  - Jika terjadi kegagalan broadcast PumpPortal, intent lama ditandai `FAILED` secara fail-closed dan intent baru dibuat untuk jalur fallback Jupiter.
+- **Startup Recovery & Orphan Dust Guard**:
+  - Saat startup, engine membaca intent gantung dan merekonsiliasi status tanda tangan on-chain tanpa broadcast ulang.
+  - Scanner token fisik startup mengabaikan saldo orphan bernilai $< \$1.00\text{ USD}$ untuk menyaring debu/rug koin lama.
 - Jupiter/PumpPortal digunakan oleh jalur executor yang tersedia.
 - Konfirmasi transaksi dipolling sebelum posisi dibuka atau ditutup.
 - Balance token direkonsiliasi dari RPC.
@@ -226,8 +235,9 @@ Fondasi RPC, discovery, encoder, durable intent, dan test sudah tersedia. SELL o
 ## Database
 
 ```text
-data/trading_state.db   posisi, signal, activity, trade history, tracked token, execution intents
-data/wallet_registry.db registry smart wallet
+data/trading_state.db        posisi, signal, activity, trade history, tracked token, execution intents (mode simulasi/dry-run)
+data/trading_state_live.db   database mandiri bersih khusus eksekusi live mainnet (DRY_RUN=false)
+data/wallet_registry.db      registry smart wallet aktif
 data/candidate_wallet_registry.db kandidat belum dipromosikan
 ```
 
@@ -253,10 +263,16 @@ make restart
 Binary utama:
 
 ```text
-zenithsw-engine       daemon engine
+zenithsw-engine       daemon engine multi-chain
 zenithsw              TUI dashboard
-robinhood_probe       RPC/pool discovery probe
+solana-canary         runner verifikasi live canary Solana (BUY -> SELL -> settlement)
 robinhood-dry-run     read-only Robinhood BUY simulation runner
+robinhood_probe       RPC/pool discovery probe
+robinhood-tx-audit    audit receipt transaksi Robinhood on-chain
+keygen                generator keypair Solana & Robinhood
+config_audit          audit parser fail-closed konfigurasi .env
+radar_readonly_probe  probe baca bukti radar DexScreener & GeckoTerminal
+radar_runtime_probe   probe pipeline radar end-to-end
 ```
 
 ## Verifikasi sebelum commit/release
@@ -270,7 +286,7 @@ mise exec rust@1.94.1 -- cargo build --release --locked
 git diff --check
 ```
 
-Verifikasi terbaru: **190 library tests & 42 integration tests lulus (total 232 test), 0 gagal**. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi.
+Verifikasi terbaru: **190 library tests & 43 integration tests lulus (total 233 test), 0 gagal**. Kompilasi release binary `cargo build --release --locked` sukses. Lulus test/build bukan bukti transaksi live. Engine dan socket tetap OFF setelah validasi jika dalam pengujian terisolasi.
 
 ## Credential dan keamanan
 

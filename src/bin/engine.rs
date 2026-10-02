@@ -217,11 +217,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Initialize Stream Listeners
-    let sol_listener = Arc::new(SolanaStreamListener::new(
-        &config.solana_rpc_url,
-        config.solana_execution_rpc_url.clone(),
-    ));
+    // Initialize Stream Listeners (Streamer murni pakai pool RPC publik, proteksi kuota Helius)
+    let sol_listener = Arc::new(SolanaStreamListener::new(&config.solana_rpc_url, None));
     let arb_listener = Arc::new(EvmStreamListener::new(
         &config.robinhood_rpc_url,
         Chain::Robinhood,
@@ -300,7 +297,7 @@ async fn main() -> Result<()> {
 
     // Recover only existing transaction hashes/signatures; never rebroadcast after restart.
     let pending_intents = db.get_pending_execution_intents()?;
-    for (intent_id, chain, _action, _token_mint, _wallet, state, tx_hash, signature) in
+    for (intent_id, chain, action, _token_mint, _wallet, state, tx_hash, signature) in
         pending_intents
     {
         match chain.as_str() {
@@ -320,9 +317,17 @@ async fn main() -> Result<()> {
                     {
                         eprintln!("[INTENT RECOVERY ERROR] update SOLANA intent gagal: {error}");
                     }
+                    if confirmed {
+                        let _ = db.update_execution_intent(
+                            &intent_id,
+                            "RECONCILED",
+                            None,
+                            Some(&signature),
+                        );
+                    }
                     println!(
-                        "[INTENT RECOVERY] chain=SOLANA state={} previous_state={}",
-                        next_state, state
+                        "[INTENT RECOVERY] chain=SOLANA action={} state={} previous_state={}",
+                        action, next_state, state
                     );
                 } else {
                     if let Err(error) =
@@ -333,7 +338,8 @@ async fn main() -> Result<()> {
                         );
                     }
                     println!(
-                        "[INTENT RECOVERY] chain=SOLANA state=FAILED reason=missing_signature"
+                        "[INTENT RECOVERY] chain=SOLANA action={} state=FAILED reason=missing_signature",
+                        action
                     );
                 }
             }

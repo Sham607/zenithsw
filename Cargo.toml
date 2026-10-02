@@ -41,6 +41,10 @@ path = "src/bin/robinhood_readonly_audit.rs"
 name = "robinhood-tx-audit"
 path = "src/bin/robinhood_tx_audit.rs"
 
+[[bin]]
+name = "solana-canary"
+path = "src/bin/solana_canary.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 ratatui = "0.29"

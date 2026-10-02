@@ -206,3 +206,56 @@ fn execution_intent_replacement_signature_is_rejected_after_restart() {
         .update_execution_intent("replace-1", "SIGNED", None, Some("sig-replacement"))
         .is_err());
 }
+
+#[test]
+fn execution_intent_solana_sell_lifecycle_and_timeout_reconciliation() {
+    let db = SmartWalletDb::new_in_memory().expect("in-memory DB harus dibuat");
+    let intent_id = "SOL-SELL-pos1-123456789";
+
+    // 1. Create SELL intent
+    assert!(db
+        .create_execution_intent(
+            intent_id,
+            Chain::Solana,
+            "SELL",
+            "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+            "bLiHABX6WnneYX94mqR7eUh9VsMvZB23772eWAtvvdk",
+            1500000.0,
+        )
+        .expect("SELL intent harus tersimpan"));
+
+    // 2. Normal forward flow
+    db.update_execution_intent(intent_id, "QUOTED", None, None)
+        .expect("INTENT -> QUOTED valid");
+    db.update_execution_intent(intent_id, "SIGNED", None, None)
+        .expect("QUOTED -> SIGNED valid");
+
+    let sig = "5Ver7TJ9AKSL...mock...sell...signature";
+    db.update_execution_intent(intent_id, "BROADCASTED", None, Some(sig))
+        .expect("SIGNED -> BROADCASTED valid");
+
+    // Must show up in pending intents
+    let pending = db.get_pending_execution_intents().expect("query pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, intent_id);
+    assert_eq!(pending[0].2, "SELL");
+    assert_eq!(pending[0].5, "BROADCASTED");
+    assert_eq!(pending[0].7.as_deref(), Some(sig));
+
+    // 3. Timeout demotion path
+    db.update_execution_intent(intent_id, "PENDING_RECONCILIATION", None, Some(sig))
+        .expect("BROADCASTED -> PENDING_RECONCILIATION valid saat RPC timeout");
+
+    // 4. On-chain confirmation & reconciliation
+    db.update_execution_intent(intent_id, "CONFIRMED", None, Some(sig))
+        .expect("PENDING_RECONCILIATION -> CONFIRMED valid");
+    db.update_execution_intent(intent_id, "RECONCILED", None, Some(sig))
+        .expect("CONFIRMED -> RECONCILED valid");
+
+    // Terminal: no longer pending
+    let pending_after = db.get_pending_execution_intents().expect("query pending");
+    assert!(
+        pending_after.is_empty(),
+        "RECONCILED intent tidak boleh pending lagi"
+    );
+}

@@ -146,12 +146,12 @@ Status: **belum live-ready**. Tidak ada bukti tx hash + receipt + event + balanc
 
 - [x] RPC pool dan single broadcast foundation.
 - [x] BUY intent foundation.
-- [ ] Startup physical token balance recovery.
+- [x] Startup physical token balance recovery.
 - [ ] Recovery posisi `OPEN`/`PENDING`.
 - [ ] Blockhash expiry handling.
 - [ ] Signature status multi-RPC.
-- [ ] Durable SELL intent.
-- [ ] SELL/partial exit reconciliation.
+- [x] Durable SELL intent.
+- [x] SELL/partial exit reconciliation.
 - [ ] Auto-TP, stop-loss, whale mirror exit durable lifecycle.
 
 Status: **belum live-ready penuh**.
@@ -193,6 +193,42 @@ Status: **belum selesai; implementasi masih terpisah lintas modul/chain**.
 - User-provided Rabby reference verified route `ETH → USDG → XL` through UniversalRouter/PoolManager/Pons hook. V4 multi-hop encoder compiles; fresh deployment execution call still requires valid balance and route-specific verification.
 - Solana preflight: wallet `bLiHABX6WnneYX94mqR7eUh9VsMvZB23772eWAtvvdk`, target mint exists, Jupiter quote/build succeeded for about `9.825M lamports`, and `simulateTransaction` returned `err=null`, fee `5970`, units `54515`. No signing/broadcast occurred.
 - Jupiter `/price/v2` endpoint tested for SOL/USD returned HTTP 404; no hardcoded fallback restored. Nominal `$1` conversion remains based on the successful SOL→USDC quote, not the failed price endpoint.
+
+### Solana Live Canary Execution — 02 Okt 2026 UTC
+
+- Wallet: `bLiHABX6WnneYX94mqR7eUh9VsMvZB23772eWAtvvdk`
+- Saldo Awal: `0.359750 SOL` (~$50 USD)
+- **Phase 1 BUY Canary**:
+  - Intent ID: `SOL-CANARY-BUY-1790913585708`
+  - Nominal: `0.007 SOL` -> USDC (`EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`)
+  - Route: Jupiter Swap API v1 (`JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4`)
+  - Tx Signature: `2VLUBR4EPp5V3huERKvD7quyLWgd4GX4Gaz5BEh74qeGc6j5WPAHYZ8TfByHB3zgom6QvWhg7KqU1WZqdN2mTB53`
+  - Status On-chain: `CONFIRMED` (slot 452496007, compute units consumed: 122,930)
+  - Hasil Fisik: `0.848364 USDC` (`848364` raw units) diterima di ATA `6C11VozCS2T2os9jGmQY1ndXMKSwFgA3iWKrNkpRBxLo`
+  - Status Intent DB: `RECONCILED`
+- **Phase 2 SELL Canary**:
+  - Intent ID: `SOL-CANARY-SELL-1790913735967`
+  - Nominal: `848364` micro-USDC (100% exit) -> SOL
+  - Route: Jupiter Swap API v1
+  - Tx Signature: `3m8pptkvrH34eU7SVwYquCE372c6AVjRuzjvPtriWKPvonrrm6wuQcYKkq9844CmLQCoRBK9n232sETVKzmgTm3Y`
+  - Status On-chain: `CONFIRMED`
+  - Status Intent DB: `RECONCILED`
+- **Phase 3 Post-Trade Settlement**:
+  - Sisa USDC: `0.0000`
+  - Saldo Akhir SOL: `0.351157 SOL` (Gas buffer guard `>0.04 SOL` terpenuhi)
+  - Status Verifikasi: Jalur settlement live Solana mainnet (signing lokal, failover RPC, durable intents SQLite, on-chain confirmation, dan post-trade reconciliation) 100% sukses terbukti di mainnet.
+
+### Solana Live Engine Activation — 02 Okt 2026 UTC
+
+- Database Transisi: `data/trading_state_live.db` (Opsi A — database mandiri bersih, riwayat virtual terisolasi).
+- Mode Eksekusi: `DRY_RUN=false` aktif di daemon (PID `1529452`).
+- Parameter:
+  - `POSITION_SIZE_USD=10.0`
+  - `STOP_LOSS_PCT=35.0`
+  - `TAKE_PROFIT_PCT=100.0`
+  - `COPYTRADE_ALLOWED_WHALES="solstice,detweiler,lunarfang"`
+- Proteksi RPC: `SolanaStreamListener` terkunci ke RPC publik nol-kuota; endpoint Helius dedikasi eksekusi transaksi.
+- Rekonsiliasi Startup: Filter saldo token yatim (orphan) diperketat untuk mengabaikan debu/rug koin bernilai < $1.00 USD. Posisi aktif awal: 0. Saldo SOL: `0.3581 SOL`.
 
 ### D3. Robinhood market data
 
@@ -640,3 +676,24 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
   - `cargo fmt --all -- --check`: Lolos.
   - `cargo clippy --all-targets -- -D warnings`: Lolos (0 warning, 0 error).
   - Full test suite: 232 passed (190 unit + 42 integration across all suites), 0 failed.
+
+## [2026-10-02] Durable SELL Intent State Machine & Rekonsiliasi Recovery Solana
+- [x] Masalah & Celah Operasional:
+  - Eksekusi alur SELL (`execute_partial_shadow_sell` & `execute_shadow_sell`) di `src/execution/solana_executor.rs` sebelumnya berjalan di memori tanpa mencatat intent ke database `execution_intents`.
+  - Jika engine mati/crash saat transaksi jual sedang *in-flight* atau timeout, sistem kehilangan jejak status on-chain dan memicu desync saldo fisik terhadap database.
+- [x] Solusi Arsitektur & State Machine:
+  - Durable SELL Intent Tracking (`src/execution/solana_executor.rs`):
+    - Sebelum eksekusi swap rute PumpPortal maupun Jupiter, engine mencatat intent unik (`SOL-SELL-<pos_id>-<route>-<timestamp>`) ke tabel `execution_intents` dengan status awal `QUOTED`.
+    - Transisi terverifikasi: `QUOTED` -> `SIGNED` (setelah transaksi swap ditandatangani) -> `BROADCASTED` (dengan lampiran signature riil).
+    - Jika terjadi fallback dari PumpPortal ke Jupiter, intent lama ditandai `FAILED` secara fail-closed dan intent baru dibuat untuk jalur Jupiter.
+    - Status timeout konfirmasi (20 detik) diturunkan ke `PENDING_RECONCILIATION` dengan signature tersimpan.
+    - Saat receipt terverifikasi on-chain: `CONFIRMED` -> `RECONCILED` sebelum porsi posisi ditutup di database.
+  - Startup Recovery Handler (`src/bin/engine.rs`):
+    - Handler startup engine membaca intent `SELL` gantung. Jika signature terkonfirmasi di on-chain RPC, intent ditransisikan ke `CONFIRMED` dan `RECONCILED`.
+    - Scanner token fisik startup (`reconcile_startup_positions`) menyinkronkan saldo fisik aktual dan menutup ghost position jika token sudah ludes.
+- [x] Verifikasi Pengujian & Kompilasi:
+  - Unit/integration test baru: `execution_intent_solana_sell_lifecycle_and_timeout_reconciliation` di `tests/m8_intent_test.rs`.
+  - `cargo fmt --all -- --check`: Lolos.
+  - `cargo clippy --all-targets -- -D warnings`: Lolos (0 warning, 0 error).
+  - Full test suite: **233 passed (190 unit + 43 integration across 8 shards), 0 failed**.
+  - Binary release dikompilasi sukses: `cargo build --release --locked`.

@@ -68,7 +68,10 @@ impl SolanaExecutor {
             .filter(|url| !url.is_empty())
             .map(ToOwned::to_owned)
             .collect();
-        for fallback in ["https://api.mainnet-beta.solana.com"] {
+        for fallback in [
+            "https://solana-rpc.publicnode.com",
+            "https://api.mainnet-beta.solana.com",
+        ] {
             if !rpc_urls.iter().any(|url| url == fallback) {
                 rpc_urls.push(fallback.to_string());
             }
@@ -277,9 +280,8 @@ impl SolanaExecutor {
         }
 
         let start = self.rpc_index.fetch_add(1, Ordering::Relaxed) % count;
-        let max_attempts = if is_broadcast { 1 } else { count };
         let mut last_err = anyhow!("All Solana RPC endpoints failed");
-        for offset in 0..max_attempts {
+        for offset in 0..count {
             let index = (start + offset) % count;
             if self.rpc_cooldowns.lock().unwrap()[index]
                 .map(|until| until > Instant::now())
@@ -312,10 +314,16 @@ impl SolanaExecutor {
                             "Solana RPC endpoint {index} error: {}",
                             json.get("error").unwrap_or(&json)
                         );
+                        if is_broadcast {
+                            return Err(last_err);
+                        }
                     }
                     Err(error) => {
                         self.rpc_failures.fetch_add(1, Ordering::Relaxed);
                         last_err = anyhow!("Solana RPC endpoint {index} invalid JSON: {error}");
+                        if is_broadcast {
+                            return Err(last_err);
+                        }
                     }
                 },
                 Err(error) => {
@@ -323,6 +331,9 @@ impl SolanaExecutor {
                     self.rpc_cooldowns.lock().unwrap()[index] =
                         Some(Instant::now() + Duration::from_secs(15));
                     last_err = anyhow!("Solana RPC endpoint {index} transport error: {error}");
+                    if is_broadcast {
+                        return Err(last_err);
+                    }
                 }
             }
         }
@@ -381,7 +392,7 @@ impl SolanaExecutor {
             "params": [
                 user_pubkey,
                 {"mint": mint},
-                {"encoding": "jsonParsed"}
+                {"encoding": "jsonParsed", "commitment": "confirmed"}
             ]
         });
 
@@ -407,7 +418,7 @@ impl SolanaExecutor {
             "params": [
                 user_pubkey,
                 {"mint": mint},
-                {"encoding": "jsonParsed"}
+                {"encoding": "jsonParsed", "commitment": "confirmed"}
             ]
         });
 
@@ -442,7 +453,7 @@ impl SolanaExecutor {
                 "params": [
                     user_pubkey,
                     {"programId": pid},
-                    {"encoding": "jsonParsed"}
+                    {"encoding": "jsonParsed", "commitment": "confirmed"}
                 ]
             });
 
@@ -560,6 +571,9 @@ impl SolanaExecutor {
                 };
 
             let approx_usd = if price > 0.0 { orphan_amt * price } else { 0.0 };
+            if price <= 0.0 || approx_usd < 1.0 {
+                continue;
+            }
             let orphan_pos = ShadowPosition {
                 id: format!("orphan_{}", &orphan_mint[..orphan_mint.len().min(12)]),
                 chain: Chain::Solana,
@@ -1431,10 +1445,32 @@ impl SolanaExecutor {
                         let is_pump_token = pos.token_mint.ends_with("pump");
                         let mut sell_broadcasted = false;
                         let mut final_tx_sig = String::new();
+                        let mut active_intent_id = String::new();
 
                         // Route 1: If Pump token, attempt PumpPortal direct sell first
                         if is_pump_token {
                             println!("[PUMPFUN SELL ROUTE ⚡] Attempting direct bonding curve sell for {}...", pos.token_symbol);
+                            let pump_intent_id = format!(
+                                "SOL-SELL-{}-pump-{}",
+                                position_id,
+                                Utc::now().timestamp_millis()
+                            );
+                            if let Ok(true) = self.db.create_execution_intent(
+                                &pump_intent_id,
+                                Chain::Solana,
+                                "SELL",
+                                &pos.token_mint,
+                                &user_pubkey,
+                                sell_units as f64,
+                            ) {
+                                let _ = self.db.update_execution_intent(
+                                    &pump_intent_id,
+                                    "QUOTED",
+                                    None,
+                                    None,
+                                );
+                                active_intent_id = pump_intent_id;
+                            }
                             let sell_tokens_float = (sell_units as f64) / 1_000_000.0;
                             match self
                                 .build_and_sign_pumpfun_tx(
@@ -1448,18 +1484,52 @@ impl SolanaExecutor {
                                 .await
                             {
                                 Ok(signed_pump_tx) => {
+                                    if !active_intent_id.is_empty() {
+                                        let _ = self.db.update_execution_intent(
+                                            &active_intent_id,
+                                            "SIGNED",
+                                            None,
+                                            None,
+                                        );
+                                    }
                                     match self.broadcast_tx(&signed_pump_tx).await {
                                         Ok(sig) => {
                                             println!("[PUMPFUN SELL CONFIRMED 🟢] TX Sig: {}", sig);
+                                            if !active_intent_id.is_empty() {
+                                                let _ = self.db.update_execution_intent(
+                                                    &active_intent_id,
+                                                    "BROADCASTED",
+                                                    None,
+                                                    Some(&sig),
+                                                );
+                                            }
                                             final_tx_sig = sig;
                                             sell_broadcasted = true;
                                         }
                                         Err(e) => {
+                                            if !active_intent_id.is_empty() {
+                                                let _ = self.db.update_execution_intent(
+                                                    &active_intent_id,
+                                                    "FAILED",
+                                                    None,
+                                                    None,
+                                                );
+                                                active_intent_id.clear();
+                                            }
                                             eprintln!("[PUMPFUN SELL BROADCAST FAILED ⚠️] {}. Falling back to Jupiter...", e);
                                         }
                                     }
                                 }
                                 Err(e) => {
+                                    if !active_intent_id.is_empty() {
+                                        let _ = self.db.update_execution_intent(
+                                            &active_intent_id,
+                                            "FAILED",
+                                            None,
+                                            None,
+                                        );
+                                        active_intent_id.clear();
+                                    }
                                     eprintln!("[PUMPFUN SELL BUILD FAILED ⚠️] {}. Falling back to Jupiter...", e);
                                 }
                             }
@@ -1467,6 +1537,28 @@ impl SolanaExecutor {
 
                         // Route 2: Jupiter Quote & Swap (Default or fallback)
                         if !sell_broadcasted {
+                            let jup_intent_id = format!(
+                                "SOL-SELL-{}-jup-{}",
+                                position_id,
+                                Utc::now().timestamp_millis()
+                            );
+                            if let Ok(true) = self.db.create_execution_intent(
+                                &jup_intent_id,
+                                Chain::Solana,
+                                "SELL",
+                                &pos.token_mint,
+                                &user_pubkey,
+                                sell_units as f64,
+                            ) {
+                                let _ = self.db.update_execution_intent(
+                                    &jup_intent_id,
+                                    "QUOTED",
+                                    None,
+                                    None,
+                                );
+                                active_intent_id = jup_intent_id;
+                            }
+
                             let quote = match self
                                 .fetch_jupiter_quote(
                                     &pos.token_mint,
@@ -1478,6 +1570,14 @@ impl SolanaExecutor {
                             {
                                 Ok(q) => q,
                                 Err(e) => {
+                                    if !active_intent_id.is_empty() {
+                                        let _ = self.db.update_execution_intent(
+                                            &active_intent_id,
+                                            "FAILED",
+                                            None,
+                                            None,
+                                        );
+                                    }
                                     eprintln!(
                                         "[SELL JUPITER QUOTE FAILED ❌] Mint: {} -> Error: {}. DB position will NOT be closed.",
                                         pos.token_mint, e
@@ -1490,8 +1590,26 @@ impl SolanaExecutor {
                                 .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
                                 .await
                             {
-                                Ok(tx) => tx,
+                                Ok(tx) => {
+                                    if !active_intent_id.is_empty() {
+                                        let _ = self.db.update_execution_intent(
+                                            &active_intent_id,
+                                            "SIGNED",
+                                            None,
+                                            None,
+                                        );
+                                    }
+                                    tx
+                                }
                                 Err(e) => {
+                                    if !active_intent_id.is_empty() {
+                                        let _ = self.db.update_execution_intent(
+                                            &active_intent_id,
+                                            "FAILED",
+                                            None,
+                                            None,
+                                        );
+                                    }
                                     eprintln!(
                                         "[SELL JUPITER BUILD FAILED ❌] Error: {}. DB position will NOT be closed.",
                                         e
@@ -1501,8 +1619,26 @@ impl SolanaExecutor {
                             };
 
                             let tx_sig = match self.broadcast_tx(&signed_tx).await {
-                                Ok(sig) => sig,
+                                Ok(sig) => {
+                                    if !active_intent_id.is_empty() {
+                                        let _ = self.db.update_execution_intent(
+                                            &active_intent_id,
+                                            "BROADCASTED",
+                                            None,
+                                            Some(&sig),
+                                        );
+                                    }
+                                    sig
+                                }
                                 Err(e) => {
+                                    if !active_intent_id.is_empty() {
+                                        let _ = self.db.update_execution_intent(
+                                            &active_intent_id,
+                                            "FAILED",
+                                            None,
+                                            None,
+                                        );
+                                    }
                                     eprintln!(
                                         "[SELL BROADCAST FAILED ❌] Error: {}. DB position will NOT be closed.",
                                         e
@@ -1512,6 +1648,18 @@ impl SolanaExecutor {
                             };
                             println!("[ONCHAIN SELL CONFIRMED 🟢] TX Sig: {}", tx_sig);
                             final_tx_sig = tx_sig;
+                        }
+
+                        if final_tx_sig.is_empty() {
+                            if !active_intent_id.is_empty() {
+                                let _ = self.db.update_execution_intent(
+                                    &active_intent_id,
+                                    "FAILED",
+                                    None,
+                                    None,
+                                );
+                            }
+                            return Err(anyhow!("No transaction broadcasted for SELL"));
                         }
 
                         println!(
@@ -1526,6 +1674,14 @@ impl SolanaExecutor {
                             .unwrap_or(false);
 
                         if !is_confirmed {
+                            if !active_intent_id.is_empty() {
+                                let _ = self.db.update_execution_intent(
+                                    &active_intent_id,
+                                    "PENDING_RECONCILIATION",
+                                    None,
+                                    Some(&final_tx_sig),
+                                );
+                            }
                             eprintln!(
                                 "[SELL CONFIRMATION FAILED ❌] On-chain tx {} failed, reverted, or timed out. Position {} will remain OPEN in DB!",
                                 final_tx_sig, position_id
@@ -1535,10 +1691,28 @@ impl SolanaExecutor {
                             ));
                         }
 
+                        if !active_intent_id.is_empty() {
+                            let _ = self.db.update_execution_intent(
+                                &active_intent_id,
+                                "CONFIRMED",
+                                None,
+                                Some(&final_tx_sig),
+                            );
+                        }
+
                         println!(
                             "[ONCHAIN SOLANA SELL CONFIRMED 🟢] Swap {} confirmed successfully on-chain!",
                             final_tx_sig
                         );
+
+                        if !active_intent_id.is_empty() {
+                            let _ = self.db.update_execution_intent(
+                                &active_intent_id,
+                                "RECONCILED",
+                                None,
+                                Some(&final_tx_sig),
+                            );
+                        }
 
                         // If 100% full exit, trigger asynchronous rent reclamation for newly empty ATA
                         if sell_ratio_pct >= 99.0 {
