@@ -697,3 +697,13 @@ Status: **DONE — Zero-guessing startup reconciliation active on Solana.**
   - `cargo clippy --all-targets -- -D warnings`: Lolos (0 warning, 0 error).
   - Full test suite: **233 passed (190 unit + 43 integration across 8 shards), 0 failed**.
   - Binary release dikompilasi sukses: `cargo build --release --locked`.
+
+## [2026-10-02] Audit On-Chain & Purge Registry Wallet Tidak Layak
+- [x] Masalah & Temuan Audit:
+  - `bunker_detweiler_sat_01` (`4X7FEZ283wQhRuyBjrgiNv76pnVasFXdRJqzFcG86HxY`): Status pasif/dormant total (0 signature di on-chain RPC sejak didaftarkan).
+  - `bunker_solstice_feeder_01` (`ARu4n5mFdZogZAravu7CcizaojWnS6oqka37gdLT5SZn`): 100% dari 653 aktivitas merupakan event `TRANSFER` debu mikro token ($0.00000001 - $0.04 USD) dan perpindahan likuiditas, bukan transaksi `BUY` di DEX.
+- [x] Tindakan Remediasi:
+  - Backup snapshot registry: `data/wallet_registry.db.bak_20261002_093425`.
+  - Hapus 2 entri wallet tidak layak dari `data/wallet_registry.db`.
+  - Total wallet aktif terpangkas dari 18 menjadi 16 dompet.
+  - Whitelist copytrade `COPYTRADE_ALLOWED_WHALES="solstice,detweiler,lunarfang"` kini terkonsentrasi eksklusif pada 3 sniper utama dengan riwayat PnL terbukti: `bunker_lunarfang_01`, `bunker_solstice_main_01`, dan `bunker_detweiler_main_01`.
