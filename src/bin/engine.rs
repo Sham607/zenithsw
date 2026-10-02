@@ -950,34 +950,77 @@ async fn main() -> Result<()> {
                                         )
                                         .await
                                         .ok();
-                                    if let Some((_, _fresh_p, fresh_liq, _)) = fresh_market {
-                                        if fresh_liq >= config_pos.liquidity_drain_usd {
+
+                                    let dexscreener_recovered = fresh_market
+                                        .as_ref()
+                                        .map(|(_, _, fresh_liq, _)| {
+                                            *fresh_liq >= config_pos.liquidity_drain_usd
+                                        })
+                                        .unwrap_or(false);
+
+                                    if dexscreener_recovered {
+                                        let fresh_liq = fresh_market.unwrap().2;
+                                        println!(
+                                            "[LIQUIDITY DRAIN REJECTED 🛡️] {} liquidity recovered to ${:.0} on recheck. False alarm discarded!",
+                                            pos.token_symbol, fresh_liq
+                                        );
+                                        false
+                                    } else {
+                                        if fresh_market.is_none() {
                                             println!(
-                                                "[LIQUIDITY DRAIN REJECTED 🛡️] {} liquidity recovered to ${:.0} on recheck. False alarm discarded!",
-                                                pos.token_symbol, fresh_liq
+                                                "[LIQUIDITY DRAIN WARNING ⚠️] {} DexScreener recheck unavailable/timed out. Verifying via Jupiter route...",
+                                                pos.token_symbol
                                             );
-                                            false
-                                        } else {
-                                            // Secondary check: verify Jupiter realizable route
-                                            match sol_exec_pos
-                                                .get_fresh_exit_quote(&pos.token_mint, 0)
-                                                .await
+                                        }
+                                        // Secondary check: verify Jupiter realizable route
+                                        match sol_exec_pos
+                                            .get_fresh_exit_quote(&pos.token_mint, 0)
+                                            .await
+                                        {
+                                            Ok(q)
+                                                if q.estimated_out_lamports > 0
+                                                    && q.price_impact_pct < 50.0 =>
                                             {
-                                                Ok(q)
-                                                    if q.estimated_out_lamports > 0
-                                                        && q.price_impact_pct < 50.0 =>
-                                                {
+                                                println!(
+                                                    "[LIQUIDITY DRAIN REJECTED 🛡️] {} Jupiter route verified active (impact: {:.1}%, out: {:.4} SOL). False alarm discarded!",
+                                                    pos.token_symbol, q.price_impact_pct, q.estimated_out_sol
+                                                );
+                                                false
+                                            }
+                                            Ok(q) => {
+                                                println!(
+                                                    "[LIQUIDITY DRAIN CONFIRMED 🚨] {} Jupiter route severely degraded (impact: {:.1}%, out: {:.4} SOL). Triggering emergency exit!",
+                                                    pos.token_symbol, q.price_impact_pct, q.estimated_out_sol
+                                                );
+                                                true
+                                            }
+                                            Err(err) => {
+                                                let err_msg = err.to_string();
+                                                let lower = err_msg.to_lowercase();
+                                                let is_terminal = lower
+                                                    .contains("could_not_find_any_route")
+                                                    || lower.contains("could not find any route")
+                                                    || lower.contains("token_not_tradable")
+                                                    || lower.contains("not tradable")
+                                                    || lower.contains("not_enough_liquidity")
+                                                    || lower.contains("not enough liquidity")
+                                                    || lower.contains("route_not_found");
+
+                                                if is_terminal {
                                                     println!(
-                                                        "[LIQUIDITY DRAIN REJECTED 🛡️] {} Jupiter route verified active (impact: {:.1}%, out: {:.4} SOL). DexScreener anomaly discarded!",
-                                                        pos.token_symbol, q.price_impact_pct, q.estimated_out_sol
+                                                        "[LIQUIDITY DRAIN CONFIRMED 🚨] {} Jupiter route collapsed on-chain ({}). Triggering emergency exit!",
+                                                        pos.token_symbol, err_msg
+                                                    );
+                                                    true
+                                                } else {
+                                                    eprintln!(
+                                                        "[LIQUIDITY DRAIN SUSPENDED ⚠️] {} route verification failed with network/transient error: {}. Position held safely for next cycle.",
+                                                        pos.token_symbol, err_msg
                                                     );
                                                     false
                                                 }
-                                                _ => true,
                                             }
                                         }
-                                    } else {
-                                        true
                                     }
                                 }
                                 _ => true,
