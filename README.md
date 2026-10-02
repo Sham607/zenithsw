@@ -249,16 +249,23 @@ Kedua database memakai SQLite WAL. Jangan menghapus atau mereset database tanpa 
 - **Pruning Terjadwal**: Menghapus `radar_evidence` kadaluarsa (>24 jam) dengan menyisakan state snapshot token teranyar, memangkas `radar_market_history` (>7 hari), serta mengeksekusi `PRAGMA wal_checkpoint(PASSIVE)` dan `PRAGMA optimize`.
 - **Zero Heartbeat Lock Contention**: Operasi `DELETE` dan optimasi I/O besar dipindahkan seluruhnya dari alur tulis streaming/radar ke background worker, menjaga IPC heartbeat TUI tetap lancar (`<10ms`) tanpa risiko *stale heartbeat*.
 
-## Menjalankan
+## Menjalankan & Perintah Manajemen (`make`)
 
-```bash
-make release
-make test
-make engine
-make start
-make stop
-make restart
-```
+Alur operasional daemon, TUI, dan pengujian dikelola melalui target `Makefile`:
+
+- `make release`: Kompilasi seluruh binary dalam profil release teroptimasi (`cargo build --release`).
+- `make test`: Eksekusi seluruh rangkaian test unit dan integrasi terisolasi (`cargo test --locked`).
+- `make start`: Mengubah `DRY_RUN=true` di `.env`, mengompilasi release, dan me-restart engine daemon via systemd user service (`zenithsw-engine.service`).
+- `make start-live`: Mengubah `DRY_RUN=false` di `.env`, mengompilasi release, dan me-restart engine daemon dalam mode live trading transaksi riil.
+- `make tui`: Mengompilasi release lalu membuka dashboard visual interaktif Ratatui (`zenithsw`).
+- `make engine`: Menjalankan daemon engine secara langsung di foreground console (`cargo run --release --bin zenithsw-engine`).
+- `make stop`: Menghentikan systemd service `zenithsw-engine.service` dan mematikan sisa proses engine.
+- `make restart`: Me-restart systemd service engine tanpa mengubah konfigurasi `DRY_RUN` yang sedang aktif di `.env`.
+- `make logs`: Menyimak *live streaming* log engine via journalctl (`journalctl --user -u zenithsw-engine.service -f`).
+- `make reset`: **Peringatan Destruktif** — mematikan engine dan menghapus seluruh database (`data/*.db*`) beserta socket IPC. Wajib izin dan backup sebelum dieksekusi.
+- `make clean`: Membersihkan cache build Cargo (`target/`) dan menghapus file socket IPC.
+- `make build`: Kompilasi build cepat dalam profil debug (`cargo build`).
+- `make help`: Menampilkan ringkasan bantuan daftar target perintah Makefile.
 
 Binary utama:
 
