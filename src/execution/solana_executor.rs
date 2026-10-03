@@ -270,6 +270,11 @@ impl SolanaExecutor {
         Ok((signing_key, pubkey_b58))
     }
 
+    /// Derives wallet Base58 public key if private key is configured
+    pub fn get_wallet_pubkey(&self) -> Option<String> {
+        self.get_keypair().ok().map(|(_, pubkey)| pubkey)
+    }
+
     /// Mengirim satu request read/broadcast ke pool RPC Solana.
     /// Broadcast tetap hanya sekali; caller wajib merekonsiliasi signature.
     pub async fn post_rpc(&self, payload: &Value) -> Result<Value> {
@@ -482,7 +487,7 @@ impl SolanaExecutor {
         Ok((raw_total, ui))
     }
 
-    async fn get_token_balance(&self, user_pubkey: &str, mint: &str) -> Result<(u64, f64)> {
+    pub async fn get_token_balance(&self, user_pubkey: &str, mint: &str) -> Result<(u64, f64)> {
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -505,6 +510,14 @@ impl SolanaExecutor {
     /// Saldo raw token untuk satu mint (semua token account dijumlahkan). Fail-closed.
     pub async fn get_raw_token_balance(&self, user_pubkey: &str, mint: &str) -> Result<u64> {
         Ok(self.get_token_balance(user_pubkey, mint).await?.0)
+    }
+
+    /// Saldo token (raw dan UI) untuk dompet bot sendiri yang terkonfigurasi. Fail-closed.
+    pub async fn get_own_token_balance(&self, mint: &str) -> Result<(u64, f64)> {
+        let pubkey = self
+            .get_wallet_pubkey()
+            .ok_or_else(|| anyhow!("Wallet not configured"))?;
+        self.get_token_balance(&pubkey, mint).await
     }
 
     /// Fetches all SPL and Token-2022 tokens held by user_pubkey with non-zero balance.
@@ -760,12 +773,18 @@ impl SolanaExecutor {
             }
         }
 
-        // Amount must be positive; if 0, use normalized sample (1_000_000 raw units) for evaluation
-        let amount = if token_amount_raw > 0 {
-            token_amount_raw
-        } else {
-            1_000_000
-        };
+        // Amount must be positive; if 0, attempt to look up owned raw balance, else use normalized sample (1_000_000 raw units)
+        let mut amount = token_amount_raw;
+        if amount == 0 {
+            if let Ok((raw_bal, _)) = self.get_own_token_balance(token_mint).await {
+                if raw_bal > 0 {
+                    amount = raw_bal;
+                }
+            }
+        }
+        if amount == 0 {
+            amount = 1_000_000;
+        }
 
         // 2. Fetch fresh quote from Jupiter
         match self

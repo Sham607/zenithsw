@@ -796,13 +796,33 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    // 1. External exit detection: Jika posisi berstatus aktif di DB tetapi saldo token on-chain 0,
+                    // tandai posisi CLOSED seketika agar bot tidak melacak token hantu / salah hitung PnL.
+                    if !pos.is_dry_run && pos.chain == Chain::Solana {
+                        if let Ok((raw_bal, _)) = sol_exec_pos.get_own_token_balance(&pos.token_mint).await {
+                            if raw_bal == 0 {
+                                println!(
+                                    "[EXTERNAL EXIT DETECTED 🔄] Token {} ({}) saldo on-chain 0. Menutup posisi {} sebagai CLOSED.",
+                                    pos.token_symbol, pos.token_mint, pos.id
+                                );
+                                pos.status = "CLOSED".to_string();
+                                pos.remaining_portion_pct = 0.0;
+                                pos.last_update = Utc::now();
+                                if let Err(e) = db_pos_tracker.upsert_position(pos) {
+                                    eprintln!("[POSITION DB ERROR] Gagal menutup posisi eksternal {}: {e}", pos.id);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
                     // Fetch latest live price & pool liquidity; never relabel stale price as fresh.
                     let price_result = match pos.chain {
                         Chain::Solana => SolanaStreamListener::fetch_token_price(&pos.token_mint).await,
                         Chain::Robinhood => Err(anyhow::anyhow!("Robinhood position price requires a verified on-chain quote; Solana resolver is not permitted")),
                         _ => Err(anyhow::anyhow!("unsupported chain position price source")),
                     };
-                    let (live_price, live_liquidity) = match price_result {
+                    let (mut live_price, live_liquidity) = match price_result {
                         Ok((_, price, liquidity, _))
                             if price.is_finite()
                                 && price > 0.0
@@ -828,6 +848,32 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     };
+
+                    // Realizable Jupiter Quote integration:
+                    // Verifikasi harga realizable on-chain via Jupiter swap quote.
+                    // Jika harga realizable lebih rendah daripada DexScreener (akibat slippage/price impact/pool tipis),
+                    // wajib prioritaskan harga realizable on-chain sebagai ground truth untuk trailing stop & stop-loss!
+                    if pos.chain == Chain::Solana {
+                        if let Ok(quote) = sol_exec_pos.get_realizable_exit_quote(&pos.token_mint, 0).await {
+                            if quote.estimated_out_sol > 0.0 {
+                                let sol_usd = SolanaStreamListener::get_cached_sol_price_usd().await;
+                                let realizable_value_usd = quote.estimated_out_sol * sol_usd;
+                                let calc_price = if !pos.is_dry_run && pos.amount_native > 0.0 {
+                                    realizable_value_usd / pos.amount_native
+                                } else {
+                                    0.0
+                                };
+
+                                if calc_price > 0.0 && calc_price.is_finite() && calc_price < live_price {
+                                    println!(
+                                        "[REALIZABLE ORACLE 🎯] {} DexScreener=${:.8} vs Realizable=${:.8} (impact: {:.1}%, out: {:.4} SOL). Menggunakan realizable price.",
+                                        pos.token_symbol, live_price, calc_price, quote.price_impact_pct, quote.estimated_out_sol
+                                    );
+                                    live_price = calc_price;
+                                }
+                            }
+                        }
+                    }
 
                     // Sanity check: Discard single-tick anomaly if price jumps > configured multiplier in one tick from an established price
                     if live_price > 0.0 {

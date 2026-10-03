@@ -15,6 +15,7 @@ type PriceCacheEntry = (String, f64, f64, f64, Instant);
 type PriceCache = RwLock<HashMap<String, PriceCacheEntry>>;
 
 static PRICE_CACHE: OnceLock<PriceCache> = OnceLock::new();
+static SOL_PRICE_CACHE: OnceLock<RwLock<(f64, Instant)>> = OnceLock::new();
 
 /// Quote/collateral mints yang dipakai whale untuk membayar.
 pub fn is_collateral_mint(mint: &str) -> bool {
@@ -308,6 +309,8 @@ impl SolanaStreamListener {
         let mut whale_balance_before = 0.0;
         let mut whale_balance_after = 0.0;
         let mut sell_ratio_pct = 0.0;
+        let mut trade_delta_sol: f64 = 0.0;
+        let mut trade_delta_stables_usd: f64 = 0.0;
 
         // Parse token balance delta for the smart wallet
         if let (Some(pre_arr), Some(post_arr)) = (pre_token_balances, post_token_balances) {
@@ -375,6 +378,9 @@ impl SolanaStreamListener {
                     + q("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
                     + q("2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo");
 
+                trade_delta_sol = delta_sol;
+                trade_delta_stables_usd = delta_stables_usd;
+
                 activity_type = classify_token_movement(delta, delta_stables_usd, delta_sol);
                 token_mint = mint;
                 whale_balance_before = bal_before;
@@ -392,19 +398,45 @@ impl SolanaStreamListener {
             return Ok(None);
         }
 
-        let mut execution_price_usd = 0.0;
+        // Hitung harga eksekusi on-chain aktual jika transaksi merupakan swap riil
+        let mut onchain_price_usd = 0.0;
+        let mut onchain_amount_usd = 0.0;
+
+        if token_amount > 0.0 && (activity_type == ActivityType::Buy || activity_type == ActivityType::Sell) {
+            let sol_flow = if activity_type == ActivityType::Buy {
+                if trade_delta_sol < -0.0005 { trade_delta_sol.abs() } else { 0.0 }
+            } else {
+                if trade_delta_sol > 0.0005 { trade_delta_sol } else { 0.0 }
+            };
+            let stables_flow = if activity_type == ActivityType::Buy {
+                if trade_delta_stables_usd < -0.01 { trade_delta_stables_usd.abs() } else { 0.0 }
+            } else {
+                if trade_delta_stables_usd > 0.01 { trade_delta_stables_usd } else { 0.0 }
+            };
+
+            let sol_price = Self::get_cached_sol_price_usd().await;
+            let total_net_usd = (sol_flow * sol_price) + stables_flow;
+            if total_net_usd > 0.0 {
+                onchain_amount_usd = total_net_usd;
+                onchain_price_usd = total_net_usd / token_amount;
+            }
+        }
+
+        let mut dex_market_price = 0.0;
         if let Ok((sym, price, _, _)) = Self::fetch_token_price(&token_mint).await {
             if sym != "UNKNOWN" {
                 token_symbol = sym;
             }
-            execution_price_usd = price;
+            dex_market_price = price;
         }
 
-        // NOTE: Strict policy - No fallback price derivation from native SOL deltas to prevent anomalous price spikes
-        let amount_usd = if token_amount > 0.0 && execution_price_usd > 0.0 {
-            token_amount * execution_price_usd
+        // Gunakan harga eksekusi swap on-chain aktual jika tersedia; fallback ke DexScreener jika bukan swap SOL/stables
+        let (execution_price_usd, amount_usd) = if onchain_price_usd > 0.0 && onchain_price_usd.is_finite() {
+            (onchain_price_usd, onchain_amount_usd)
+        } else if dex_market_price > 0.0 {
+            (dex_market_price, token_amount * dex_market_price)
         } else {
-            0.0
+            (0.0, 0.0)
         };
 
         let tx_time = if block_time > 0 {
@@ -564,6 +596,160 @@ impl SolanaStreamListener {
         anyhow::bail!("Solana WebSocket disconnected")
     }
 
+    /// Mengambil estimasi harga SOL dari Jupiter Swap Quote API (1 WSOL -> USDC) dengan cache 30 detik
+    pub async fn get_cached_sol_price_usd() -> f64 {
+        let cache = SOL_PRICE_CACHE.get_or_init(|| {
+            RwLock::new((0.0, Instant::now() - Duration::from_secs(120)))
+        });
+
+        if let Ok(guard) = cache.read() {
+            if guard.0 > 0.0 && guard.1.elapsed() < Duration::from_secs(30) {
+                return guard.0;
+            }
+        }
+
+        // Fast probe via Jupiter quote: 1 WSOL -> USDC
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build();
+        if let Ok(client) = client {
+            let url = "https://api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=1000000000&slippageBps=0&restrictIntermediateTokens=true";
+            if let Ok(res) = client.get(url).send().await {
+                if let Ok(json) = res.json::<Value>().await {
+                    if let Some(out_str) = json.get("outAmount").and_then(Value::as_str) {
+                        if let Ok(raw_usdc) = out_str.parse::<f64>() {
+                            let price = raw_usdc / 1_000_000.0;
+                            if price > 0.0 && price.is_finite() {
+                                if let Ok(mut guard) = cache.write() {
+                                    *guard = (price, Instant::now());
+                                }
+                                return price;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: check cache read even if older
+        if let Ok(guard) = cache.read() {
+            if guard.0 > 0.0 {
+                return guard.0;
+            }
+        }
+
+        120.0
+    }
+
+    /// Seleksi pool terbaik dari respon JSON DexScreener:
+    /// - Mengeliminasi seluruh pasangan Pump.fun kurva mati (likuiditas null/0) bila ada pool DEX aktif (pumpswap, raydium, meteora, dll.).
+    /// - Mencegah sintesis likuiditas fiktif mcap * 0.50 pada pool yang sudah bermigrasi.
+    /// - Memilih pool dengan likuiditas riil terverifikasi tertinggi.
+    pub fn select_best_pair_from_dex_json(
+        pairs: &[Value],
+        mint: &str,
+    ) -> Option<(String, f64, f64, f64)> {
+        let matching_pairs: Vec<&Value> = pairs
+            .iter()
+            .filter(|p| {
+                p.get("baseToken")
+                    .and_then(|b| b.get("address"))
+                    .and_then(|s| s.as_str())
+                    .map(|addr| addr.eq_ignore_ascii_case(mint))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if matching_pairs.is_empty() {
+            return None;
+        }
+
+        let has_real_liquidity_pool = matching_pairs.iter().any(|p| {
+            let dex_id = p.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
+            let liq_usd = p
+                .get("liquidity")
+                .and_then(|l| l.get("usd"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            liq_usd > 0.0 && dex_id != "pumpfun"
+        });
+
+        let mut max_liq = 0.0;
+        let mut total_liq = 0.0;
+        let mut best_symbol = "TOKEN".to_string();
+        let mut best_price = 0.0;
+        let mut best_mcap = 0.0;
+
+        for pair in matching_pairs {
+            let dex_id = pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
+            let sym = pair
+                .get("baseToken")
+                .and_then(|b| b.get("symbol"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            let price: f64 = pair
+                .get("priceUsd")
+                .and_then(|p| p.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+
+            let reported_liq: f64 = pair
+                .get("liquidity")
+                .and_then(|l| l.get("usd"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+
+            let mcap: f64 = pair
+                .get("marketCap")
+                .or_else(|| pair.get("fdv"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+
+            if price <= 0.0 {
+                continue;
+            }
+
+            let mut liq = reported_liq;
+
+            if has_real_liquidity_pool {
+                // Jika sudah ada pool DEX riil yang aktif, kurva pump.fun yang mati/migrasi DILARANG dipilih
+                if dex_id == "pumpfun" && reported_liq <= 0.0 {
+                    continue;
+                }
+                let real_quote_usd = liq * 0.5;
+                if real_quote_usd < 10_000.0 {
+                    liq = real_quote_usd;
+                }
+            } else {
+                // Hanya jika belum ada pool DEX riil sama sekali (token masih di bonding curve):
+                // Reserve fisik pump.fun maksimal ~85 SOL (~$10k-$12k USD).
+                if dex_id == "pumpfun" && liq <= 0.0 && mcap > 0.0 {
+                    liq = (mcap * 0.15).clamp(100.0, 12_000.0);
+                }
+            }
+
+            total_liq += liq;
+
+            if liq > max_liq || (liq == max_liq && best_price <= 0.0) {
+                max_liq = liq;
+                best_price = price;
+                if mcap > 0.0 {
+                    best_mcap = mcap;
+                }
+                if !sym.is_empty() {
+                    best_symbol = sym.to_string();
+                }
+            }
+        }
+
+        let effective_liq = max_liq.max(total_liq);
+        if best_price > 0.0 {
+            Some((best_symbol, best_price, effective_liq, best_mcap))
+        } else {
+            None
+        }
+    }
+
     /// Fetches live price & aggregated liquidity with multi-pool scanning & in-memory TTL caching (DexScreener + Search Fallback)
     pub async fn fetch_token_price(mint: &str) -> Result<(String, f64, f64, f64)> {
         Self::fetch_token_price_internal(mint, false).await
@@ -594,177 +780,56 @@ impl SolanaStreamListener {
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .build()?;
 
-        // Source 1: DexScreener API with strict baseToken matching & aggregated liquidity
+        // Source 1: DexScreener API with strict baseToken matching & dead curve elimination
         let url = format!("https://api.dexscreener.com/latest/dex/tokens/{}", mint);
         if let Ok(res) = client.get(&url).send().await {
             if res.status().is_success() {
                 if let Ok(json) = res.json::<Value>().await {
                     if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
-                        if !pairs.is_empty() {
-                            let mut max_liq = 0.0;
-                            let mut total_liq = 0.0;
-                            let mut best_symbol = "TOKEN".to_string();
-                            let mut best_price = 0.0;
-                            let mut best_mcap = 0.0;
-
-                            for pair in pairs {
-                                let base_addr = pair
-                                    .get("baseToken")
-                                    .and_then(|b| b.get("address"))
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or("");
-
-                                // STRICT: Base token address MUST match query mint (case-insensitive)
-                                if !base_addr.eq_ignore_ascii_case(mint) {
-                                    continue;
-                                }
-
-                                let dex_id =
-                                    pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
-                                let sym = pair
-                                    .get("baseToken")
-                                    .and_then(|b| b.get("symbol"))
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or("");
-                                let price: f64 = pair
-                                    .get("priceUsd")
-                                    .and_then(|p| p.as_str())
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0.0);
-
-                                let mut liq: f64 = pair
-                                    .get("liquidity")
-                                    .and_then(|l| l.get("usd"))
-                                    .and_then(|v| v.as_f64())
-                                    .unwrap_or(0.0);
-
-                                // Market cap harus berasal dari field marketCap; FDV bukan market cap.
-                                let mcap: f64 = pair
-                                    .get("marketCap")
-                                    .and_then(|v| v.as_f64())
-                                    .unwrap_or(0.0);
-
-                                // Anti-CLMM Spoof: use DexScreener's liquidity.usd directly as real_quote_usd (half of reported USD liquidity).
-                                // DexScreener already converts quote reserves to USD at live prices, so no static price mapping needed.
-                                let real_quote_usd = liq * 0.5;
-
-                                // Clamp thin pools: if quote-side USD < $10k, treat that as effective liquidity
-                                if dex_id != "pumpfun" && real_quote_usd < 10_000.0 {
-                                    liq = real_quote_usd;
-                                }
-
-                                // For Pump.fun bonding curves where liquidity object is null/0, derive virtual liquidity from marketCap / fdv
-                                if dex_id == "pumpfun" && liq <= 0.0 && mcap > 0.0 {
-                                    liq = mcap * 0.50; // Pump.fun virtual pool reserve ~ 50% of MC
-                                }
-
-                                total_liq += liq;
-
-                                if liq >= max_liq && price > 0.0 {
-                                    max_liq = liq;
-                                    best_price = price;
-                                    if mcap > 0.0 {
-                                        best_mcap = mcap;
-                                    }
-                                    if !sym.is_empty() {
-                                        best_symbol = sym.to_string();
-                                    }
-                                } else if best_price <= 0.0 && price > 0.0 {
-                                    best_price = price;
-                                    if mcap > 0.0 && best_mcap <= 0.0 {
-                                        best_mcap = mcap;
-                                    }
-                                    if !sym.is_empty() {
-                                        best_symbol = sym.to_string();
-                                    }
-                                }
+                        if let Some((best_sym, best_price, effective_liq, best_mcap)) =
+                            Self::select_best_pair_from_dex_json(pairs, mint)
+                        {
+                            if let Ok(mut cache) = get_price_cache().write() {
+                                cache.insert(
+                                    mint.to_string(),
+                                    (
+                                        best_sym.clone(),
+                                        best_price,
+                                        effective_liq,
+                                        best_mcap,
+                                        Instant::now(),
+                                    ),
+                                );
                             }
-
-                            let effective_liq = max_liq.max(total_liq);
-                            if best_price > 0.0 {
-                                if let Ok(mut cache) = get_price_cache().write() {
-                                    cache.insert(
-                                        mint.to_string(),
-                                        (
-                                            best_symbol.clone(),
-                                            best_price,
-                                            effective_liq,
-                                            best_mcap,
-                                            Instant::now(),
-                                        ),
-                                    );
-                                }
-                                return Ok((best_symbol, best_price, effective_liq, best_mcap));
-                            }
+                            return Ok((best_sym, best_price, effective_liq, best_mcap));
                         }
                     }
                 }
             }
         }
 
-        // Source 2: DexScreener Search Endpoint Fallback with strict baseToken matching & max liquidity selection
+        // Source 2: DexScreener Search Endpoint Fallback
         let search_url = format!("https://api.dexscreener.com/latest/dex/search?q={}", mint);
         if let Ok(res) = client.get(&search_url).send().await {
             if res.status().is_success() {
                 if let Ok(json) = res.json::<Value>().await {
                     if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
-                        let mut best_pair: Option<(String, f64, f64, f64)> = None;
-                        let mut max_liq = 0.0;
-
-                        for pair in pairs {
-                            let matches_mint = pair
-                                .get("baseToken")
-                                .and_then(|b| b.get("address"))
-                                .and_then(|s| s.as_str())
-                                .map(|addr| addr.eq_ignore_ascii_case(mint))
-                                .unwrap_or(false);
-
-                            if !matches_mint {
-                                continue;
-                            }
-
-                            let symbol = pair
-                                .get("baseToken")
-                                .and_then(|b| b.get("symbol"))
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("TOKEN")
-                                .to_string();
-                            let price_usd: f64 = pair
-                                .get("priceUsd")
-                                .and_then(|p| p.as_str())
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0.0);
-                            let liquidity_usd: f64 = pair
-                                .get("liquidity")
-                                .and_then(|l| l.get("usd"))
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0);
-                            let mcap: f64 = pair
-                                .get("marketCap")
-                                .or_else(|| pair.get("fdv"))
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0);
-
-                            if price_usd > 0.0 && liquidity_usd > max_liq {
-                                max_liq = liquidity_usd;
-                                best_pair = Some((symbol, price_usd, liquidity_usd, mcap));
-                            }
-                        }
-
-                        if let Some((symbol, price_usd, liquidity_usd, mcap)) = best_pair {
+                        if let Some((best_sym, best_price, effective_liq, best_mcap)) =
+                            Self::select_best_pair_from_dex_json(pairs, mint)
+                        {
                             if let Ok(mut cache) = get_price_cache().write() {
                                 cache.insert(
                                     mint.to_string(),
                                     (
-                                        symbol.clone(),
-                                        price_usd,
-                                        liquidity_usd,
-                                        mcap,
+                                        best_sym.clone(),
+                                        best_price,
+                                        effective_liq,
+                                        best_mcap,
                                         Instant::now(),
                                     ),
                                 );
                             }
-                            return Ok((symbol, price_usd, liquidity_usd, mcap));
+                            return Ok((best_sym, best_price, effective_liq, best_mcap));
                         }
                     }
                 }
@@ -946,5 +1011,73 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn select_best_pair_rejects_dead_pumpfun_curve_when_pumpswap_active() {
+        let pairs = serde_json::json!([
+            {
+                "dexId": "pumpfun",
+                "baseToken": {
+                    "address": "6ytRwyudu2sZUSug632m9zFW35GhdpWZQgu48NhSJcbP",
+                    "symbol": "SLOPCORE"
+                },
+                "priceUsd": "0.00004895",
+                "liquidity": null,
+                "marketCap": 48952.0
+            },
+            {
+                "dexId": "pumpswap",
+                "baseToken": {
+                    "address": "6ytRwyudu2sZUSug632m9zFW35GhdpWZQgu48NhSJcbP",
+                    "symbol": "SLOPCORE"
+                },
+                "priceUsd": "0.00001549",
+                "liquidity": {
+                    "usd": 9308.0
+                },
+                "marketCap": 15490.0
+            }
+        ]);
+
+        let best = SolanaStreamListener::select_best_pair_from_dex_json(
+            pairs.as_array().unwrap(),
+            "6ytRwyudu2sZUSug632m9zFW35GhdpWZQgu48NhSJcbP",
+        );
+
+        assert!(best.is_some());
+        let (sym, price, liq, mcap) = best.unwrap();
+        assert_eq!(sym, "SLOPCORE");
+        assert!((price - 0.00001549).abs() < 1e-8, "Must pick real pumpswap price, not dead pumpfun curve");
+        assert!(liq > 0.0);
+        assert_eq!(mcap, 15490.0);
+    }
+
+    #[test]
+    fn select_best_pair_allows_pumpfun_bonding_curve_if_sole_pool() {
+        let pairs = serde_json::json!([
+            {
+                "dexId": "pumpfun",
+                "baseToken": {
+                    "address": "SoleBondingCurveMint11111111111111111111111",
+                    "symbol": "FRESH"
+                },
+                "priceUsd": "0.000005",
+                "liquidity": null,
+                "marketCap": 5000.0
+            }
+        ]);
+
+        let best = SolanaStreamListener::select_best_pair_from_dex_json(
+            pairs.as_array().unwrap(),
+            "SoleBondingCurveMint11111111111111111111111",
+        );
+
+        assert!(best.is_some());
+        let (sym, price, liq, mcap) = best.unwrap();
+        assert_eq!(sym, "FRESH");
+        assert_eq!(price, 0.000005);
+        assert!(liq > 0.0 && liq <= 12_000.0, "Derived liquidity for bonding curve must be capped");
+        assert_eq!(mcap, 5000.0);
     }
 }
