@@ -1,13 +1,19 @@
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::sleep;
 use zenithsw::config::Config;
 use zenithsw::db::SmartWalletDb;
 use zenithsw::execution::solana_executor::SolanaExecutor;
-use zenithsw::models::Chain;
 
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+/// 0.007 SOL ukuran canary BUY.
+const CANARY_BUY_LAMPORTS: u64 = 7_000_000;
+/// Cadangan gas minimum di luar ukuran canary.
+const CANARY_GAS_BUFFER_LAMPORTS: u64 = 40_000_000;
+const CANARY_SLIPPAGE_BPS: u16 = 100;
+
+/// Canary live BUY (SOL→USDC) lalu SELL (USDC→SOL) melalui pipeline swap
+/// yang sama dengan engine. Gagal keras bila salah satu fase tidak terbukti on-chain.
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -17,215 +23,121 @@ async fn main() -> Result<()> {
         &config.wallet_db_path,
     )?);
     let sol_exec = SolanaExecutor::new(config.clone(), db.clone());
+    let (_, user_pubkey) = sol_exec.get_keypair()?;
 
-    let (signing_key, user_pubkey) = sol_exec.get_keypair()?;
     println!("=======================================================");
-    println!("🚀 ZENITHSW - SOLANA MAINNET LIVE CANARY TEST");
+    println!("🚀 ZENITHSW - SOLANA MAINNET LIVE CANARY (pipeline engine)");
     println!("=======================================================");
-    println!("• Wallet: {}", user_pubkey);
+    println!("• Wallet: {user_pubkey}");
+    println!("• Trading DB: {}", config.trading_db_path);
 
-    let initial_balance = sol_exec.get_native_balance(&user_pubkey).await?;
-    println!("• Current Balance: {:.6} SOL", initial_balance);
-
-    if initial_balance < 0.04 {
+    let initial_lamports = sol_exec.get_native_balance_lamports(&user_pubkey).await?;
+    let initial_usdc_raw = sol_exec
+        .get_raw_token_balance(&user_pubkey, USDC_MINT)
+        .await?;
+    println!(
+        "• Saldo awal: {} lamports ({:.6} SOL), USDC raw {}",
+        initial_lamports,
+        initial_lamports as f64 / 1e9,
+        initial_usdc_raw
+    );
+    if initial_lamports < CANARY_BUY_LAMPORTS + CANARY_GAS_BUFFER_LAMPORTS {
         return Err(anyhow!(
-            "Insufficient SOL balance for canary: {:.6} SOL < 0.04 SOL",
-            initial_balance
+            "saldo tidak cukup untuk canary: {initial_lamports} lamports"
         ));
     }
 
-    let wsol_mint = "So11111111111111111111111111111111111111112";
-    let usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    let args: Vec<String> = std::env::args().collect();
+    let recover_sell_only = args.iter().any(|arg| arg == "--sell-only");
+    let requested_sell_raw = args
+        .windows(2)
+        .find(|pair| pair[0] == "--amount-raw")
+        .map(|pair| pair[1].parse::<u64>())
+        .transpose()
+        .map_err(|error| anyhow!("--amount-raw invalid: {error}"))?;
 
-    let mut buy_sig = String::new();
-    let mut usdc_raw = sol_exec
-        .get_raw_token_balance(&user_pubkey, usdc_mint)
-        .await
-        .unwrap_or(0);
-
-    if usdc_raw > 0 {
-        let usdc_ui = sol_exec
-            .get_ui_token_balance(&user_pubkey, usdc_mint)
-            .await
-            .unwrap_or(0.0);
-        println!(
-            "\n[PHASE 1] DETECTED EXISTING USDC ON-CHAIN: {:.4} (${:.2}, raw: {})",
-            usdc_ui, usdc_ui, usdc_raw
-        );
-        println!("• Skipping Phase 1 BUY (already confirmed in previous transaction)");
-    } else {
-        let buy_lamports = 7_000_000u64; // 0.007 SOL (~$0.98 USD)
-        let buy_intent_id = format!("SOL-CANARY-BUY-{}", Utc::now().timestamp_millis());
-
-        println!("\n[PHASE 1] BUY CANARY (0.007 SOL -> USDC)");
-        println!("• Creating Intent: {}", buy_intent_id);
-        db.create_execution_intent(
-            &buy_intent_id,
-            Chain::Solana,
-            "BUY",
-            usdc_mint,
-            &user_pubkey,
-            0.007,
-        )?;
-
-        println!("• Fetching Jupiter Quote...");
-        let quote = sol_exec
-            .fetch_jupiter_quote(wsol_mint, usdc_mint, buy_lamports, 100)
-            .await?;
-        let out_amount = quote["outAmount"]
-            .as_str()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        println!(
-            "  Expected Output: {} micro-USDC (${:.4})",
-            out_amount,
-            out_amount as f64 / 1_000_000.0
-        );
-
-        db.update_execution_intent(&buy_intent_id, "QUOTED", None, None)?;
-
-        println!("• Building & Signing Transaction...");
-        let signed_tx = sol_exec
-            .build_and_sign_jupiter_tx(quote, &user_pubkey, &signing_key)
-            .await?;
-        db.update_execution_intent(&buy_intent_id, "SIGNED", None, None)?;
-
-        println!("• Broadcasting to Solana Mainnet...");
-        buy_sig = sol_exec.broadcast_tx(&signed_tx).await?;
-        println!("  Broadcasted! Tx: https://solscan.io/tx/{}", buy_sig);
-        db.update_execution_intent(&buy_intent_id, "BROADCASTED", None, Some(&buy_sig))?;
-
-        println!("• Awaiting Confirmation (up to 30s)...");
-        let confirmed = sol_exec.confirm_transaction_signature(&buy_sig, 30).await?;
-        if !confirmed {
-            db.update_execution_intent(
-                &buy_intent_id,
-                "PENDING_RECONCILIATION",
-                None,
-                Some(&buy_sig),
-            )?;
+    let (bought_raw, buy_lamports_delta) = if recover_sell_only {
+        let amount = requested_sell_raw.unwrap_or(initial_usdc_raw);
+        if amount == 0 || amount > initial_usdc_raw {
             return Err(anyhow!(
-                "BUY transaction confirmation timed out: {}",
-                buy_sig
+                "jumlah SELL invalid: {amount}, saldo USDC raw {initial_usdc_raw}"
             ));
         }
-        db.update_execution_intent(&buy_intent_id, "CONFIRMED", None, Some(&buy_sig))?;
-        println!("  BUY CONFIRMED ON-CHAIN 🟢");
-
-        println!("• Reconciling Physical Token Balance...");
-        for attempt in 1..=5 {
-            sleep(Duration::from_millis(1500)).await;
-            usdc_raw = sol_exec
-                .get_raw_token_balance(&user_pubkey, usdc_mint)
-                .await
-                .unwrap_or(0);
-            if usdc_raw > 0 {
-                break;
-            }
-            println!(
-                "  Waiting for token account sync (attempt {}/5)...",
-                attempt
-            );
-        }
-
-        let usdc_ui = sol_exec
-            .get_ui_token_balance(&user_pubkey, usdc_mint)
+        println!("\n[PHASE 1] DILEWATI — recovery SELL {amount} raw USDC");
+        (amount, 0)
+    } else {
+        println!("\n[PHASE 1] BUY 0.007 SOL -> USDC");
+        let (buy_sig, buy_fill) = sol_exec
+            .execute_canary_swap(
+                "BUY",
+                WSOL_MINT,
+                USDC_MINT,
+                USDC_MINT,
+                CANARY_BUY_LAMPORTS,
+                CANARY_SLIPPAGE_BPS,
+            )
             .await?;
+        println!("• Tx: https://solscan.io/tx/{buy_sig}");
         println!(
-            "  Received Physical USDC Balance: {:.4} (${:.2}, raw: {})",
-            usdc_ui, usdc_ui, usdc_raw
+            "• Fill meta: token_raw_delta={} lamports_delta={} fee={} decimals={:?}",
+            buy_fill.token_raw_delta,
+            buy_fill.owner_lamports_delta,
+            buy_fill.fee_lamports,
+            buy_fill.token_decimals
         );
-        db.update_execution_intent(&buy_intent_id, "RECONCILED", None, Some(&buy_sig))?;
+        let amount = u64::try_from(buy_fill.token_raw_delta)
+            .ok()
+            .filter(|v| *v > 0)
+            .ok_or_else(|| anyhow!("BUY fill tidak menghasilkan token positif"))?;
+        (amount, buy_fill.owner_lamports_delta)
+    };
 
-        if usdc_raw == 0 {
-            return Err(anyhow!("Reconciliation failed: physical USDC balance is 0"));
-        }
-    }
-
-    println!("\n[PHASE 2] SELL CANARY (USDC -> SOL 100% Exit)");
-    let sell_intent_id = format!("SOL-CANARY-SELL-{}", Utc::now().timestamp_millis());
-    println!("• Creating Intent: {}", sell_intent_id);
-    db.create_execution_intent(
-        &sell_intent_id,
-        Chain::Solana,
-        "SELL",
-        usdc_mint,
-        &user_pubkey,
-        usdc_raw as f64,
-    )?;
-
+    println!("\n[PHASE 2] SELL {bought_raw} raw USDC -> SOL");
+    let (sell_sig, sell_fill) = sol_exec
+        .execute_canary_swap(
+            "SELL",
+            USDC_MINT,
+            WSOL_MINT,
+            USDC_MINT,
+            bought_raw,
+            CANARY_SLIPPAGE_BPS,
+        )
+        .await?;
+    println!("• Tx: https://solscan.io/tx/{sell_sig}");
     println!(
-        "• Fetching Jupiter Exit Quote for {} raw units...",
-        usdc_raw
+        "• Fill meta: token_raw_delta={} lamports_delta={} fee={}",
+        sell_fill.token_raw_delta, sell_fill.owner_lamports_delta, sell_fill.fee_lamports
     );
-    let sell_quote = sol_exec
-        .fetch_jupiter_quote(usdc_mint, wsol_mint, usdc_raw, 100)
-        .await?;
-    let sell_out_lamports = sell_quote["outAmount"]
-        .as_str()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    println!(
-        "  Expected Return: {} lamports ({:.6} SOL)",
-        sell_out_lamports,
-        sell_out_lamports as f64 / 1e9
-    );
-
-    db.update_execution_intent(&sell_intent_id, "QUOTED", None, None)?;
-
-    println!("• Building & Signing SELL Transaction...");
-    let signed_sell_tx = sol_exec
-        .build_and_sign_jupiter_tx(sell_quote, &user_pubkey, &signing_key)
-        .await?;
-    db.update_execution_intent(&sell_intent_id, "SIGNED", None, None)?;
-
-    println!("• Broadcasting SELL to Solana Mainnet...");
-    let sell_sig = sol_exec.broadcast_tx(&signed_sell_tx).await?;
-    println!("  Broadcasted! Tx: https://solscan.io/tx/{}", sell_sig);
-    db.update_execution_intent(&sell_intent_id, "BROADCASTED", None, Some(&sell_sig))?;
-
-    println!("• Awaiting Confirmation (up to 30s)...");
-    let sell_confirmed = sol_exec
-        .confirm_transaction_signature(&sell_sig, 30)
-        .await?;
-    if !sell_confirmed {
-        db.update_execution_intent(
-            &sell_intent_id,
-            "PENDING_RECONCILIATION",
-            None,
-            Some(&sell_sig),
-        )?;
+    if sell_fill.token_raw_delta != -i128::from(bought_raw) {
         return Err(anyhow!(
-            "SELL transaction confirmation timed out: {}",
-            sell_sig
+            "SELL fill mismatch: token_raw_delta {} != -{}",
+            sell_fill.token_raw_delta,
+            bought_raw
         ));
     }
-    db.update_execution_intent(&sell_intent_id, "CONFIRMED", None, Some(&sell_sig))?;
-    println!("  SELL CONFIRMED ON-CHAIN 🟢");
 
-    db.update_execution_intent(&sell_intent_id, "RECONCILED", None, Some(&sell_sig))?;
-
-    println!("\n[PHASE 3] POST-TRADE RECONCILIATION");
-    sleep(Duration::from_millis(1500)).await;
-    let final_balance = sol_exec.get_native_balance(&user_pubkey).await?;
-    let final_usdc = sol_exec
-        .get_ui_token_balance(&user_pubkey, usdc_mint)
-        .await
-        .unwrap_or(0.0);
+    println!("\n[PHASE 3] REKONSILIASI");
+    let round_trip = buy_lamports_delta + sell_fill.owner_lamports_delta;
     println!(
-        "• Final SOL Balance: {:.6} SOL (Net Delta: {:.6} SOL)",
-        final_balance,
-        final_balance - initial_balance
+        "• Biaya round-trip dari meta tx: {} lamports ({:.6} SOL)",
+        round_trip,
+        round_trip as f64 / 1e9
     );
-    println!("• Remaining USDC Balance: {:.4}", final_usdc);
+    let final_lamports = sol_exec.get_native_balance_lamports(&user_pubkey).await?;
+    let final_usdc_raw = sol_exec
+        .get_raw_token_balance(&user_pubkey, USDC_MINT)
+        .await?;
+    println!(
+        "• Saldo akhir: {} lamports (delta RPC {}), USDC raw {} (awal {})",
+        final_lamports,
+        i128::from(final_lamports) - i128::from(initial_lamports),
+        final_usdc_raw,
+        initial_usdc_raw
+    );
 
     println!("\n=======================================================");
-    println!("✅ SOLANA MAINNET CANARY TEST SUCCEEDED 100%!");
-    if !buy_sig.is_empty() {
-        println!("• BUY Signature:  https://solscan.io/tx/{}", buy_sig);
-    }
-    println!("• SELL Signature: https://solscan.io/tx/{}", sell_sig);
+    println!("✅ CANARY SUKSES: SELL landing, fill terbaca dari meta transaksi");
+    println!("• SELL: https://solscan.io/tx/{sell_sig}");
     println!("=======================================================");
-
     Ok(())
 }

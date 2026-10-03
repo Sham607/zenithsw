@@ -400,7 +400,7 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
     let mut sig_items = Vec::new();
     for sig in app.signals.iter().take(15) {
         let (status_color, status_text) = if sig.is_passed {
-            (Color::Green, "COPIED [BUY ENTRY] ✅")
+            (Color::Green, "GATING PASSED ⏳")
         } else {
             (Color::Red, "REJECTED ❌")
         };

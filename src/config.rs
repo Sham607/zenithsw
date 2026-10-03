@@ -53,8 +53,7 @@ pub struct Config {
     pub solana_tp_slippage_bps: u16,  // Jupiter TP sell slippage bps (e.g. 250 bps)
     pub solana_trailing_slippage_bps: u16, // Jupiter trailing sell slippage bps (e.g. 300 bps)
     pub solana_sl_slippage_bps: u16,  // Jupiter emergency hard SL slippage bps (e.g. 500 bps)
-    pub solana_pumpfun_slippage_pct: f64, // PumpPortal slippage % (e.g. 15.0%)
-    pub solana_pumpfun_priority_fee: f64, // PumpPortal priority fee SOL (e.g. 0.005 SOL)
+    pub solana_priority_fee_max_lamports: u64, // Batas atas priority fee Jupiter (level veryHigh)
     pub evm_slippage_bps: u128,       // EVM swap slippage bps (e.g. 50 bps)
     pub evm_gas_reserve_wei: u128,    // EVM minimum gas reserve in wei (e.g. 0.002 ETH)
     pub evm_deadline_secs: u64,       // EVM swap deadline in seconds (e.g. 120s)
@@ -329,8 +328,11 @@ impl Config {
         let solana_tp_slippage_bps = parse_value("SOLANA_TP_SLIPPAGE_BPS", 250u16)?;
         let solana_trailing_slippage_bps = parse_value("SOLANA_TRAILING_SLIPPAGE_BPS", 300u16)?;
         let solana_sl_slippage_bps = parse_value("SOLANA_SL_SLIPPAGE_BPS", 500u16)?;
-        let solana_pumpfun_slippage_pct = parse_value("SOLANA_PUMPFUN_SLIPPAGE_PCT", 15.0f64)?;
-        let solana_pumpfun_priority_fee = parse_value("SOLANA_PUMPFUN_PRIORITY_FEE", 0.005f64)?;
+        let solana_priority_fee_max_lamports =
+            parse_value("SOLANA_PRIORITY_FEE_MAX_LAMPORTS", 100_000u64)?;
+        if solana_priority_fee_max_lamports == 0 || solana_priority_fee_max_lamports > 5_000_000 {
+            anyhow::bail!("SOLANA_PRIORITY_FEE_MAX_LAMPORTS harus 1..=5000000");
+        }
         let evm_slippage_bps = parse_value("EVM_SLIPPAGE_BPS", 50u128)?;
         let evm_gas_reserve_wei = parse_value("EVM_GAS_RESERVE_WEI", 2_000_000_000_000_000u128)?;
         let evm_deadline_secs = parse_value("EVM_DEADLINE_SECS", 120u64)?;
@@ -377,8 +379,6 @@ impl Config {
             ("PEAK_DRAWDOWN_PCT", peak_drawdown_pct),
             ("PROFIT_LOCK_FLOOR_PCT", profit_lock_floor_pct),
             ("WHALE_FULL_DUMP_PCT", whale_full_dump_pct),
-            ("SOLANA_PUMPFUN_SLIPPAGE_PCT", solana_pumpfun_slippage_pct),
-            ("SOLANA_PUMPFUN_PRIORITY_FEE", solana_pumpfun_priority_fee),
             ("RADAR_MIN_HOLDING_VALUE_USD", radar_min_holding_value_usd),
             ("BOT_TAKE_PROFIT_PCT", bot_take_profit_pct),
             ("BOT_STOP_LOSS_PCT", bot_stop_loss_pct),
@@ -527,8 +527,7 @@ impl Config {
             solana_tp_slippage_bps,
             solana_trailing_slippage_bps,
             solana_sl_slippage_bps,
-            solana_pumpfun_slippage_pct,
-            solana_pumpfun_priority_fee,
+            solana_priority_fee_max_lamports,
             evm_slippage_bps,
             evm_gas_reserve_wei,
             evm_deadline_secs,

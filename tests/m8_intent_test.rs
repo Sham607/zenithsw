@@ -259,3 +259,72 @@ fn execution_intent_solana_sell_lifecycle_and_timeout_reconciliation() {
         "RECONCILED intent tidak boleh pending lagi"
     );
 }
+
+#[test]
+fn exclusive_intent_blocks_second_active_intent_per_mint() {
+    let db = SmartWalletDb::new_in_memory().expect("in-memory DB harus dibuat");
+    assert!(db
+        .create_execution_intent_exclusive("buy-1", Chain::Solana, "BUY", "mint-x", "w", 0.08)
+        .unwrap());
+    // Intent BUY kedua untuk mint sama ditolak selama intent pertama aktif.
+    assert!(!db
+        .create_execution_intent_exclusive("buy-2", Chain::Solana, "BUY", "mint-x", "w", 0.08)
+        .unwrap());
+    // SELL untuk mint sama juga ditolak (anti double-sell / tumpang tindih).
+    assert!(!db
+        .create_execution_intent_exclusive("sell-1", Chain::Solana, "SELL", "mint-x", "w", 1.0)
+        .unwrap());
+    // Mint berbeda tetap boleh.
+    assert!(db
+        .create_execution_intent_exclusive("buy-3", Chain::Solana, "BUY", "mint-y", "w", 0.08)
+        .unwrap());
+    // PENDING_RECONCILIATION masih memblokir.
+    db.update_execution_intent("buy-1", "SIGNED", None, Some("sig-1"))
+        .unwrap();
+    db.update_execution_intent("buy-1", "PENDING_RECONCILIATION", None, None)
+        .unwrap();
+    assert!(!db
+        .create_execution_intent_exclusive("buy-4", Chain::Solana, "BUY", "mint-x", "w", 0.08)
+        .unwrap());
+    // Setelah terminal, mint terbuka lagi.
+    db.update_execution_intent("buy-1", "FAILED", None, None)
+        .unwrap();
+    assert!(db
+        .create_execution_intent_exclusive("buy-5", Chain::Solana, "BUY", "mint-x", "w", 0.08)
+        .unwrap());
+}
+
+#[test]
+fn stale_pending_intents_expose_signature_and_expiry() {
+    let db = SmartWalletDb::new_in_memory().expect("in-memory DB harus dibuat");
+    db.create_execution_intent("p-1", Chain::Solana, "BUY", "mint", "w", 1.0)
+        .unwrap();
+    db.update_execution_intent_metadata(
+        "p-1",
+        &ExecutionIntentMetadata {
+            nonce: None,
+            recent_blockhash: Some("bh".to_string()),
+            last_valid_block_height: Some(430_000_000),
+            calldata_hash: None,
+            quote_block: None,
+            expiry: None,
+        },
+    )
+    .unwrap();
+    db.update_execution_intent("p-1", "SIGNED", None, Some("sig-p1"))
+        .unwrap();
+    db.create_execution_intent("r-1", Chain::Robinhood, "BUY", "0xt", "0xw", 1.0)
+        .unwrap();
+    let pending = db.get_stale_pending_intents(Chain::Solana, 0).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].signature.as_deref(), Some("sig-p1"));
+    assert_eq!(pending[0].last_valid_block_height, Some(430_000_000));
+    // Intent yang baru di-update tidak dianggap stale untuk ambang 600 detik.
+    assert!(db
+        .get_stale_pending_intents(Chain::Solana, 600)
+        .unwrap()
+        .is_empty());
+    // SIGNED -> PENDING_RECONCILIATION valid (broadcast tak terbukti).
+    db.update_execution_intent("p-1", "PENDING_RECONCILIATION", None, None)
+        .unwrap();
+}

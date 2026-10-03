@@ -39,14 +39,16 @@ TUI juga melakukan refresh database berkala. Status IPC harus dibedakan dari sna
   - *Proteksi Kuota Streamer*: `SolanaStreamListener` dikunci ke RPC publik nol-kuota (`rpc: None`), memisahkan streamer sepenuhnya dari kuota eksekusi Helius.
 - **Parser Native SOL Stream**: Menghitung selisih saldo lamports Native SOL fisik (`meta.preBalances` vs `meta.postBalances`) dengan kompensasi netral fee transaksi pada fee payer, mencegah salah klasifikasi transaksi DEX multi-hop/Native SOL sebagai `TRANSFER`.
 - **Durable Intent State Machine (BUY & SELL)**:
-  - Sebelum eksekusi alur SELL (PumpPortal bonding curve atau Jupiter Swap), engine mencatat intent unik persisten ke SQLite (`execution_intents`) dengan transisi: `QUOTED` $\rightarrow$ `SIGNED` $\rightarrow$ `BROADCASTED` $\rightarrow$ `PENDING_RECONCILIATION` (jika konfirmasi RPC timeout) $\rightarrow$ `CONFIRMED` $\rightarrow$ `RECONCILED`.
-  - Jika terjadi kegagalan broadcast PumpPortal, intent lama ditandai `FAILED` secara fail-closed dan intent baru dibuat untuk jalur fallback Jupiter.
+  - BUY dan SELL Solana memakai satu pipeline Jupiter: `INTENT` → `QUOTED` → `SIMULATED` (`simulateTransaction` nyata) → `SIGNED` (signature dipersist sebelum broadcast) → `BROADCASTED` → `CONFIRMED` → `RECONCILED` (fill dari meta transaksi).
+  - Transaksi bertanda tangan yang sama dikirim ulang setiap 2 detik sampai landing, gagal on-chain, atau block height melewati `lastValidBlockHeight`. Tanpa bukti, intent ditahan `PENDING_RECONCILIATION`.
+  - Satu intent aktif per (chain, mint): BUY/SELL baru ditolak selama intent lain untuk mint yang sama belum terminal.
+  - Priority fee eksplisit Jupiter level `veryHigh` dibatasi `SOLANA_PRIORITY_FEE_MAX_LAMPORTS`.
 - **Startup Recovery & Orphan Dust Guard**:
-  - Saat startup, engine membaca intent gantung dan merekonsiliasi status tanda tangan on-chain tanpa broadcast ulang.
+  - Saat startup dan setiap 30 detik, resolver intent membaca status signature on-chain tanpa broadcast ulang; `FAILED` hanya bila gagal on-chain atau blockhash terbukti expired.
   - Scanner token fisik startup mengabaikan saldo orphan bernilai $< \$1.00\text{ USD}$ untuk menyaring debu/rug koin lama.
-- Jupiter/PumpPortal digunakan oleh jalur executor yang tersedia.
+- Jupiter adalah satu-satunya jalur executor Solana (rute PumpPortal dihapus).
 - Konfirmasi transaksi dipolling sebelum posisi dibuka atau ditutup.
-- Balance token direkonsiliasi dari RPC.
+- Entry/exit price dan PnL dihitung dari delta token & lamports aktual pada meta transaksi; saldo yang gagal dibaca menolak trade (fail-closed).
 - Posisi satu token digabung dengan VWAP (multi-lot accumulation didukung hingga batas exposure cap).
 - Exit parsial mengikuti proporsi penjualan whale saat mode shadow aktif.
 - Transaction aggregator yang dipakai untuk BUY harus menyediakan serialized transaction; blockhash diparse dari transaction yang benar-benar akan ditandatangani, bukan dari RPC `getLatestBlockhash` yang diambil terpisah.

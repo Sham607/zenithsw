@@ -24,6 +24,20 @@ type PendingExecutionIntent = (
     Option<String>,
 );
 
+/// State intent yang belum terminal; satu mint hanya boleh punya satu intent aktif.
+const ACTIVE_INTENT_STATES_SQL: &str =
+    "'INTENT','QUOTED','SIMULATED','SIGNED','BROADCASTED','PENDING_RECONCILIATION'";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalePendingIntent {
+    pub intent_id: String,
+    pub action: String,
+    pub token_mint: String,
+    pub state: String,
+    pub signature: Option<String>,
+    pub last_valid_block_height: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionIntentMetadata {
     pub nonce: Option<i64>,
@@ -2015,6 +2029,22 @@ impl SmartWalletDb {
         self.close_position_portion(id, 100.0, exit_reason, exit_price)
     }
 
+    /// Menutup posisi yang saldo fisiknya terbukti nol / fill tidak terbukti, TANPA
+    /// mencatat PnL atau trade_history fiktif. Status menjadi CLOSED, remaining 0.
+    pub fn close_position_without_fill(&self, id: &str, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE shadow_positions SET status='CLOSED', remaining_portion_pct=0, last_update=?1
+             WHERE id=?2 AND status!='CLOSED'",
+            params![Utc::now().to_rfc3339(), id],
+        )?;
+        if changed != 1 {
+            return Err(anyhow::anyhow!("posisi aktif tidak ditemukan: {id}"));
+        }
+        println!("[POSITION CLOSED WITHOUT FILL] id={id} reason={reason}");
+        Ok(())
+    }
+
     pub fn get_recent_trades(&self, limit: usize) -> Result<Vec<TradeRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -2549,6 +2579,84 @@ impl SmartWalletDb {
         Ok(inserted == 1)
     }
 
+    /// Membuat intent hanya jika tidak ada intent aktif lain untuk (chain, token_mint).
+    /// Cek dan insert dilakukan di bawah lock koneksi yang sama sehingga atomik
+    /// terhadap pemanggil lain di proses ini. `Ok(false)` = ditolak karena ada intent aktif
+    /// atau intent_id duplikat.
+    pub fn create_execution_intent_exclusive(
+        &self,
+        intent_id: &str,
+        chain: Chain,
+        action: &str,
+        token_mint: &str,
+        wallet_address: &str,
+        amount_native: f64,
+    ) -> Result<bool> {
+        if intent_id.trim().is_empty()
+            || action.trim().is_empty()
+            || token_mint.trim().is_empty()
+            || wallet_address.trim().is_empty()
+            || !amount_native.is_finite()
+            || amount_native <= 0.0
+        {
+            return Err(anyhow::anyhow!("invalid execution intent"));
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let active: i64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM execution_intents
+                 WHERE chain=?1 AND token_mint=?2 AND state IN ({ACTIVE_INTENT_STATES_SQL})"
+            ),
+            params![chain.to_string(), token_mint],
+            |row| row.get(0),
+        )?;
+        if active > 0 {
+            return Ok(false);
+        }
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO execution_intents
+             (intent_id,chain,action,token_mint,wallet_address,amount_native,state,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,'INTENT',?7,?7)",
+            params![intent_id, chain.to_string(), action, token_mint, wallet_address, amount_native, now],
+        )?;
+        tx.commit()?;
+        Ok(inserted == 1)
+    }
+
+    /// Intent aktif (belum terminal) untuk satu chain yang terakhir di-update
+    /// minimal `older_than_secs` detik lalu. Dipakai resolver startup (0) dan runtime.
+    pub fn get_stale_pending_intents(
+        &self,
+        chain: Chain,
+        older_than_secs: i64,
+    ) -> Result<Vec<StalePendingIntent>> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs.max(0))).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT intent_id,action,token_mint,state,signature,last_valid_block_height
+             FROM execution_intents
+             WHERE chain=?1 AND state IN ({ACTIVE_INTENT_STATES_SQL}) AND updated_at<=?2
+             ORDER BY created_at ASC"
+        ))?;
+        let rows = stmt.query_map(params![chain.to_string(), cutoff], |row| {
+            Ok(StalePendingIntent {
+                intent_id: row.get(0)?,
+                action: row.get(1)?,
+                token_mint: row.get(2)?,
+                state: row.get(3)?,
+                signature: row.get(4)?,
+                last_valid_block_height: row.get(5)?,
+            })
+        })?;
+        let mut intents = Vec::new();
+        for row in rows {
+            intents.push(row?);
+        }
+        Ok(intents)
+    }
+
     pub fn update_execution_intent(
         &self,
         intent_id: &str,
@@ -2576,7 +2684,7 @@ impl SmartWalletDb {
             ) => true,
             ("QUOTED", "SIMULATED" | "SIGNED" | "FAILED" | "UNKNOWN") => true,
             ("SIMULATED", "SIGNED" | "FAILED" | "UNKNOWN") => true,
-            ("SIGNED", "BROADCASTED" | "FAILED" | "UNKNOWN") => true,
+            ("SIGNED", "BROADCASTED" | "PENDING_RECONCILIATION" | "FAILED" | "UNKNOWN") => true,
             ("BROADCASTED", "PENDING_RECONCILIATION" | "CONFIRMED" | "FAILED" | "UNKNOWN") => true,
             ("PENDING_RECONCILIATION", "CONFIRMED" | "RECONCILED" | "FAILED") => true,
             ("CONFIRMED", "RECONCILED" | "FAILED") => true,

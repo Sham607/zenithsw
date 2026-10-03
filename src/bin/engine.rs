@@ -297,52 +297,12 @@ async fn main() -> Result<()> {
 
     // Recover only existing transaction hashes/signatures; never rebroadcast after restart.
     let pending_intents = db.get_pending_execution_intents()?;
-    for (intent_id, chain, action, _token_mint, _wallet, state, tx_hash, signature) in
+    for (intent_id, chain, _action, _token_mint, _wallet, state, tx_hash, _signature) in
         pending_intents
     {
         match chain.as_str() {
-            "SOLANA" => {
-                if let Some(signature) = signature {
-                    let confirmed = sol_exec
-                        .confirm_transaction_signature(&signature, 5)
-                        .await
-                        .unwrap_or(false);
-                    let next_state = if confirmed {
-                        "CONFIRMED"
-                    } else {
-                        "PENDING_RECONCILIATION"
-                    };
-                    if let Err(error) =
-                        db.update_execution_intent(&intent_id, next_state, None, Some(&signature))
-                    {
-                        eprintln!("[INTENT RECOVERY ERROR] update SOLANA intent gagal: {error}");
-                    }
-                    if confirmed {
-                        let _ = db.update_execution_intent(
-                            &intent_id,
-                            "RECONCILED",
-                            None,
-                            Some(&signature),
-                        );
-                    }
-                    println!(
-                        "[INTENT RECOVERY] chain=SOLANA action={} state={} previous_state={}",
-                        action, next_state, state
-                    );
-                } else {
-                    if let Err(error) =
-                        db.update_execution_intent(&intent_id, "UNKNOWN", None, None)
-                    {
-                        eprintln!(
-                            "[INTENT RECOVERY ERROR] update SOLANA failed intent gagal: {error}"
-                        );
-                    }
-                    println!(
-                        "[INTENT RECOVERY] chain=SOLANA action={} state=FAILED reason=missing_signature",
-                        action
-                    );
-                }
-            }
+            // Intent Solana diselesaikan oleh resolver berbasis bukti on-chain di bawah.
+            "SOLANA" => {}
             "ROBINHOOD" => {
                 if let Some(tx_hash) = tx_hash {
                     let rpc = RobinhoodRpc::new(&config.robinhood_rpc_url)?;
@@ -395,6 +355,23 @@ async fn main() -> Result<()> {
                 println!("[INTENT RECOVERY] state=FAILED reason=unsupported_chain");
             }
         }
+    }
+
+    // Resolver intent Solana: FAILED hanya bila gagal on-chain / blockhash expired.
+    if config.enable_solana {
+        match sol_exec.resolve_pending_intents(0).await {
+            Ok(count) => println!("[INTENT RECOVERY] chain=SOLANA resolved={count}"),
+            Err(error) => eprintln!("[INTENT RECOVERY ERROR] chain=SOLANA error={error}"),
+        }
+        let resolver_exec = sol_exec.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(30)).await;
+                if let Err(error) = resolver_exec.resolve_pending_intents(150).await {
+                    eprintln!("[INTENT RESOLVER ERROR] chain=SOLANA error={error}");
+                }
+            }
+        });
     }
 
     // Startup Physical On-Chain Position Reconciliation & Orphan Recovery (Zero-Guessing)
