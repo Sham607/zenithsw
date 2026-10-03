@@ -19,6 +19,14 @@ const SEND_LOOP_INTERVAL_MS: u64 = 2_000;
 const SEND_LOOP_MAX_SECS: u64 = 120;
 /// Percobaan `getTransaction` untuk membaca fill aktual setelah konfirmasi.
 const FILL_FETCH_ATTEMPTS: u32 = 5;
+/// Jeda minimum antar pencarian bukti jual eksternal per posisi (hemat RPC).
+const EXTERNAL_EXIT_RECHECK_SECS: u64 = 30;
+/// Jumlah signature wallet yang dipindai untuk mencari jual eksternal sejak entry.
+const EXTERNAL_EXIT_SIG_LIMIT: usize = 200;
+/// Batas `getTransaction` per pencarian; lebih dari ini = riwayat terlalu ramai, ditahan.
+const EXTERNAL_EXIT_MAX_TX_FETCH: usize = 40;
+/// Umur minimum posisi sebelum saldo 0 tanpa bukti jual boleh dicatat -100% (anti RPC tertinggal).
+const EXTERNAL_EXIT_UNVERIFIED_MIN_AGE_SECS: i64 = 600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignatureState {
@@ -81,6 +89,21 @@ pub struct CachedRealizableQuote {
     pub fetched_at: Instant,
 }
 
+impl CachedRealizableQuote {
+    /// Menghitung harga realizable per UI token dalam USD berdasarkan sol_usd dan token decimals.
+    pub fn calculate_realizable_price_usd(&self, sol_usd: f64, decimals: u8) -> f64 {
+        if self.token_amount_raw == 0 || sol_usd <= 0.0 {
+            return 0.0;
+        }
+        let ui_tokens = self.token_amount_raw as f64 / 10f64.powi(decimals as i32);
+        if ui_tokens <= 0.0 {
+            return 0.0;
+        }
+        let realizable_value_usd = self.estimated_out_sol * sol_usd;
+        realizable_value_usd / ui_tokens
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JupiterQuoteResponse {
     #[serde(rename = "inputMint")]
@@ -114,7 +137,9 @@ pub struct SolanaExecutor {
     rpc_successes: AtomicU64,
     rpc_rate_limited: AtomicU64,
     rpc_failures: AtomicU64,
-    quote_cache: Mutex<HashMap<String, CachedRealizableQuote>>,
+    quote_cache: Mutex<HashMap<(String, u64), CachedRealizableQuote>>,
+    decimals_cache: Mutex<HashMap<String, u8>>,
+    external_exit_checks: Mutex<HashMap<String, Instant>>,
 }
 
 impl SolanaExecutor {
@@ -149,6 +174,8 @@ impl SolanaExecutor {
             rpc_rate_limited: AtomicU64::new(0),
             rpc_failures: AtomicU64::new(0),
             quote_cache: Mutex::new(HashMap::new()),
+            decimals_cache: Mutex::new(HashMap::new()),
+            external_exit_checks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -613,6 +640,17 @@ impl SolanaExecutor {
 
         // 1. Check existing DB positions against physical on-chain balance
         for pos in &db_positions {
+            // Isolasi kepemilikan posisi: jika posisi tercatat milik wallet lain, abaikan (jangan ditutup / jangan disentuh)
+            if let Some(ref owner) = pos.owner_pubkey {
+                if owner != &wallet_pubkey {
+                    println!(
+                        "[STARTUP RECONCILIATION 🛡️] Posisi {} ({}) dimiliki wallet lain ({}), dilewati dari audit wallet aktif {}.",
+                        pos.id, pos.token_symbol, owner, wallet_pubkey
+                    );
+                    continue;
+                }
+            }
+
             if let Some(&physical_amt) = onchain_map.get(&pos.token_mint) {
                 if (pos.amount_native - physical_amt).abs() > 0.000001 {
                     let mut updated = pos.clone();
@@ -630,21 +668,15 @@ impl SolanaExecutor {
                 // Token accounted for
                 onchain_map.remove(&pos.token_mint);
             } else {
-                // Ghost position: DB says active, but physical on-chain balance is zero
-                if let Err(e) = self
-                    .db
-                    .close_position_without_fill(&pos.id, "ORPHAN_AUDIT_ONCHAIN_ZERO")
-                {
-                    eprintln!(
-                        "[STARTUP RECONCILIATION ERROR] Failed closing ghost position {}: {e}",
-                        pos.id
-                    );
-                } else {
-                    ghost_closed += 1;
-                    println!(
-                        "[STARTUP RECONCILIATION 👻] Ghost position closed for {} (id: {}) — on-chain balance is 0",
-                        pos.token_symbol, pos.id
-                    );
+                // Saldo fisik 0 -> dijual di luar bot (Titan, Raydium, dll.).
+                // PnL wajib dari meta transaksi jual, bukan harga model; tanpa bukti posisi ditahan.
+                match self.reconcile_external_exit(pos).await {
+                    Ok(true) => ghost_closed += 1,
+                    Ok(false) => {}
+                    Err(e) => eprintln!(
+                        "[STARTUP RECONCILIATION HOLD ⚠️] Posisi {} ({}) saldo on-chain 0 tetapi bukti jual belum lengkap: {e}",
+                        pos.id, pos.token_symbol
+                    ),
                 }
             }
         }
@@ -686,6 +718,9 @@ impl SolanaExecutor {
                 last_update: Utc::now(),
                 status: "OPEN".to_string(),
                 is_dry_run: false, // On-chain adopted orphan is a real physical holding
+                owner_pubkey: Some(wallet_pubkey.clone()),
+                price_source: "DEXSCREENER".to_string(),
+                price_updated_at: Utc::now(),
             };
 
             if let Err(e) = self.db.upsert_position(&orphan_pos) {
@@ -706,6 +741,161 @@ impl SolanaExecutor {
     }
 
     /// Fetches a Jupiter Swap quote (v1)
+    /// Rekonsiliasi posisi live yang saldo token on-chain-nya terbukti 0 (dijual di luar bot).
+    /// PnL dari meta transaksi jual eksternal (SOL bersih diterima wallet), bukan harga model.
+    /// `Ok(true)` = posisi ditutup, `Ok(false)` = dilewati (jeda cek), `Err` = bukti belum
+    /// lengkap sehingga posisi tetap aktif dan dicoba lagi.
+    pub async fn reconcile_external_exit(&self, pos: &ShadowPosition) -> Result<bool> {
+        {
+            let mut guard = self
+                .external_exit_checks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if guard
+                .get(&pos.id)
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(EXTERNAL_EXIT_RECHECK_SECS))
+            {
+                return Ok(false);
+            }
+            guard.insert(pos.id.clone(), Instant::now());
+        }
+
+        let wallet = self
+            .get_wallet_pubkey()
+            .ok_or_else(|| anyhow!("wallet bot tidak terkonfigurasi"))?;
+        if pos.owner_pubkey.as_deref().is_some_and(|owner| owner != wallet) {
+            return Err(anyhow!("posisi milik wallet lain; tidak direkonsiliasi"));
+        }
+        if self
+            .db
+            .has_active_execution_intent(Chain::Solana, &pos.token_mint)?
+        {
+            return Err(anyhow!("intent bot untuk mint ini masih aktif; menunggu resolver"));
+        }
+
+        let entry_ts = pos.entry_time.timestamp();
+        let sigs_json = self
+            .post_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [wallet, {"limit": EXTERNAL_EXIT_SIG_LIMIT, "commitment": "confirmed"}]
+            }))
+            .await?;
+        let sigs = sigs_json["result"]
+            .as_array()
+            .ok_or_else(|| anyhow!("getSignaturesForAddress malformed"))?;
+        let mut covered = sigs.len() < EXTERNAL_EXIT_SIG_LIMIT;
+        let mut candidates = Vec::new();
+        for item in sigs {
+            if item["blockTime"].as_i64().is_some_and(|t| t < entry_ts) {
+                covered = true;
+                break;
+            }
+            if !item["err"].is_null() {
+                continue;
+            }
+            let sig = item["signature"]
+                .as_str()
+                .ok_or_else(|| anyhow!("signature tidak valid di riwayat"))?;
+            // Transaksi milik bot sendiri sudah dibukukan oleh jalur eksekusi.
+            if !self.db.is_execution_signature(sig)? {
+                candidates.push(sig.to_string());
+            }
+        }
+        if !covered {
+            return Err(anyhow!(
+                "riwayat wallet > {EXTERNAL_EXIT_SIG_LIMIT} transaksi sejak entry; bukti tidak lengkap"
+            ));
+        }
+        if candidates.len() > EXTERNAL_EXIT_MAX_TX_FETCH {
+            return Err(anyhow!(
+                "{} transaksi kandidat > batas {EXTERNAL_EXIT_MAX_TX_FETCH}; ditahan",
+                candidates.len()
+            ));
+        }
+
+        let mut tokens_sold_raw: i128 = 0;
+        let mut proceeds_lamports: i128 = 0;
+        let mut decimals: Option<u32> = None;
+        let mut evidence = Vec::new();
+        for sig in &candidates {
+            let tx = self
+                .post_rpc(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTransaction",
+                    "params": [sig, {"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 1}]
+                }))
+                .await?;
+            if tx["result"].is_null() {
+                return Err(anyhow!("getTransaction {sig} belum tersedia"));
+            }
+            // Bukan swap wallet ini untuk mint ini (fee payer lain / mint lain) -> bukan bukti.
+            let Ok(fill) = Self::parse_swap_fill(&tx["result"], &wallet, &pos.token_mint) else {
+                continue;
+            };
+            if fill.token_raw_delta < 0 {
+                tokens_sold_raw += -fill.token_raw_delta;
+                proceeds_lamports += fill.owner_lamports_delta;
+                decimals = decimals.or(fill.token_decimals);
+                evidence.push(sig.clone());
+            }
+        }
+
+        if evidence.is_empty() {
+            if pos.owner_pubkey.is_none() {
+                return Err(anyhow!(
+                    "tidak ada transaksi jual di wallet aktif dan pemilik posisi tidak tercatat; tidak ditutup otomatis"
+                ));
+            }
+            // Posisi baru + saldo 0 bisa karena node RPC tertinggal; jangan tutup -100% terlalu dini.
+            let age_secs = (Utc::now() - pos.entry_time).num_seconds();
+            if age_secs < EXTERNAL_EXIT_UNVERIFIED_MIN_AGE_SECS {
+                return Err(anyhow!(
+                    "saldo 0 tanpa bukti jual pada posisi berumur {age_secs}s; ditahan (kemungkinan RPC tertinggal)"
+                ));
+            }
+            self.db
+                .close_position_without_fill(&pos.id, "EXTERNAL_EXIT_UNVERIFIED")?;
+            println!(
+                "[EXTERNAL EXIT UNVERIFIED ⚠️] {} ({}) saldo 0 tanpa transaksi jual terbukti; dicatat -100% konservatif.",
+                pos.token_symbol, pos.id
+            );
+            return Ok(true);
+        }
+
+        let decimals = decimals.ok_or_else(|| anyhow!("decimals tidak ada di meta transaksi"))?;
+        // ponytail: harga SOL/USD saat deteksi, bukan saat jual; selisih kecil untuk deteksi runtime,
+        // bisa membesar bila terdeteksi saat startup berjam-jam kemudian. Upgrade: harga SOL historis.
+        let sol_usd = self.get_sol_price().await?;
+        match external_exit_price_usd(tokens_sold_raw, decimals, proceeds_lamports, sol_usd) {
+            Some(exit_price) => {
+                self.db
+                    .close_position(&pos.id, "MANUAL_EXIT_EXTERNAL", exit_price)?;
+                println!(
+                    "[EXTERNAL EXIT RECORDED ✅] {} ({}) exit=${:.10} proceeds={} lamports bukti={}",
+                    pos.token_symbol,
+                    pos.id,
+                    exit_price,
+                    proceeds_lamports,
+                    evidence.join(",")
+                );
+            }
+            None => {
+                self.db
+                    .close_position_without_fill(&pos.id, "MANUAL_EXIT_EXTERNAL_ZERO_PROCEEDS")?;
+                println!(
+                    "[EXTERNAL EXIT RECORDED ⚠️] {} ({}) hasil jual <= 0 SOL; dicatat -100%. bukti={}",
+                    pos.token_symbol,
+                    pos.id,
+                    evidence.join(",")
+                );
+            }
+        }
+        Ok(true)
+    }
+
     pub async fn fetch_jupiter_quote(
         &self,
         input_mint: &str,
@@ -729,25 +919,59 @@ impl SolanaExecutor {
         Ok(json)
     }
 
+    /// Decimals mint dari `getTokenSupply`. Gagal baca = error (tidak ada nilai default).
+    pub async fn get_token_decimals(&self, mint: &str) -> Result<u8> {
+        {
+            let guard = self
+                .decimals_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(&dec) = guard.get(mint) {
+                return Ok(dec);
+            }
+        }
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenSupply",
+            "params": [mint]
+        });
+        let json = self.post_rpc(&payload).await?;
+        let dec = json
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.get("decimals"))
+            .and_then(|d| d.as_u64())
+            .and_then(|d| u8::try_from(d).ok())
+            .ok_or_else(|| anyhow!("getTokenSupply {mint}: decimals tidak valid di respons"))?;
+        let mut guard = self
+            .decimals_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.insert(mint.to_string(), dec);
+        Ok(dec)
+    }
+
     /// Fetches a realizable exit quote from Jupiter (token -> WSOL).
-    /// Uses in-memory cache with TTL 60 seconds to avoid hammering Jupiter rate-limits.
-    /// Falls back to cache if fresh fetch fails and cached quote is < 180 seconds old.
+    /// Uses in-memory cache with TTL exit_quote_ttl_ms to avoid hammering Jupiter rate-limits.
+    /// Soft quote: allows fallback to cache (up to stale_price_max_secs) if fresh fetch fails.
     pub async fn get_realizable_exit_quote(
         &self,
         token_mint: &str,
         token_amount_raw: u64,
     ) -> Result<CachedRealizableQuote> {
-        self.get_exit_quote_internal(token_mint, token_amount_raw, false)
+        self.get_exit_quote_internal(token_mint, token_amount_raw, false, true)
             .await
     }
 
     /// Fetches a fresh realizable exit quote from Jupiter bypassing cache.
+    /// Hard exit/SL quote: fails immediately if fresh fetch fails, never falls back to stale cache.
     pub async fn get_fresh_exit_quote(
         &self,
         token_mint: &str,
         token_amount_raw: u64,
     ) -> Result<CachedRealizableQuote> {
-        self.get_exit_quote_internal(token_mint, token_amount_raw, true)
+        self.get_exit_quote_internal(token_mint, token_amount_raw, true, false)
             .await
     }
 
@@ -756,34 +980,33 @@ impl SolanaExecutor {
         token_mint: &str,
         token_amount_raw: u64,
         bypass_cache: bool,
+        allow_stale_fallback: bool,
     ) -> Result<CachedRealizableQuote> {
         let wsol_mint = "So11111111111111111111111111111111111111112";
         let now = Instant::now();
+        let cache_ttl = Duration::from_millis(self.config.exit_quote_ttl_ms);
 
-        // 1. Check cache freshness (< 60 seconds) unless bypass_cache is requested
+        // Kuotasi wajib untuk jumlah token riil posisi; tanpa jumlah tidak ada harga (sampel dilarang).
+        if token_amount_raw == 0 {
+            return Err(anyhow!(
+                "kuotasi exit {token_mint} ditolak: jumlah token 0 / tidak terbukti"
+            ));
+        }
+        let amount = token_amount_raw;
+
+        let cache_key = (token_mint.to_string(), amount);
+
+        // 1. Check cache freshness (< exit_quote_ttl_ms) unless bypass_cache is requested
         if !bypass_cache {
             let guard = self
                 .quote_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(cached) = guard.get(token_mint) {
-                if now.duration_since(cached.fetched_at) < Duration::from_secs(60) {
+            if let Some(cached) = guard.get(&cache_key) {
+                if now.duration_since(cached.fetched_at) < cache_ttl {
                     return Ok(cached.clone());
                 }
             }
-        }
-
-        // Amount must be positive; if 0, attempt to look up owned raw balance, else use normalized sample (1_000_000 raw units)
-        let mut amount = token_amount_raw;
-        if amount == 0 {
-            if let Ok((raw_bal, _)) = self.get_own_token_balance(token_mint).await {
-                if raw_bal > 0 {
-                    amount = raw_bal;
-                }
-            }
-        }
-        if amount == 0 {
-            amount = 1_000_000;
         }
 
         // 2. Fetch fresh quote from Jupiter
@@ -802,9 +1025,13 @@ impl SolanaExecutor {
                 let estimated_out_sol = out_lamports as f64 / 1_000_000_000.0;
                 let price_impact_pct = val
                     .get("priceImpactPct")
-                    .and_then(Value::as_str)
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
+                    .and_then(|v| {
+                        v.as_str()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .or_else(|| v.as_f64())
+                    })
+                    .filter(|p| p.is_finite())
+                    .ok_or_else(|| anyhow!("Jupiter quote missing or invalid priceImpactPct"))?;
 
                 let quote = CachedRealizableQuote {
                     token_mint: token_mint.to_string(),
@@ -819,18 +1046,22 @@ impl SolanaExecutor {
                     .quote_cache
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.insert(token_mint.to_string(), quote.clone());
+                guard.insert(cache_key, quote.clone());
                 Ok(quote)
             }
             Err(err) => {
-                // Fallback to cache if < 180 seconds old
-                let guard = self
-                    .quote_cache
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(cached) = guard.get(token_mint) {
-                    if now.duration_since(cached.fetched_at) < Duration::from_secs(180) {
-                        return Ok(cached.clone());
+                // Fallback to cache only if explicitly permitted (soft display quote only)
+                if allow_stale_fallback {
+                    let guard = self
+                        .quote_cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(cached) = guard.get(&cache_key) {
+                        let max_stale =
+                            Duration::from_secs(self.config.stale_price_max_secs.max(2));
+                        if now.duration_since(cached.fetched_at) < max_stale {
+                            return Ok(cached.clone());
+                        }
                     }
                 }
                 Err(err)
@@ -1801,6 +2032,9 @@ impl SolanaExecutor {
             last_update: now,
             status: "OPEN".to_string(),
             is_dry_run: self.config.dry_run,
+            owner_pubkey: self.get_wallet_pubkey(),
+            price_source: "DEXSCREENER".to_string(),
+            price_updated_at: now,
         };
 
         self.db.upsert_position(&position)?;
@@ -2014,9 +2248,36 @@ impl SolanaExecutor {
     }
 }
 
+/// Harga exit per token (USD) dari hasil jual on-chain. `None` bila hasil/jumlah tidak positif.
+pub fn external_exit_price_usd(
+    tokens_sold_raw: i128,
+    decimals: u32,
+    proceeds_lamports: i128,
+    sol_usd: f64,
+) -> Option<f64> {
+    let tokens_sold = tokens_sold_raw as f64 / 10f64.powi(decimals as i32);
+    let proceeds_usd = proceeds_lamports as f64 / 1_000_000_000.0 * sol_usd;
+    let price = proceeds_usd / tokens_sold;
+    (tokens_sold > 0.0 && proceeds_usd > 0.0 && price.is_finite()).then_some(price)
+}
+
 #[cfg(test)]
 mod transaction_tests {
-    use super::SolanaExecutor;
+    use super::{external_exit_price_usd, SolanaExecutor};
+
+    #[test]
+    fn external_exit_price_uses_onchain_proceeds_not_model_price() {
+        // Data nyata SLOPCORE: jual 273390.000115 token (6 decimals), wallet terima
+        // 8_462_311 lamports bersih (tx 4RAMGN...). Entry $0.0000366; harga model DB $0.00004895.
+        let sol_usd = 200.0;
+        let exit = external_exit_price_usd(273_390_000_115, 6, 8_462_311, sol_usd).unwrap();
+        let expected = 8_462_311.0 / 1e9 * sol_usd / 273_390.000_115;
+        assert!((exit - expected).abs() < 1e-15);
+        assert!(exit < 0.0000366 * 0.5, "rugi nyata wajib tercatat, bukan profit model");
+        assert_eq!(external_exit_price_usd(273_390_000_115, 6, 0, sol_usd), None);
+        assert_eq!(external_exit_price_usd(273_390_000_115, 6, -5_000, sol_usd), None);
+        assert_eq!(external_exit_price_usd(0, 6, 8_462_311, sol_usd), None);
+    }
 
     fn fixture(versioned: bool, blockhash: [u8; 32]) -> Vec<u8> {
         let mut tx = vec![1u8];

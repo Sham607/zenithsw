@@ -1,10 +1,10 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use futures_util::stream::{self, StreamExt};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -60,11 +60,13 @@ use zenithsw::dex_adapters::{
     NormalizedActivityMaterializationContext,
 };
 use zenithsw::execution::evm_executor::EvmExecutor;
-use zenithsw::execution::solana_executor::SolanaExecutor;
+use zenithsw::execution::solana_executor::{CachedRealizableQuote, SolanaExecutor};
 use zenithsw::gating::confluence::ConfluenceEngine;
 use zenithsw::indexer::SmartMoneyIndexer;
 use zenithsw::ipc::{IpcMessage, IpcServer};
-use zenithsw::models::{ActivityType, Chain, SmartWallet, WalletActivity, WalletTier};
+use zenithsw::models::{
+    ActivityType, Chain, ShadowPosition, SmartWallet, WalletActivity, WalletTier,
+};
 use zenithsw::radar_rpc::{
     poll_and_persist_solana_activity_read_only_for_venue, ReadOnlyRpcClient,
     SolanaActivityPersistenceContext,
@@ -219,6 +221,7 @@ async fn main() -> Result<()> {
 
     // Initialize Stream Listeners (Streamer murni pakai pool RPC publik, proteksi kuota Helius)
     let sol_listener = Arc::new(SolanaStreamListener::new(&config.solana_rpc_url, None));
+    let sol_listener_hb = Arc::clone(&sol_listener);
     let arb_listener = Arc::new(EvmStreamListener::new(
         &config.robinhood_rpc_url,
         Chain::Robinhood,
@@ -375,7 +378,25 @@ async fn main() -> Result<()> {
     }
 
     // Startup Physical On-Chain Position Reconciliation & Orphan Recovery (Zero-Guessing)
+    let wallet_pubkey_mismatch = Arc::new(AtomicBool::new(false));
     if config.enable_solana {
+        let current_wallet_pubkey = sol_exec.get_wallet_pubkey();
+        if let Some(ref current_pk) = current_wallet_pubkey {
+            if let Ok(active_positions) = db.get_active_positions() {
+                for pos in &active_positions {
+                    if let Some(ref owner) = pos.owner_pubkey {
+                        if !owner.is_empty() && owner != current_pk {
+                            eprintln!(
+                                "[WALLET MISMATCH GUARD ⚠️] Posisi {} ({}) milik wallet {}, wallet aktif {}. Posisi tidak akan dimonitor oleh instans ini.",
+                                pos.id, pos.token_symbol, owner, current_pk
+                            );
+                            wallet_pubkey_mismatch.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+
         match sol_exec.reconcile_startup_positions().await {
             Ok((ghost_closed, orphans_adopted)) => {
                 println!(
@@ -718,6 +739,13 @@ async fn main() -> Result<()> {
                             }
 
                             if sig.is_passed {
+                                if config_stream.trading_paused {
+                                    println!(
+                                        "[TRADING PAUSED ⏸️] TRADING_PAUSED=true. BUY baru dilewati untuk {} ({}). Posisi aktif tetap diawasi untuk exit.",
+                                        sig.token_symbol, sig.token_mint
+                                    );
+                                    continue;
+                                }
                                 println!("[EXECUTE 🚀] Passed strict gating! Executing shadow buy for {}", sig.token_symbol);
                                 let pos_opt = match sig.chain {
                                     Chain::Solana => {
@@ -790,785 +818,20 @@ async fn main() -> Result<()> {
             );
         }
         loop {
-            if let Ok(mut positions) = db_pos_tracker.get_active_positions() {
-                for pos in &mut positions {
-                    if pos.status == "CLOSED" {
-                        continue;
-                    }
-
-                    // 1. External exit detection: Jika posisi berstatus aktif di DB tetapi saldo token on-chain 0,
-                    // tandai posisi CLOSED seketika agar bot tidak melacak token hantu / salah hitung PnL.
-                    if !pos.is_dry_run && pos.chain == Chain::Solana {
-                        if let Ok((raw_bal, _)) = sol_exec_pos.get_own_token_balance(&pos.token_mint).await {
-                            if raw_bal == 0 {
-                                println!(
-                                    "[EXTERNAL EXIT DETECTED 🔄] Token {} ({}) saldo on-chain 0. Menutup posisi {} sebagai CLOSED.",
-                                    pos.token_symbol, pos.token_mint, pos.id
-                                );
-                                pos.status = "CLOSED".to_string();
-                                pos.remaining_portion_pct = 0.0;
-                                pos.last_update = Utc::now();
-                                if let Err(e) = db_pos_tracker.upsert_position(pos) {
-                                    eprintln!("[POSITION DB ERROR] Gagal menutup posisi eksternal {}: {e}", pos.id);
-                                }
-                                continue;
-                            }
-                        }
-                    }
-
-                    // Fetch latest live price & pool liquidity; never relabel stale price as fresh.
-                    let price_result = match pos.chain {
-                        Chain::Solana => SolanaStreamListener::fetch_token_price(&pos.token_mint).await,
-                        Chain::Robinhood => Err(anyhow::anyhow!("Robinhood position price requires a verified on-chain quote; Solana resolver is not permitted")),
-                        _ => Err(anyhow::anyhow!("unsupported chain position price source")),
-                    };
-                    let (mut live_price, live_liquidity) = match price_result {
-                        Ok((_, price, liquidity, _))
-                            if price.is_finite()
-                                && price > 0.0
-                                && liquidity.is_finite()
-                                && liquidity > 0.0 =>
-                        {
-                            (price, liquidity)
-                        }
-                        Ok((symbol, price, liquidity, _)) => {
-                            eprintln!(
-                                "[PRICE UPDATE SKIP ⚠️] {} returned invalid market data (price=${:.8}, liquidity=${:.2}); keeping last price with no refresh.",
-                                if symbol.is_empty() { &pos.token_symbol } else { &symbol },
-                                price,
-                                liquidity
-                            );
-                            continue;
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "[PRICE UPDATE FAILED ⚠️] {} ({}) — keeping last price with no refresh.",
-                                pos.token_symbol, error
-                            );
-                            continue;
-                        }
-                    };
-
-                    // Realizable Jupiter Quote integration:
-                    // Verifikasi harga realizable on-chain via Jupiter swap quote.
-                    // Jika harga realizable lebih rendah daripada DexScreener (akibat slippage/price impact/pool tipis),
-                    // wajib prioritaskan harga realizable on-chain sebagai ground truth untuk trailing stop & stop-loss!
-                    if pos.chain == Chain::Solana {
-                        if let Ok(quote) = sol_exec_pos.get_realizable_exit_quote(&pos.token_mint, 0).await {
-                            if quote.estimated_out_sol > 0.0 {
-                                let sol_usd = SolanaStreamListener::get_cached_sol_price_usd().await;
-                                let realizable_value_usd = quote.estimated_out_sol * sol_usd;
-                                let calc_price = if !pos.is_dry_run && pos.amount_native > 0.0 {
-                                    realizable_value_usd / pos.amount_native
-                                } else {
-                                    0.0
-                                };
-
-                                if calc_price > 0.0 && calc_price.is_finite() && calc_price < live_price {
-                                    println!(
-                                        "[REALIZABLE ORACLE 🎯] {} DexScreener=${:.8} vs Realizable=${:.8} (impact: {:.1}%, out: {:.4} SOL). Menggunakan realizable price.",
-                                        pos.token_symbol, live_price, calc_price, quote.price_impact_pct, quote.estimated_out_sol
-                                    );
-                                    live_price = calc_price;
-                                }
-                            }
-                        }
-                    }
-
-                    // Sanity check: Discard single-tick anomaly if price jumps > configured multiplier in one tick from an established price
-                    if live_price > 0.0 {
-                        if pos.current_price > 0.0
-                            && live_price > pos.current_price * config_pos.price_sanity_spike_mult
-                        {
-                            eprintln!(
-                                "[PRICE SANITY GUARD 🛡️] Suspicious price spike for {} (${:.6} -> ${:.6}). Discarding unverified tick.",
-                                pos.token_symbol, pos.current_price, live_price
-                            );
-                            continue;
-                        }
-
-                        // Downward sanity check: Warn on extreme single-tick drop (>50% drop in one tick)
-                        if pos.current_price > 0.0 && live_price < pos.current_price * 0.50 {
-                            eprintln!(
-                                "[PRICE SANITY GUARD 🛡️] Extreme price drop for {} (${:.6} -> ${:.6}, -{:.1}% in single tick). Debouncing 1500ms with fresh oracle recheck...",
-                                pos.token_symbol,
-                                pos.current_price,
-                                live_price,
-                                ((pos.current_price - live_price) / pos.current_price) * 100.0
-                            );
-                            tokio::time::sleep(Duration::from_millis(1500)).await;
-                            let fresh_check = match pos.chain {
-                                Chain::Solana => {
-                                    SolanaStreamListener::fetch_token_price_fresh(&pos.token_mint)
-                                        .await
-                                        .ok()
-                                }
-                                _ => None,
-                            };
-                            if let Some((_, fresh_p, fresh_liq, _)) = fresh_check {
-                                if fresh_p >= pos.current_price * 0.50
-                                    && fresh_liq >= config_pos.liquidity_drain_usd
-                                {
-                                    println!(
-                                        "[PRICE SANITY GUARD 🛡️] False price crash rejected for {} (${:.6} recovered vs glitched ${:.6}). Tick discarded!",
-                                        pos.token_symbol, fresh_p, live_price
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-
-                        pos.current_price = live_price;
-                        pos.peak_price = pos.peak_price.max(live_price);
-                        if pos.entry_price > 0.0 {
-                            pos.unrealized_pnl_pct =
-                                ((pos.current_price - pos.entry_price) / pos.entry_price) * 100.0;
-                        }
-                        pos.last_update = Utc::now();
-
-                        // Realizable Jupiter Quote check for Solana positions nearing TP (+10%) or SL (-20%)
-                        if pos.chain == Chain::Solana
-                            && (pos.unrealized_pnl_pct >= 10.0 || pos.unrealized_pnl_pct <= -20.0)
-                        {
-                            if let Ok(quote) = sol_exec_pos
-                                .get_realizable_exit_quote(&pos.token_mint, 0)
-                                .await
-                            {
-                                if quote.price_impact_pct > 15.0 {
-                                    eprintln!(
-                                        "[REALIZABLE EXIT GUARD ⚠️] Token {} Jupiter price impact is severe ({:.1}%). Realizable out: {:.4} SOL",
-                                        pos.token_symbol, quote.price_impact_pct, quote.estimated_out_sol
-                                    );
-                                }
-                            }
-                        }
-
-                        // Persist every valid tick so current_price, PnL, and last_update
-                        // remain recoverable after a restart, even when the price is flat.
-                        // The TUI receives the same fresh snapshot below via IPC.
-                        if let Err(error) = db_pos_tracker.upsert_position(pos) {
-                            eprintln!(
-                                "[POSITION DB ERROR] Gagal menyimpan posisi {}: {error}",
-                                pos.id
-                            );
-                            continue;
-                        }
-
-                        // Liquidity Drain Guard (Rug-pull trap protection: exit immediately if pool liquidity collapses below floor)
-                        if live_liquidity > 0.0
-                            && live_liquidity < config_pos.liquidity_drain_usd
-                            && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
-                        {
-                            println!(
-                                "[LIQUIDITY DRAIN ⏳] Position {} ({}) reported pool liquidity ${:.0} (<${:.0}). Debouncing 1500ms to verify on-chain before emergency dump...",
-                                pos.id, pos.token_symbol, live_liquidity, config_pos.liquidity_drain_usd
-                            );
-                            tokio::time::sleep(Duration::from_millis(1500)).await;
-
-                            let is_verified_drain = match pos.chain {
-                                Chain::Solana => {
-                                    let fresh_market =
-                                        SolanaStreamListener::fetch_token_price_fresh(
-                                            &pos.token_mint,
-                                        )
-                                        .await
-                                        .ok();
-
-                                    let dexscreener_recovered = fresh_market
-                                        .as_ref()
-                                        .map(|(_, _, fresh_liq, _)| {
-                                            *fresh_liq >= config_pos.liquidity_drain_usd
-                                        })
-                                        .unwrap_or(false);
-
-                                    if dexscreener_recovered {
-                                        let fresh_liq = fresh_market.unwrap().2;
-                                        println!(
-                                            "[LIQUIDITY DRAIN REJECTED 🛡️] {} liquidity recovered to ${:.0} on recheck. False alarm discarded!",
-                                            pos.token_symbol, fresh_liq
-                                        );
-                                        false
-                                    } else {
-                                        if fresh_market.is_none() {
-                                            println!(
-                                                "[LIQUIDITY DRAIN WARNING ⚠️] {} DexScreener recheck unavailable/timed out. Verifying via Jupiter route...",
-                                                pos.token_symbol
-                                            );
-                                        }
-                                        // Secondary check: verify Jupiter realizable route
-                                        match sol_exec_pos
-                                            .get_fresh_exit_quote(&pos.token_mint, 0)
-                                            .await
-                                        {
-                                            Ok(q)
-                                                if q.estimated_out_lamports > 0
-                                                    && q.price_impact_pct < 50.0 =>
-                                            {
-                                                println!(
-                                                    "[LIQUIDITY DRAIN REJECTED 🛡️] {} Jupiter route verified active (impact: {:.1}%, out: {:.4} SOL). False alarm discarded!",
-                                                    pos.token_symbol, q.price_impact_pct, q.estimated_out_sol
-                                                );
-                                                false
-                                            }
-                                            Ok(q) => {
-                                                println!(
-                                                    "[LIQUIDITY DRAIN CONFIRMED 🚨] {} Jupiter route severely degraded (impact: {:.1}%, out: {:.4} SOL). Triggering emergency exit!",
-                                                    pos.token_symbol, q.price_impact_pct, q.estimated_out_sol
-                                                );
-                                                true
-                                            }
-                                            Err(err) => {
-                                                let err_msg = err.to_string();
-                                                let lower = err_msg.to_lowercase();
-                                                let is_terminal = lower
-                                                    .contains("could_not_find_any_route")
-                                                    || lower.contains("could not find any route")
-                                                    || lower.contains("token_not_tradable")
-                                                    || lower.contains("not tradable")
-                                                    || lower.contains("not_enough_liquidity")
-                                                    || lower.contains("not enough liquidity")
-                                                    || lower.contains("route_not_found");
-
-                                                if is_terminal {
-                                                    println!(
-                                                        "[LIQUIDITY DRAIN CONFIRMED 🚨] {} Jupiter route collapsed on-chain ({}). Triggering emergency exit!",
-                                                        pos.token_symbol, err_msg
-                                                    );
-                                                    true
-                                                } else {
-                                                    eprintln!(
-                                                        "[LIQUIDITY DRAIN SUSPENDED ⚠️] {} route verification failed with network/transient error: {}. Position held safely for next cycle.",
-                                                        pos.token_symbol, err_msg
-                                                    );
-                                                    false
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => true,
-                            };
-
-                            if !is_verified_drain {
-                                continue;
-                            }
-
-                            println!(
-                                "[LIQUIDITY DRAIN GUARD 🚨] Confirmed pool liquidity collapse for {} (<${:.0})! Emergency dumping to avoid rug-pull trap!",
-                                pos.token_symbol, config_pos.liquidity_drain_usd
-                            );
-                            match pos.chain {
-                                Chain::Solana => {
-                                    if let Err(error) = sol_exec_pos
-                                        .execute_shadow_sell(
-                                            &pos.id,
-                                            "LIQUIDITY_DRAIN_EXIT",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=LIQUIDITY_DRAIN_EXIT error={error}", pos.id);
-                                    }
-                                }
-                                _ => {
-                                    if let Err(error) = evm_exec_pos
-                                        .execute_shadow_sell(
-                                            &pos.id,
-                                            "LIQUIDITY_DRAIN_EXIT",
-                                            live_price,
-                                        )
-                                        .await
-                                    {
-                                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=LIQUIDITY_DRAIN_EXIT error={error}", pos.id);
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-
-                        if config_pos.shadow_exit_enabled {
-                            // =========================================================================
-                            // MODE A: WHALE SHADOW & RUNNER PROTOCOL (Configured Multi-Tier Exit + Moonbag)
-                            // =========================================================================
-
-                            // 1. Tier 1 Auto Take Profit (Sell configured % of initial position at TP1 PnL to free-roll initial capital)
-                            if pos.unrealized_pnl_pct >= config_pos.take_profit_pct
-                                && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
-                                && pos.remaining_portion_pct >= 90.0
-                            {
-                                println!("[AUTO-TP 1 (+{:.0}%) 🎯] Position {} ({}) reached +{:.1}% >= +{:.0}%! Selling {:.0}% to secure capital (Free-Roll Mode)!",
-                                    config_pos.take_profit_pct, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.take_profit_pct, config_pos.tp1_portion_pct);
-                                match pos.chain {
-                                    Chain::Solana => {
-                                        if let Err(error) = sol_exec_pos
-                                            .execute_partial_shadow_sell(
-                                                &pos.id,
-                                                config_pos.tp1_portion_pct,
-                                                "AUTO_TP_50_FREE_ROLL",
-                                                live_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=AUTO_TP_50_FREE_ROLL error={error}", pos.id);
-                                        }
-                                    }
-                                    _ => {
-                                        if let Err(error) = evm_exec_pos
-                                            .execute_partial_shadow_sell(
-                                                &pos.id,
-                                                config_pos.tp1_portion_pct,
-                                                "AUTO_TP_50_FREE_ROLL",
-                                                live_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=AUTO_TP_50_FREE_ROLL error={error}", pos.id);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 2. Tier 2 Moonbag Take Profit (Sell configured % of initial at configured TP2 PnL, leaving runner)
-                            let tp2_target_pnl = config_pos.take_profit_2_pct;
-                            let remaining_after_tp1 = 100.0 - config_pos.tp1_portion_pct;
-                            let moonbag_portion = remaining_after_tp1 - config_pos.tp2_portion_pct;
-                            if pos.unrealized_pnl_pct >= tp2_target_pnl
-                                && pos.status == "PARTIAL_EXIT"
-                                && pos.remaining_portion_pct > (moonbag_portion + 5.0)
-                                && pos.remaining_portion_pct <= (remaining_after_tp1 + 5.0)
-                            {
-                                println!("[AUTO-TP 2 (+{:.0}%) 🚀] Position {} ({}) hit +{:.1}%! Selling {:.0}% of initial position to lock moonbag gains!",
-                                    tp2_target_pnl, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.tp2_portion_pct);
-                                match pos.chain {
-                                    Chain::Solana => {
-                                        if let Err(error) = sol_exec_pos
-                                            .execute_partial_shadow_sell(
-                                                &pos.id,
-                                                config_pos.tp2_portion_pct,
-                                                "AUTO_TP_25_RUNNER_LOCK",
-                                                live_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=AUTO_TP_25_RUNNER_LOCK error={error}", pos.id);
-                                        }
-                                    }
-                                    _ => {
-                                        if let Err(error) = evm_exec_pos
-                                            .execute_partial_shadow_sell(
-                                                &pos.id,
-                                                config_pos.tp2_portion_pct,
-                                                "AUTO_TP_25_RUNNER_LOCK",
-                                                live_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=AUTO_TP_25_RUNNER_LOCK error={error}", pos.id);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 3. Tier 3 Catastrophic Peak Drawdown Guard on Runner / Moonbag
-                            // If price drops beyond configured % from peak after a configured multiplier pump, dump remaining portion to prevent roundtripping to zero
-                            let peak_drawdown_ratio = 1.0 - (config_pos.peak_drawdown_pct / 100.0);
-                            if pos.status == "PARTIAL_EXIT"
-                                && pos.peak_price
-                                    >= pos.entry_price * config_pos.runner_min_pump_mult
-                                && pos.current_price <= pos.peak_price * peak_drawdown_ratio
-                                && pos.remaining_portion_pct <= (remaining_after_tp1 + 5.0)
-                            {
-                                println!("[PEAK DRAWDOWN GUARD 🛡️] Position {} ({}) dropped >{:.0}% from peak (${:.6} -> ${:.6})! Dumping remaining {:.0}% to lock profit!",
-                                    pos.id, pos.token_symbol, config_pos.peak_drawdown_pct, pos.peak_price, pos.current_price, pos.remaining_portion_pct);
-                                match pos.chain {
-                                    Chain::Solana => {
-                                        if let Err(error) = sol_exec_pos
-                                            .execute_shadow_sell(
-                                                &pos.id,
-                                                "PEAK_DRAWDOWN_GUARD_EXIT",
-                                                live_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=PEAK_DRAWDOWN_GUARD_EXIT error={error}", pos.id);
-                                        }
-                                    }
-                                    _ => {
-                                        if let Err(error) = evm_exec_pos
-                                            .execute_shadow_sell(
-                                                &pos.id,
-                                                "PEAK_DRAWDOWN_GUARD_EXIT",
-                                                live_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=PEAK_DRAWDOWN_GUARD_EXIT error={error}", pos.id);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 4. Profit-Lock Floor on Moonbag (locked once profit reaches the configured floor)
-                            // STRICT SAFETY: Must have reached at least configured pump multiplier initially and current PnL must be positive (>= profit_lock_min_current_pnl_pct)
-                            if pos.status == "PARTIAL_EXIT"
-                                && pos.peak_price
-                                    >= pos.entry_price * config_pos.runner_min_pump_mult
-                                && pos.unrealized_pnl_pct <= config_pos.profit_lock_floor_pct
-                                && pos.unrealized_pnl_pct
-                                    >= config_pos.profit_lock_min_current_pnl_pct
-                                && pos.remaining_portion_pct <= (remaining_after_tp1 + 5.0)
-                            {
-                                println!("[PROFIT-LOCK FLOOR 🛡️] Position {} ({}) moonbag dropped to +{:.1}% (<= +{:.0}%)! Closing remaining portion to guarantee green trade!",
-                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.profit_lock_floor_pct);
-                                match pos.chain {
-                                    Chain::Solana => {
-                                        if let Err(error) = sol_exec_pos
-                                            .execute_shadow_sell(
-                                                &pos.id,
-                                                "PROFIT_LOCK_FLOOR_EXIT",
-                                                live_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=PROFIT_LOCK_FLOOR_EXIT error={error}", pos.id);
-                                        }
-                                    }
-                                    _ => {
-                                        if let Err(error) = evm_exec_pos
-                                            .execute_shadow_sell(
-                                                &pos.id,
-                                                "PROFIT_LOCK_FLOOR_EXIT",
-                                                live_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=PROFIT_LOCK_FLOOR_EXIT error={error}", pos.id);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 5. Pre-TP Conditional Trailing Stop Guard (Capital Preservation)
-                            // Activates when peak gain reaches trailing_stop_trigger_pct (e.g. +35%),
-                            // and dumps 100% if current price drops >= trailing_stop_pct (e.g. 15%) from peak.
-                            let peak_gain_pct = if pos.entry_price > 0.0 {
-                                ((pos.peak_price - pos.entry_price) / pos.entry_price) * 100.0
-                            } else {
-                                0.0
-                            };
-
-                            if (pos.status == "OPEN" || pos.remaining_portion_pct >= 90.0)
-                                && peak_gain_pct >= config_pos.trailing_stop_trigger_pct
-                                && pos.status != "CLOSED"
-                            {
-                                let trailing_drop_threshold =
-                                    1.0 - (config_pos.trailing_stop_pct / 100.0);
-                                let trailing_exit_price = pos.peak_price * trailing_drop_threshold;
-
-                                if pos.current_price <= trailing_exit_price {
-                                    println!(
-                                        "[TRAILING STOP GUARD 🛡️] Position {} ({}) peak was +{:.1}% (${:.6}), dropped >{:.0}% from peak to ${:.6} (<= ${:.6})! Dumping 100% to lock profit!",
-                                        pos.id, pos.token_symbol, peak_gain_pct, pos.peak_price, config_pos.trailing_stop_pct, pos.current_price, trailing_exit_price
-                                    );
-                                    match pos.chain {
-                                        Chain::Solana => {
-                                            if let Err(error) = sol_exec_pos
-                                                .execute_shadow_sell(
-                                                    &pos.id,
-                                                    "TRAILING_STOP_EXIT",
-                                                    live_price,
-                                                )
-                                                .await
-                                            {
-                                                eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=TRAILING_STOP_EXIT error={error}", pos.id);
-                                            }
-                                        }
-                                        _ => {
-                                            if let Err(error) = evm_exec_pos
-                                                .execute_shadow_sell(
-                                                    &pos.id,
-                                                    "TRAILING_STOP_EXIT",
-                                                    live_price,
-                                                )
-                                                .await
-                                            {
-                                                eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=TRAILING_STOP_EXIT error={error}", pos.id);
-                                            }
-                                        }
-                                    }
-                                    continue;
-                                }
-                            }
-
-                            // 6. Emergency Hard Stop Loss Cut-Loss (Disaster Protection Floor)
-                            let hard_sl_trigger =
-                                pos.unrealized_pnl_pct <= -config_pos.stop_loss_pct;
-                            if hard_sl_trigger && pos.status != "CLOSED" {
-                                println!(
-                                    "[SL CONFIRMATION ⏳] Position {} ({}) hit {:.1}% <= -{:.1}%. Awaiting 1200ms debounce to filter flash wicks...",
-                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct
-                                );
-                                sleep(Duration::from_millis(1200)).await;
-
-                                // Re-verify with fresh price fetch (bypass cache)
-                                let recheck_price = match pos.chain {
-                                    Chain::Solana => SolanaStreamListener::fetch_token_price_fresh(
-                                        &pos.token_mint,
-                                    )
-                                    .await
-                                    .map(|(_, p, _, _)| p)
-                                    .ok(),
-                                    _ => None,
-                                };
-
-                                if let Some(fresh_p) = recheck_price {
-                                    if fresh_p > 0.0 && pos.entry_price > 0.0 {
-                                        let fresh_pnl =
-                                            ((fresh_p - pos.entry_price) / pos.entry_price) * 100.0;
-                                        pos.current_price = fresh_p;
-                                        pos.unrealized_pnl_pct = fresh_pnl;
-                                        let _ = db_pos_tracker.upsert_position(pos);
-
-                                        if fresh_pnl > -config_pos.stop_loss_pct {
-                                            println!(
-                                                "[SL FLASH-WICK REJECTED 🛡️] Position {} ({}) recovered to ${:.6} ({:.1}% > -{:.1}%). Cut-loss cancelled!",
-                                                pos.id, pos.token_symbol, fresh_p, fresh_pnl, config_pos.stop_loss_pct
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                }
-
-                                // Check Jupiter realizable quote for Solana
-                                if pos.chain == Chain::Solana {
-                                    if let Ok(quote) =
-                                        sol_exec_pos.get_fresh_exit_quote(&pos.token_mint, 0).await
-                                    {
-                                        if quote.price_impact_pct > 30.0 {
-                                            eprintln!(
-                                                "[SL REALIZABLE WARNING ⚠️] Token {} Jupiter price impact is severe ({:.1}%). Realizable out: {:.4} SOL",
-                                                pos.token_symbol, quote.price_impact_pct, quote.estimated_out_sol
-                                            );
-                                        }
-                                    }
-                                }
-
-                                println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) confirmed breach at {:.1}% <= -{:.1}%! Force closing immediately to protect capital!",
-                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct);
-                                match pos.chain {
-                                    Chain::Solana => {
-                                        if let Err(error) = sol_exec_pos
-                                            .execute_shadow_sell(
-                                                &pos.id,
-                                                "EMERGENCY_HARD_SL_CUTLOSS",
-                                                pos.current_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=EMERGENCY_HARD_SL_CUTLOSS error={error}", pos.id);
-                                        }
-                                    }
-                                    _ => {
-                                        if let Err(error) = evm_exec_pos
-                                            .execute_shadow_sell(
-                                                &pos.id,
-                                                "EMERGENCY_HARD_SL_CUTLOSS",
-                                                pos.current_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=EMERGENCY_HARD_SL_CUTLOSS error={error}", pos.id);
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-                        } else {
-                            // =========================================================================
-                            // MODE B: PURE BOT AUTONOMOUS EXIT (Mode FALSE — All-or-Nothing / Clean Scalp)
-                            // =========================================================================
-
-                            // 1. Bot Trailing Stop Guard (Capital Preservation)
-                            let peak_gain_pct = if pos.entry_price > 0.0 {
-                                ((pos.peak_price - pos.entry_price) / pos.entry_price) * 100.0
-                            } else {
-                                0.0
-                            };
-
-                            if pos.status != "CLOSED"
-                                && peak_gain_pct >= config_pos.bot_trailing_stop_trigger_pct
-                            {
-                                let trailing_drop_threshold =
-                                    1.0 - (config_pos.bot_trailing_stop_pct / 100.0);
-                                let trailing_exit_price = pos.peak_price * trailing_drop_threshold;
-
-                                if pos.current_price <= trailing_exit_price {
-                                    println!(
-                                        "[BOT TRAILING STOP 🛡️] Position {} ({}) peak was +{:.1}% (${:.6}), dropped >{:.0}% from peak to ${:.6} (<= ${:.6})! Dumping 100% to lock profit!",
-                                        pos.id, pos.token_symbol, peak_gain_pct, pos.peak_price, config_pos.bot_trailing_stop_pct, pos.current_price, trailing_exit_price
-                                    );
-                                    match pos.chain {
-                                        Chain::Solana => {
-                                            if let Err(error) = sol_exec_pos
-                                                .execute_shadow_sell(
-                                                    &pos.id,
-                                                    "BOT_TRAILING_STOP_EXIT",
-                                                    live_price,
-                                                )
-                                                .await
-                                            {
-                                                eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=BOT_TRAILING_STOP_EXIT error={error}", pos.id);
-                                            }
-                                        }
-                                        _ => {
-                                            if let Err(error) = evm_exec_pos
-                                                .execute_shadow_sell(
-                                                    &pos.id,
-                                                    "BOT_TRAILING_STOP_EXIT",
-                                                    live_price,
-                                                )
-                                                .await
-                                            {
-                                                eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=BOT_TRAILING_STOP_EXIT error={error}", pos.id);
-                                            }
-                                        }
-                                    }
-                                    continue;
-                                }
-                            }
-
-                            // 2. Bot Full Take Profit (100% dump, no partials)
-                            if pos.status != "CLOSED"
-                                && pos.unrealized_pnl_pct >= config_pos.bot_take_profit_pct
-                            {
-                                println!(
-                                    "[BOT AUTO-TP 🎯] Position {} ({}) hit +{:.1}% >= +{:.0}%! Selling 100% full position!",
-                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.bot_take_profit_pct
-                                );
-                                match pos.chain {
-                                    Chain::Solana => {
-                                        if let Err(error) = sol_exec_pos
-                                            .execute_shadow_sell(
-                                                &pos.id,
-                                                "BOT_FULL_TP_EXIT",
-                                                live_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=BOT_FULL_TP_EXIT error={error}", pos.id);
-                                        }
-                                    }
-                                    _ => {
-                                        if let Err(error) = evm_exec_pos
-                                            .execute_shadow_sell(
-                                                &pos.id,
-                                                "BOT_FULL_TP_EXIT",
-                                                live_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=BOT_FULL_TP_EXIT error={error}", pos.id);
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // 3. Bot Full Hard Stop Loss (100% cut loss)
-                            if pos.status != "CLOSED"
-                                && pos.unrealized_pnl_pct <= -config_pos.bot_stop_loss_pct
-                            {
-                                println!(
-                                    "[SL CONFIRMATION ⏳] Position {} ({}) hit {:.1}% <= -{:.1}%. Awaiting 1200ms debounce to filter flash wicks...",
-                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.bot_stop_loss_pct
-                                );
-                                sleep(Duration::from_millis(1200)).await;
-
-                                // Re-verify with fresh price fetch (bypass cache)
-                                let recheck_price = match pos.chain {
-                                    Chain::Solana => SolanaStreamListener::fetch_token_price_fresh(
-                                        &pos.token_mint,
-                                    )
-                                    .await
-                                    .map(|(_, p, _, _)| p)
-                                    .ok(),
-                                    _ => None,
-                                };
-
-                                if let Some(fresh_p) = recheck_price {
-                                    if fresh_p > 0.0 && pos.entry_price > 0.0 {
-                                        let fresh_pnl =
-                                            ((fresh_p - pos.entry_price) / pos.entry_price) * 100.0;
-                                        pos.current_price = fresh_p;
-                                        pos.unrealized_pnl_pct = fresh_pnl;
-                                        let _ = db_pos_tracker.upsert_position(pos);
-
-                                        if fresh_pnl > -config_pos.bot_stop_loss_pct {
-                                            println!(
-                                                "[SL FLASH-WICK REJECTED 🛡️] Position {} ({}) recovered to ${:.6} ({:.1}% > -{:.1}%). Cut-loss cancelled!",
-                                                pos.id, pos.token_symbol, fresh_p, fresh_pnl, config_pos.bot_stop_loss_pct
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                }
-
-                                // Check Jupiter realizable quote for Solana
-                                if pos.chain == Chain::Solana {
-                                    if let Ok(quote) =
-                                        sol_exec_pos.get_fresh_exit_quote(&pos.token_mint, 0).await
-                                    {
-                                        if quote.price_impact_pct > 30.0 {
-                                            eprintln!(
-                                                "[SL REALIZABLE WARNING ⚠️] Token {} Jupiter price impact is severe ({:.1}%). Realizable out: {:.4} SOL",
-                                                pos.token_symbol, quote.price_impact_pct, quote.estimated_out_sol
-                                            );
-                                        }
-                                    }
-                                }
-
-                                println!(
-                                    "[BOT EMERGENCY SL 🛑] Position {} ({}) confirmed breach at {:.1}% <= -{:.1}%! Force closing 100% immediately!",
-                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.bot_stop_loss_pct
-                                );
-                                match pos.chain {
-                                    Chain::Solana => {
-                                        if let Err(error) = sol_exec_pos
-                                            .execute_shadow_sell(
-                                                &pos.id,
-                                                "BOT_HARD_SL_CUTLOSS",
-                                                pos.current_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=BOT_HARD_SL_CUTLOSS error={error}", pos.id);
-                                        }
-                                    }
-                                    _ => {
-                                        if let Err(error) = evm_exec_pos
-                                            .execute_shadow_sell(
-                                                &pos.id,
-                                                "BOT_HARD_SL_CUTLOSS",
-                                                pos.current_price,
-                                            )
-                                            .await
-                                        {
-                                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=BOT_HARD_SL_CUTLOSS error={error}", pos.id);
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                    }
-
-                    sleep(Duration::from_millis(100)).await;
-                }
+            if let Ok(positions) = db_pos_tracker.get_active_positions() {
+                let eval_futures = positions.into_iter().map(|pos| {
+                    let db = db_pos_tracker.clone();
+                    let sol_exec = sol_exec_pos.clone();
+                    let evm_exec = evm_exec_pos.clone();
+                    let config = Arc::new(config_pos.clone());
+                    evaluate_single_position(pos, db, sol_exec, evm_exec, config)
+                });
+                let refreshed_positions = futures_util::future::join_all(eval_futures).await;
 
                 // Broadcast refreshed positions to IPC socket
-                if let Err(error) =
-                    ipc_pos_tracker.broadcast(&IpcMessage::PositionUpdate { positions })
-                {
+                if let Err(error) = ipc_pos_tracker.broadcast(&IpcMessage::PositionUpdate {
+                    positions: refreshed_positions,
+                }) {
                     eprintln!("[IPC ERROR] PositionUpdate gagal: {error}");
                 }
             }
@@ -1698,6 +961,7 @@ async fn main() -> Result<()> {
             sleep(Duration::from_secs(5)).await;
         }
     });
+    let wallet_pubkey_mismatch_hb = Arc::clone(&wallet_pubkey_mismatch);
     tokio::spawn(async move {
         let mut sync_tick = 0u64;
         loop {
@@ -1761,11 +1025,11 @@ async fn main() -> Result<()> {
 
             let wallet_equity_usd = sol_usd_val + open_positions_usd;
 
-            let total_realized_pnl_usd: f64 = match db_heartbeat.get_recent_trades(500) {
-                Ok(trades) => trades.iter().map(|t| t.pnl_usd).sum(),
+            let total_realized_pnl_usd: Option<f64> = match db_heartbeat.get_recent_trades(500) {
+                Ok(trades) => Some(trades.iter().map(|t| t.pnl_usd).sum()),
                 Err(error) => {
                     eprintln!("[HEARTBEAT DB ERROR] Realized PnL unavailable: {error}");
-                    0.0
+                    None
                 }
             };
 
@@ -1777,6 +1041,19 @@ async fn main() -> Result<()> {
                     rpc_requests, rpc_successes, rpc_rate_limited, rpc_failures
                 );
             }
+
+            let (ws_subscribed_wallets, ws_expected_wallets) =
+                sol_listener_hb.ws_subscription_status();
+            let stale_positions_count = active_positions
+                .iter()
+                .filter(|p| {
+                    p.price_source == "STALE"
+                        || (Utc::now() - p.price_updated_at).num_seconds().max(0) as u64
+                            >= config_hb.stale_price_max_secs
+                })
+                .count();
+            let trading_paused = config_hb.trading_paused;
+            let wallet_pubkey_mismatch = wallet_pubkey_mismatch_hb.load(Ordering::Relaxed);
 
             let hb = IpcMessage::Heartbeat {
                 uptime_secs,
@@ -1821,6 +1098,11 @@ async fn main() -> Result<()> {
                 polled_wallets_count: polled_counter_hb.load(Ordering::Relaxed),
                 global_scanned_wallets_count: global_scanned_counter_hb.load(Ordering::Relaxed),
                 candidate_wallets_count: candidate_counter_hb.load(Ordering::Relaxed),
+                ws_subscribed_wallets,
+                ws_expected_wallets,
+                stale_positions_count,
+                trading_paused,
+                wallet_pubkey_mismatch,
             };
             if let Err(error) = ipc_heartbeat.broadcast(&hb) {
                 eprintln!("[IPC ERROR] Heartbeat gagal: {error}");
@@ -1942,4 +1224,834 @@ async fn main() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     println!("\n[SHUTDOWN] Stopping ZenithSW Daemon cleanly...");
     Ok(())
+}
+
+/// Jumlah raw token posisi + decimals mint untuk kuotasi exit.
+/// Live = saldo on-chain riil; dry-run = amount_native × 10^decimals.
+/// Error bila saldo/decimals tidak terbukti — tidak ada nilai pengganti.
+async fn position_exit_amount_raw(
+    pos: &ShadowPosition,
+    sol_exec: &SolanaExecutor,
+) -> Result<(u64, u8)> {
+    let decimals = sol_exec.get_token_decimals(&pos.token_mint).await?;
+    let amount_raw = if pos.is_dry_run {
+        (pos.amount_native * 10f64.powi(i32::from(decimals))).round() as u64
+    } else {
+        sol_exec.get_own_token_balance(&pos.token_mint).await?.0
+    };
+    Ok((amount_raw, decimals))
+}
+
+/// Harga realizable per token (USD) dari kuotasi Jupiter; error bila harga SOL belum terverifikasi.
+async fn realizable_price_usd(quote: &CachedRealizableQuote, decimals: u8) -> Result<f64> {
+    let sol_usd = SolanaStreamListener::get_cached_sol_price_usd()
+        .await
+        .ok_or_else(|| anyhow!("harga SOL/USD belum terverifikasi"))?;
+    let price = quote.calculate_realizable_price_usd(sol_usd, decimals);
+    if price.is_finite() && price > 0.0 {
+        Ok(price)
+    } else {
+        bail!("harga realizable tidak valid ({price})")
+    }
+}
+
+/// Harga realizable fresh (tanpa cache) untuk jumlah token riil posisi.
+async fn fresh_realizable_price(pos: &ShadowPosition, sol_exec: &SolanaExecutor) -> Result<f64> {
+    let (amount_raw, decimals) = position_exit_amount_raw(pos, sol_exec).await?;
+    let quote = sol_exec
+        .get_fresh_exit_quote(&pos.token_mint, amount_raw)
+        .await?;
+    realizable_price_usd(&quote, decimals).await
+}
+
+/// Harga posisi = harga terbukti terendah (konservatif). Keduanya tidak ada = None (STALE).
+fn select_position_price(
+    dex_price: Option<f64>,
+    realizable_price: Option<f64>,
+) -> Option<(f64, &'static str)> {
+    match (dex_price, realizable_price) {
+        (Some(dex), Some(realizable)) if realizable < dex => Some((realizable, "JUPITER")),
+        (Some(dex), _) => Some((dex, "DEXSCREENER")),
+        (None, Some(realizable)) => Some((realizable, "JUPITER")),
+        (None, None) => None,
+    }
+}
+
+async fn evaluate_single_position(
+    mut pos: ShadowPosition,
+    db_pos_tracker: Arc<SmartWalletDb>,
+    sol_exec_pos: Arc<SolanaExecutor>,
+    evm_exec_pos: Arc<EvmExecutor>,
+    config_pos: Arc<Config>,
+) -> ShadowPosition {
+    if pos.status == "CLOSED" {
+        return pos;
+    }
+
+    // 1. Cek kepemilikan posisi: engine hanya mengelola posisi milik wallet aktif
+    let active_pubkey = sol_exec_pos.get_wallet_pubkey();
+    if !pos.is_dry_run && pos.chain == Chain::Solana {
+        if let Some(ref owner) = pos.owner_pubkey {
+            if let Some(ref active) = active_pubkey {
+                if owner != active {
+                    // Milik wallet lain. Lewati agar tidak disentuh atau ditutup oleh wallet aktif yang berbeda.
+                    return pos;
+                }
+            }
+        }
+    }
+
+    // 2. External exit detection: Jika posisi berstatus aktif di DB tetapi saldo token on-chain 0,
+    // rekonsiliasi manual exit seketika dan catat ke trade_history via MANUAL_EXIT_EXTERNAL.
+    if !pos.is_dry_run && pos.chain == Chain::Solana {
+        if let Ok((raw_bal, _)) = sol_exec_pos.get_own_token_balance(&pos.token_mint).await {
+            if raw_bal == 0 {
+                println!(
+                    "[EXTERNAL EXIT DETECTED 🔄] Token {} ({}) saldo on-chain 0. Mencari bukti transaksi jual di riwayat on-chain untuk posisi {}.",
+                    pos.token_symbol, pos.token_mint, pos.id
+                );
+                if let Err(e) = sol_exec_pos.reconcile_external_exit(&pos).await {
+                    eprintln!(
+                        "[EXTERNAL EXIT HOLD ⚠️] Posisi {} ditahan, dicoba lagi siklus berikutnya: {e}",
+                        pos.id
+                    );
+                }
+                return pos;
+            }
+        }
+    }
+
+    // Fetch latest live price & pool liquidity; never relabel stale price as fresh.
+    let price_result = match pos.chain {
+                        Chain::Solana => SolanaStreamListener::fetch_token_price(&pos.token_mint).await,
+                        Chain::Robinhood => Err(anyhow::anyhow!("Robinhood position price requires a verified on-chain quote; Solana resolver is not permitted")),
+                        _ => Err(anyhow::anyhow!("unsupported chain position price source")),
+                    };
+    // DexScreener gagal ≠ posisi buta: kuotasi Jupiter tetap dievaluasi di bawah (A3).
+    let dex_market = match price_result {
+        Ok((_, price, liquidity, _))
+            if price.is_finite() && price > 0.0 && liquidity.is_finite() && liquidity > 0.0 =>
+        {
+            Some((price, liquidity))
+        }
+        Ok((symbol, price, liquidity, _)) => {
+            eprintln!(
+                                "[PRICE UPDATE SKIP ⚠️] {} returned invalid market data (price=${:.8}, liquidity=${:.2}); lanjut ke kuotasi Jupiter.",
+                                if symbol.is_empty() { &pos.token_symbol } else { &symbol },
+                                price,
+                                liquidity
+                            );
+            None
+        }
+        Err(error) => {
+            eprintln!(
+                "[PRICE UPDATE FAILED ⚠️] {} ({}) — DexScreener gagal; lanjut ke kuotasi Jupiter.",
+                pos.token_symbol, error
+            );
+            None
+        }
+    };
+    // Tanpa data DexScreener, likuiditas tidak diketahui (0) sehingga drain guard tidak terpicu palsu.
+    let live_liquidity = dex_market.map_or(0.0, |(_, liquidity)| liquidity);
+
+    // Realizable Jupiter Quote integration:
+    // Verifikasi harga realizable on-chain via Jupiter swap quote.
+    // Jika harga realizable lebih rendah daripada DexScreener (akibat slippage/price impact/pool tipis),
+    // wajib prioritaskan harga realizable on-chain sebagai ground truth untuk trailing stop & stop-loss!
+    let mut realizable_price: Option<f64> = None;
+    if pos.chain == Chain::Solana {
+        // Saldo/decimals tidak terbukti: kuotasi realizable dilewati (tanpa sampel/nilai default).
+        // Harga DexScreener tetap dipakai sehingga SL masih dievaluasi; recheck SL fail-closed.
+        let realizable = match position_exit_amount_raw(&pos, &sol_exec_pos).await {
+            Ok((token_amount_raw, decimals)) => sol_exec_pos
+                .get_realizable_exit_quote(&pos.token_mint, token_amount_raw)
+                .await
+                .map(|quote| (quote, decimals)),
+            Err(error) => {
+                eprintln!(
+                    "[REALIZABLE ORACLE SKIP ⚠️] {} ({}) saldo/decimals tidak terbukti: {error}",
+                    pos.token_symbol, pos.token_mint
+                );
+                Err(error)
+            }
+        };
+
+        if let Ok((quote, decimals)) = realizable {
+            match realizable_price_usd(&quote, decimals).await {
+                Ok(calc_price) => {
+                    if dex_market.is_none_or(|(dex_price, _)| calc_price < dex_price) {
+                        println!(
+                                        "[REALIZABLE ORACLE 🎯] {} DexScreener={} vs Realizable=${:.8} (impact: {:.1}%, out: {:.4} SOL). Menggunakan realizable price.",
+                                        pos.token_symbol,
+                                        dex_market.map_or("N/A".to_string(), |(dex_price, _)| format!("${dex_price:.8}")),
+                                        calc_price, quote.price_impact_pct, quote.estimated_out_sol
+                                    );
+                    }
+                    realizable_price = Some(calc_price);
+                }
+                Err(error) => eprintln!(
+                    "[REALIZABLE ORACLE SKIP ⚠️] {} harga realizable tidak terbukti: {error}",
+                    pos.token_symbol
+                ),
+            }
+        }
+    }
+
+    let Some((live_price, price_source)) =
+        select_position_price(dex_market.map(|(price, _)| price), realizable_price)
+    else {
+        eprintln!(
+            "[PRICE STALE ⚠️] {} ({}) DexScreener & Jupiter sama-sama tidak tersedia; tanpa keputusan siklus ini.",
+            pos.token_symbol, pos.token_mint
+        );
+        pos.price_source = "STALE".to_string();
+        return pos;
+    };
+
+    // Sanity check: Discard single-tick anomaly if price jumps > configured multiplier in one tick from an established price
+    if live_price > 0.0 {
+        if pos.current_price > 0.0
+            && live_price > pos.current_price * config_pos.price_sanity_spike_mult
+        {
+            eprintln!(
+                                "[PRICE SANITY GUARD 🛡️] Suspicious price spike for {} (${:.6} -> ${:.6}). Discarding unverified tick.",
+                                pos.token_symbol, pos.current_price, live_price
+                            );
+            return pos;
+        }
+
+        // Downward sanity check: Warn on extreme single-tick drop (>50% drop in one tick).
+        // Hanya untuk harga dari DexScreener: anjlok versi kuotasi Jupiter tidak boleh diveto
+        // DexScreener (A2); recheck SL tetap memakai kuotasi Jupiter fresh.
+        if price_source == "DEXSCREENER"
+            && pos.current_price > 0.0
+            && live_price < pos.current_price * 0.50
+        {
+            eprintln!(
+                                "[PRICE SANITY GUARD 🛡️] Extreme price drop for {} (${:.6} -> ${:.6}, -{:.1}% in single tick). Debouncing 1500ms with fresh oracle recheck...",
+                                pos.token_symbol,
+                                pos.current_price,
+                                live_price,
+                                ((pos.current_price - live_price) / pos.current_price) * 100.0
+                            );
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let fresh_check = match pos.chain {
+                Chain::Solana => SolanaStreamListener::fetch_token_price_fresh(&pos.token_mint)
+                    .await
+                    .ok(),
+                _ => None,
+            };
+            if let Some((_, fresh_p, fresh_liq, _)) = fresh_check {
+                if fresh_p >= pos.current_price * 0.50
+                    && fresh_liq >= config_pos.liquidity_drain_usd
+                {
+                    println!(
+                                        "[PRICE SANITY GUARD 🛡️] False price crash rejected for {} (${:.6} recovered vs glitched ${:.6}). Tick discarded!",
+                                        pos.token_symbol, fresh_p, live_price
+                                    );
+                    return pos;
+                }
+            }
+        }
+
+        pos.current_price = live_price;
+        pos.price_source = price_source.to_string();
+        pos.price_updated_at = Utc::now();
+        pos.peak_price = pos.peak_price.max(live_price);
+        if pos.entry_price > 0.0 {
+            pos.unrealized_pnl_pct =
+                ((pos.current_price - pos.entry_price) / pos.entry_price) * 100.0;
+        }
+        pos.last_update = Utc::now();
+
+        // Realizable Jupiter Quote check for Solana positions nearing TP (+10%) or SL (-20%)
+        if pos.chain == Chain::Solana
+            && (pos.unrealized_pnl_pct >= 10.0 || pos.unrealized_pnl_pct <= -20.0)
+        {
+            let quote = match position_exit_amount_raw(&pos, &sol_exec_pos).await {
+                Ok((raw_amt, _)) => {
+                    sol_exec_pos
+                        .get_realizable_exit_quote(&pos.token_mint, raw_amt)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Ok(quote) = quote {
+                if quote.price_impact_pct > 15.0 {
+                    eprintln!(
+                                        "[REALIZABLE EXIT GUARD ⚠️] Token {} Jupiter price impact is severe ({:.1}%). Realizable out: {:.4} SOL",
+                                        pos.token_symbol, quote.price_impact_pct, quote.estimated_out_sol
+                                    );
+                }
+            }
+        }
+
+        // Persist every valid tick so current_price, PnL, and last_update
+        // remain recoverable after a restart, even when the price is flat.
+        // The TUI receives the same fresh snapshot below via IPC.
+        if let Err(error) = db_pos_tracker.upsert_position(&pos) {
+            eprintln!(
+                "[POSITION DB ERROR] Gagal menyimpan posisi {}: {error}",
+                pos.id
+            );
+            return pos;
+        }
+
+        // Liquidity Drain Guard (Rug-pull trap protection: exit immediately if pool liquidity collapses below floor)
+        if live_liquidity > 0.0
+            && live_liquidity < config_pos.liquidity_drain_usd
+            && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
+        {
+            println!(
+                                "[LIQUIDITY DRAIN ⏳] Position {} ({}) reported pool liquidity ${:.0} (<${:.0}). Debouncing 1500ms to verify on-chain before emergency dump...",
+                                pos.id, pos.token_symbol, live_liquidity, config_pos.liquidity_drain_usd
+                            );
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+
+            let is_verified_drain = match pos.chain {
+                Chain::Solana => {
+                    let fresh_market =
+                        SolanaStreamListener::fetch_token_price_fresh(&pos.token_mint)
+                            .await
+                            .ok();
+
+                    let dexscreener_recovered = fresh_market
+                        .as_ref()
+                        .map(|(_, _, fresh_liq, _)| *fresh_liq >= config_pos.liquidity_drain_usd)
+                        .unwrap_or(false);
+
+                    if dexscreener_recovered {
+                        let fresh_liq = fresh_market.unwrap().2;
+                        println!(
+                                            "[LIQUIDITY DRAIN REJECTED 🛡️] {} liquidity recovered to ${:.0} on recheck. False alarm discarded!",
+                                            pos.token_symbol, fresh_liq
+                                        );
+                        false
+                    } else {
+                        if fresh_market.is_none() {
+                            println!(
+                                                "[LIQUIDITY DRAIN WARNING ⚠️] {} DexScreener recheck unavailable/timed out. Verifying via Jupiter route...",
+                                                pos.token_symbol
+                                            );
+                        }
+                        // Secondary check: rute Jupiter untuk jumlah token riil posisi (bukan sampel)
+                        let drain_quote = match position_exit_amount_raw(&pos, &sol_exec_pos).await
+                        {
+                            Ok((raw_amt, _)) => {
+                                sol_exec_pos
+                                    .get_fresh_exit_quote(&pos.token_mint, raw_amt)
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        };
+                        match drain_quote {
+                            Ok(q) if q.estimated_out_lamports > 0 && q.price_impact_pct < 50.0 => {
+                                println!(
+                                                    "[LIQUIDITY DRAIN REJECTED 🛡️] {} Jupiter route verified active (impact: {:.1}%, out: {:.4} SOL). False alarm discarded!",
+                                                    pos.token_symbol, q.price_impact_pct, q.estimated_out_sol
+                                                );
+                                false
+                            }
+                            Ok(q) => {
+                                println!(
+                                                    "[LIQUIDITY DRAIN CONFIRMED 🚨] {} Jupiter route severely degraded (impact: {:.1}%, out: {:.4} SOL). Triggering emergency exit!",
+                                                    pos.token_symbol, q.price_impact_pct, q.estimated_out_sol
+                                                );
+                                true
+                            }
+                            Err(err) => {
+                                let err_msg = err.to_string();
+                                let lower = err_msg.to_lowercase();
+                                let is_terminal = lower.contains("could_not_find_any_route")
+                                    || lower.contains("could not find any route")
+                                    || lower.contains("token_not_tradable")
+                                    || lower.contains("not tradable")
+                                    || lower.contains("not_enough_liquidity")
+                                    || lower.contains("not enough liquidity")
+                                    || lower.contains("route_not_found");
+
+                                if is_terminal {
+                                    println!(
+                                                        "[LIQUIDITY DRAIN CONFIRMED 🚨] {} Jupiter route collapsed on-chain ({}). Triggering emergency exit!",
+                                                        pos.token_symbol, err_msg
+                                                    );
+                                    true
+                                } else {
+                                    eprintln!(
+                                                        "[LIQUIDITY DRAIN SUSPENDED ⚠️] {} route verification failed with network/transient error: {}. Position held safely for next cycle.",
+                                                        pos.token_symbol, err_msg
+                                                    );
+                                    false
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => true,
+            };
+
+            if !is_verified_drain {
+                return pos;
+            }
+
+            println!(
+                                "[LIQUIDITY DRAIN GUARD 🚨] Confirmed pool liquidity collapse for {} (<${:.0})! Emergency dumping to avoid rug-pull trap!",
+                                pos.token_symbol, config_pos.liquidity_drain_usd
+                            );
+            match pos.chain {
+                Chain::Solana => {
+                    if let Err(error) = sol_exec_pos
+                        .execute_shadow_sell(&pos.id, "LIQUIDITY_DRAIN_EXIT", live_price)
+                        .await
+                    {
+                        eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=LIQUIDITY_DRAIN_EXIT error={error}", pos.id);
+                    }
+                }
+                _ => {
+                    if let Err(error) = evm_exec_pos
+                        .execute_shadow_sell(&pos.id, "LIQUIDITY_DRAIN_EXIT", live_price)
+                        .await
+                    {
+                        eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=LIQUIDITY_DRAIN_EXIT error={error}", pos.id);
+                    }
+                }
+            }
+            return pos;
+        }
+
+        if config_pos.shadow_exit_enabled {
+            // =========================================================================
+            // MODE A: WHALE SHADOW & RUNNER PROTOCOL (Configured Multi-Tier Exit + Moonbag)
+            // =========================================================================
+
+            // 1. Tier 1 Auto Take Profit (Sell configured % of initial position at TP1 PnL to free-roll initial capital)
+            if pos.unrealized_pnl_pct >= config_pos.take_profit_pct
+                && (pos.status == "OPEN" || pos.status == "PARTIAL_EXIT")
+                && pos.remaining_portion_pct >= 90.0
+            {
+                println!("[AUTO-TP 1 (+{:.0}%) 🎯] Position {} ({}) reached +{:.1}% >= +{:.0}%! Selling {:.0}% to secure capital (Free-Roll Mode)!",
+                                    config_pos.take_profit_pct, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.take_profit_pct, config_pos.tp1_portion_pct);
+                match pos.chain {
+                    Chain::Solana => {
+                        if let Err(error) = sol_exec_pos
+                            .execute_partial_shadow_sell(
+                                &pos.id,
+                                config_pos.tp1_portion_pct,
+                                "AUTO_TP_50_FREE_ROLL",
+                                live_price,
+                            )
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=AUTO_TP_50_FREE_ROLL error={error}", pos.id);
+                        }
+                    }
+                    _ => {
+                        if let Err(error) = evm_exec_pos
+                            .execute_partial_shadow_sell(
+                                &pos.id,
+                                config_pos.tp1_portion_pct,
+                                "AUTO_TP_50_FREE_ROLL",
+                                live_price,
+                            )
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=AUTO_TP_50_FREE_ROLL error={error}", pos.id);
+                        }
+                    }
+                }
+            }
+
+            // 2. Tier 2 Moonbag Take Profit (Sell configured % of initial at configured TP2 PnL, leaving runner)
+            let tp2_target_pnl = config_pos.take_profit_2_pct;
+            let remaining_after_tp1 = 100.0 - config_pos.tp1_portion_pct;
+            let moonbag_portion = remaining_after_tp1 - config_pos.tp2_portion_pct;
+            if pos.unrealized_pnl_pct >= tp2_target_pnl
+                && pos.status == "PARTIAL_EXIT"
+                && pos.remaining_portion_pct > (moonbag_portion + 5.0)
+                && pos.remaining_portion_pct <= (remaining_after_tp1 + 5.0)
+            {
+                println!("[AUTO-TP 2 (+{:.0}%) 🚀] Position {} ({}) hit +{:.1}%! Selling {:.0}% of initial position to lock moonbag gains!",
+                                    tp2_target_pnl, pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.tp2_portion_pct);
+                match pos.chain {
+                    Chain::Solana => {
+                        if let Err(error) = sol_exec_pos
+                            .execute_partial_shadow_sell(
+                                &pos.id,
+                                config_pos.tp2_portion_pct,
+                                "AUTO_TP_25_RUNNER_LOCK",
+                                live_price,
+                            )
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=AUTO_TP_25_RUNNER_LOCK error={error}", pos.id);
+                        }
+                    }
+                    _ => {
+                        if let Err(error) = evm_exec_pos
+                            .execute_partial_shadow_sell(
+                                &pos.id,
+                                config_pos.tp2_portion_pct,
+                                "AUTO_TP_25_RUNNER_LOCK",
+                                live_price,
+                            )
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=AUTO_TP_25_RUNNER_LOCK error={error}", pos.id);
+                        }
+                    }
+                }
+            }
+
+            // 3. Tier 3 Catastrophic Peak Drawdown Guard on Runner / Moonbag
+            // If price drops beyond configured % from peak after a configured multiplier pump, dump remaining portion to prevent roundtripping to zero
+            let peak_drawdown_ratio = 1.0 - (config_pos.peak_drawdown_pct / 100.0);
+            if pos.status == "PARTIAL_EXIT"
+                && pos.peak_price >= pos.entry_price * config_pos.runner_min_pump_mult
+                && pos.current_price <= pos.peak_price * peak_drawdown_ratio
+                && pos.remaining_portion_pct <= (remaining_after_tp1 + 5.0)
+            {
+                println!("[PEAK DRAWDOWN GUARD 🛡️] Position {} ({}) dropped >{:.0}% from peak (${:.6} -> ${:.6})! Dumping remaining {:.0}% to lock profit!",
+                                    pos.id, pos.token_symbol, config_pos.peak_drawdown_pct, pos.peak_price, pos.current_price, pos.remaining_portion_pct);
+                match pos.chain {
+                    Chain::Solana => {
+                        if let Err(error) = sol_exec_pos
+                            .execute_shadow_sell(&pos.id, "PEAK_DRAWDOWN_GUARD_EXIT", live_price)
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=PEAK_DRAWDOWN_GUARD_EXIT error={error}", pos.id);
+                        }
+                    }
+                    _ => {
+                        if let Err(error) = evm_exec_pos
+                            .execute_shadow_sell(&pos.id, "PEAK_DRAWDOWN_GUARD_EXIT", live_price)
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=PEAK_DRAWDOWN_GUARD_EXIT error={error}", pos.id);
+                        }
+                    }
+                }
+            }
+
+            // 4. Profit-Lock Floor on Moonbag (locked once profit reaches the configured floor)
+            // STRICT SAFETY: Must have reached at least configured pump multiplier initially and current PnL must be positive (>= profit_lock_min_current_pnl_pct)
+            if pos.status == "PARTIAL_EXIT"
+                && pos.peak_price >= pos.entry_price * config_pos.runner_min_pump_mult
+                && pos.unrealized_pnl_pct <= config_pos.profit_lock_floor_pct
+                && pos.unrealized_pnl_pct >= config_pos.profit_lock_min_current_pnl_pct
+                && pos.remaining_portion_pct <= (remaining_after_tp1 + 5.0)
+            {
+                println!("[PROFIT-LOCK FLOOR 🛡️] Position {} ({}) moonbag dropped to +{:.1}% (<= +{:.0}%)! Closing remaining portion to guarantee green trade!",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.profit_lock_floor_pct);
+                match pos.chain {
+                    Chain::Solana => {
+                        if let Err(error) = sol_exec_pos
+                            .execute_shadow_sell(&pos.id, "PROFIT_LOCK_FLOOR_EXIT", live_price)
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=PROFIT_LOCK_FLOOR_EXIT error={error}", pos.id);
+                        }
+                    }
+                    _ => {
+                        if let Err(error) = evm_exec_pos
+                            .execute_shadow_sell(&pos.id, "PROFIT_LOCK_FLOOR_EXIT", live_price)
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=PROFIT_LOCK_FLOOR_EXIT error={error}", pos.id);
+                        }
+                    }
+                }
+            }
+
+            // 5. Pre-TP Conditional Trailing Stop Guard (Capital Preservation)
+            // Activates when peak gain reaches trailing_stop_trigger_pct (e.g. +35%),
+            // and dumps 100% if current price drops >= trailing_stop_pct (e.g. 15%) from peak.
+            let peak_gain_pct = if pos.entry_price > 0.0 {
+                ((pos.peak_price - pos.entry_price) / pos.entry_price) * 100.0
+            } else {
+                0.0
+            };
+
+            if (pos.status == "OPEN" || pos.remaining_portion_pct >= 90.0)
+                && peak_gain_pct >= config_pos.trailing_stop_trigger_pct
+                && pos.status != "CLOSED"
+            {
+                let trailing_drop_threshold = 1.0 - (config_pos.trailing_stop_pct / 100.0);
+                let trailing_exit_price = pos.peak_price * trailing_drop_threshold;
+
+                if pos.current_price <= trailing_exit_price {
+                    println!(
+                                        "[TRAILING STOP GUARD 🛡️] Position {} ({}) peak was +{:.1}% (${:.6}), dropped >{:.0}% from peak to ${:.6} (<= ${:.6})! Dumping 100% to lock profit!",
+                                        pos.id, pos.token_symbol, peak_gain_pct, pos.peak_price, config_pos.trailing_stop_pct, pos.current_price, trailing_exit_price
+                                    );
+                    match pos.chain {
+                        Chain::Solana => {
+                            if let Err(error) = sol_exec_pos
+                                .execute_shadow_sell(&pos.id, "TRAILING_STOP_EXIT", live_price)
+                                .await
+                            {
+                                eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=TRAILING_STOP_EXIT error={error}", pos.id);
+                            }
+                        }
+                        _ => {
+                            if let Err(error) = evm_exec_pos
+                                .execute_shadow_sell(&pos.id, "TRAILING_STOP_EXIT", live_price)
+                                .await
+                            {
+                                eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=TRAILING_STOP_EXIT error={error}", pos.id);
+                            }
+                        }
+                    }
+                    return pos;
+                }
+            }
+
+            // 6. Emergency Hard Stop Loss Cut-Loss (Disaster Protection Floor)
+            let hard_sl_trigger = pos.unrealized_pnl_pct <= -config_pos.stop_loss_pct;
+            if hard_sl_trigger && pos.status != "CLOSED" {
+                println!(
+                                    "[SL CONFIRMATION ⏳] Position {} ({}) hit {:.1}% <= -{:.1}%. Awaiting 1200ms debounce to filter flash wicks...",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct
+                                );
+                sleep(Duration::from_millis(1200)).await;
+
+                if pos.chain == Chain::Solana {
+                    // Solana exit oracle ground truth: Jupiter realizable exit quote (NO DEXSCREENER VETO!)
+                    // Hanya harga terbukti (saldo riil + decimals + harga SOL) yang boleh membatalkan SL.
+                    match fresh_realizable_price(&pos, &sol_exec_pos).await {
+                        Ok(fresh_p) => {
+                            if pos.entry_price > 0.0 {
+                                let fresh_pnl =
+                                    ((fresh_p - pos.entry_price) / pos.entry_price) * 100.0;
+                                pos.current_price = fresh_p;
+                                pos.unrealized_pnl_pct = fresh_pnl;
+                                pos.price_source = "JUPITER".to_string();
+                                pos.price_updated_at = Utc::now();
+                                let _ = db_pos_tracker.upsert_position(&pos);
+
+                                if fresh_pnl > -config_pos.stop_loss_pct {
+                                    println!(
+                                                        "[SL FLASH-WICK REJECTED 🛡️] Position {} ({}) Jupiter realizable price recovered to ${:.6} ({:.1}% > -{:.1}%). Cut-loss cancelled!",
+                                                        pos.id, pos.token_symbol, fresh_p, fresh_pnl, config_pos.stop_loss_pct
+                                                    );
+                                    return pos;
+                                }
+                            }
+                        }
+                        Err(quote_err) => {
+                            // Saldo/decimals/harga SOL/quote tidak terbukti -> FAIL-CLOSED!
+                            // Dilarang membatalkan SL berdasarkan DexScreener!
+                            eprintln!(
+                                                "[SL RECHECK FAIL-CLOSED ⚠️] Token {} harga realizable fresh tidak terbukti ({quote_err}). Proceeding with EMERGENCY CUT-LOSS to protect capital!",
+                                                pos.token_symbol
+                                            );
+                        }
+                    }
+                } else {
+                    // For non-Solana (e.g. EVM)
+                    let recheck_price: Option<f64> = match pos.chain {
+                        Chain::Robinhood => None,
+                        _ => None,
+                    };
+                    if let Some(fresh_p) = recheck_price {
+                        if fresh_p > 0.0 && pos.entry_price > 0.0 {
+                            let fresh_pnl = ((fresh_p - pos.entry_price) / pos.entry_price) * 100.0;
+                            pos.current_price = fresh_p;
+                            pos.unrealized_pnl_pct = fresh_pnl;
+                            pos.price_updated_at = Utc::now();
+                            let _ = db_pos_tracker.upsert_position(&pos);
+                            if fresh_pnl > -config_pos.stop_loss_pct {
+                                return pos;
+                            }
+                        }
+                    }
+                }
+
+                println!("[EMERGENCY SL CUT-LOSS 🛑] Position {} ({}) confirmed breach at {:.1}% <= -{:.1}%! Force closing immediately to protect capital!",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.stop_loss_pct);
+                match pos.chain {
+                    Chain::Solana => {
+                        if let Err(error) = sol_exec_pos
+                            .execute_shadow_sell(
+                                &pos.id,
+                                "EMERGENCY_HARD_SL_CUTLOSS",
+                                pos.current_price,
+                            )
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=EMERGENCY_HARD_SL_CUTLOSS error={error}", pos.id);
+                        }
+                    }
+                    _ => {
+                        if let Err(error) = evm_exec_pos
+                            .execute_shadow_sell(
+                                &pos.id,
+                                "EMERGENCY_HARD_SL_CUTLOSS",
+                                pos.current_price,
+                            )
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=EMERGENCY_HARD_SL_CUTLOSS error={error}", pos.id);
+                        }
+                    }
+                }
+                return pos;
+            }
+        } else {
+            // =========================================================================
+            // MODE B: PURE BOT AUTONOMOUS EXIT (Mode FALSE — All-or-Nothing / Clean Scalp)
+            // =========================================================================
+
+            // 1. Bot Trailing Stop Guard (Capital Preservation)
+            let peak_gain_pct = if pos.entry_price > 0.0 {
+                ((pos.peak_price - pos.entry_price) / pos.entry_price) * 100.0
+            } else {
+                0.0
+            };
+
+            if pos.status != "CLOSED" && peak_gain_pct >= config_pos.bot_trailing_stop_trigger_pct {
+                let trailing_drop_threshold = 1.0 - (config_pos.bot_trailing_stop_pct / 100.0);
+                let trailing_exit_price = pos.peak_price * trailing_drop_threshold;
+
+                if pos.current_price <= trailing_exit_price {
+                    println!(
+                                        "[BOT TRAILING STOP 🛡️] Position {} ({}) peak was +{:.1}% (${:.6}), dropped >{:.0}% from peak to ${:.6} (<= ${:.6})! Dumping 100% to lock profit!",
+                                        pos.id, pos.token_symbol, peak_gain_pct, pos.peak_price, config_pos.bot_trailing_stop_pct, pos.current_price, trailing_exit_price
+                                    );
+                    match pos.chain {
+                        Chain::Solana => {
+                            if let Err(error) = sol_exec_pos
+                                .execute_shadow_sell(&pos.id, "BOT_TRAILING_STOP_EXIT", live_price)
+                                .await
+                            {
+                                eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=BOT_TRAILING_STOP_EXIT error={error}", pos.id);
+                            }
+                        }
+                        _ => {
+                            if let Err(error) = evm_exec_pos
+                                .execute_shadow_sell(&pos.id, "BOT_TRAILING_STOP_EXIT", live_price)
+                                .await
+                            {
+                                eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=BOT_TRAILING_STOP_EXIT error={error}", pos.id);
+                            }
+                        }
+                    }
+                    return pos;
+                }
+            }
+
+            // 2. Bot Full Take Profit (100% dump, no partials)
+            if pos.status != "CLOSED" && pos.unrealized_pnl_pct >= config_pos.bot_take_profit_pct {
+                println!(
+                                    "[BOT AUTO-TP 🎯] Position {} ({}) hit +{:.1}% >= +{:.0}%! Selling 100% full position!",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.bot_take_profit_pct
+                                );
+                match pos.chain {
+                    Chain::Solana => {
+                        if let Err(error) = sol_exec_pos
+                            .execute_shadow_sell(&pos.id, "BOT_FULL_TP_EXIT", live_price)
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=BOT_FULL_TP_EXIT error={error}", pos.id);
+                        }
+                    }
+                    _ => {
+                        if let Err(error) = evm_exec_pos
+                            .execute_shadow_sell(&pos.id, "BOT_FULL_TP_EXIT", live_price)
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=BOT_FULL_TP_EXIT error={error}", pos.id);
+                        }
+                    }
+                }
+                return pos;
+            }
+
+            // 3. Bot Full Hard Stop Loss (100% cut loss)
+            if pos.status != "CLOSED" && pos.unrealized_pnl_pct <= -config_pos.bot_stop_loss_pct {
+                println!(
+                                    "[SL CONFIRMATION ⏳] Position {} ({}) hit {:.1}% <= -{:.1}%. Awaiting 1200ms debounce to filter flash wicks...",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.bot_stop_loss_pct
+                                );
+                sleep(Duration::from_millis(1200)).await;
+
+                // Re-verify with fresh Jupiter realizable quote for Solana (bypass DexScreener to prevent stale veto)
+                if pos.chain == Chain::Solana {
+                    // Hanya harga terbukti (saldo riil + decimals + harga SOL) yang boleh membatalkan SL.
+                    match fresh_realizable_price(&pos, &sol_exec_pos).await {
+                        Ok(fresh_p) => {
+                            if pos.entry_price > 0.0 {
+                                let fresh_pnl =
+                                    ((fresh_p - pos.entry_price) / pos.entry_price) * 100.0;
+                                pos.current_price = fresh_p;
+                                pos.price_source = "JUPITER".to_string();
+                                pos.price_updated_at = Utc::now();
+                                pos.unrealized_pnl_pct = fresh_pnl;
+                                let _ = db_pos_tracker.upsert_position(&pos);
+
+                                if fresh_pnl > -config_pos.bot_stop_loss_pct {
+                                    println!(
+                                                        "[SL RECHECK RECOVERED 🛡️] Position {} ({}) Jupiter realizable price recovered to ${:.6} ({:.1}% > -{:.1}%). Cut-loss cancelled!",
+                                                        pos.id, pos.token_symbol, fresh_p, fresh_pnl, config_pos.bot_stop_loss_pct
+                                                    );
+                                    return pos;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            // Fail-closed: Jika gagal mendapatkan fresh quote Jupiter saat SL terpicu,
+                            // eksekusi tetap dilanjutkan untuk melindungi modal (fail-closed exit).
+                            eprintln!(
+                                                "[SL RECHECK FAIL-CLOSED ⚠️] Harga realizable fresh tidak terbukti untuk {} ({err}). Tetap lanjut cut-loss demi proteksi modal!",
+                                                pos.token_symbol
+                                            );
+                        }
+                    }
+                }
+
+                println!(
+                                    "[BOT EMERGENCY SL 🛑] Position {} ({}) confirmed breach at {:.1}% <= -{:.1}%! Force closing 100% immediately!",
+                                    pos.id, pos.token_symbol, pos.unrealized_pnl_pct, config_pos.bot_stop_loss_pct
+                                );
+                match pos.chain {
+                    Chain::Solana => {
+                        if let Err(error) = sol_exec_pos
+                            .execute_shadow_sell(&pos.id, "BOT_HARD_SL_CUTLOSS", pos.current_price)
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] Solana pos={} reason=BOT_HARD_SL_CUTLOSS error={error}", pos.id);
+                        }
+                    }
+                    _ => {
+                        if let Err(error) = evm_exec_pos
+                            .execute_shadow_sell(&pos.id, "BOT_HARD_SL_CUTLOSS", pos.current_price)
+                            .await
+                        {
+                            eprintln!("[EXIT EXECUTION ERROR] EVM pos={} reason=BOT_HARD_SL_CUTLOSS error={error}", pos.id);
+                        }
+                    }
+                }
+                return pos;
+            }
+        }
+    }
+
+    pos
+}
+
+#[cfg(test)]
+mod position_price_tests {
+    use super::select_position_price;
+
+    #[test]
+    fn dexscreener_failure_falls_back_to_jupiter_and_never_blind() {
+        // DexScreener gagal: Jupiter tetap dipakai (posisi tidak buta).
+        assert_eq!(select_position_price(None, Some(0.5)), Some((0.5, "JUPITER")));
+        // Keduanya ada: harga terendah (konservatif) menang.
+        assert_eq!(select_position_price(Some(1.0), Some(0.4)), Some((0.4, "JUPITER")));
+        assert_eq!(select_position_price(Some(1.0), Some(1.2)), Some((1.0, "DEXSCREENER")));
+        // Jupiter gagal: DexScreener tetap dipakai.
+        assert_eq!(select_position_price(Some(1.0), None), Some((1.0, "DEXSCREENER")));
+        // Keduanya gagal: STALE, tanpa harga karangan.
+        assert_eq!(select_position_price(None, None), None);
+    }
 }

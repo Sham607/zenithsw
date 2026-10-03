@@ -59,6 +59,11 @@ pub fn apply_ipc_message(app: &mut App, msg: IpcMessage, config: &Config) {
             polled_wallets_count,
             global_scanned_wallets_count,
             candidate_wallets_count,
+            ws_subscribed_wallets,
+            ws_expected_wallets,
+            stale_positions_count,
+            trading_paused,
+            wallet_pubkey_mismatch,
             tracked_wallets_count: _,
             active_positions_count: _,
         } => {
@@ -95,6 +100,11 @@ pub fn apply_ipc_message(app: &mut App, msg: IpcMessage, config: &Config) {
             app.polled_wallets_count = polled_wallets_count;
             app.global_scanned_wallets_count = global_scanned_wallets_count;
             app.candidate_wallets_count = candidate_wallets_count;
+            app.ws_subscribed_wallets = ws_subscribed_wallets;
+            app.ws_expected_wallets = ws_expected_wallets;
+            app.stale_positions_count = stale_positions_count;
+            app.trading_paused = trading_paused;
+            app.wallet_pubkey_mismatch = wallet_pubkey_mismatch;
         }
         IpcMessage::WalletSync { mut wallets } => {
             wallets.retain(|wallet| chain_enabled(wallet.chain, config));
@@ -116,6 +126,7 @@ pub fn apply_ipc_message(app: &mut App, msg: IpcMessage, config: &Config) {
         IpcMessage::ActivityBroadcast { activity } => {
             if chain_enabled(activity.chain, config) {
                 app.activities.insert(0, activity);
+                app.activities.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                 if app.activities.len() > 100 {
                     app.activities.pop();
                 }
@@ -123,11 +134,13 @@ pub fn apply_ipc_message(app: &mut App, msg: IpcMessage, config: &Config) {
         }
         IpcMessage::ActivitySync { mut activities } => {
             activities.retain(|activity| chain_enabled(activity.chain, config));
+            activities.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
             app.activities = activities;
         }
         IpcMessage::SignalBroadcast { signal } => {
             if chain_enabled(signal.chain, config) {
                 app.signals.insert(0, signal);
+                app.signals.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                 if app.signals.len() > 100 {
                     app.signals.pop();
                 }
@@ -135,6 +148,7 @@ pub fn apply_ipc_message(app: &mut App, msg: IpcMessage, config: &Config) {
         }
         IpcMessage::SignalSync { mut signals } => {
             signals.retain(|signal| chain_enabled(signal.chain, config));
+            signals.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
             app.signals = signals;
         }
         IpcMessage::PositionUpdate { mut positions } => {

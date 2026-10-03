@@ -28,7 +28,7 @@ pub enum IpcMessage {
         #[serde(default)]
         wallet_equity_usd: f64,
         #[serde(default)]
-        total_realized_pnl_usd: f64,
+        total_realized_pnl_usd: Option<f64>,
         #[serde(default)]
         min_liquidity_usd: f64,
         #[serde(default)]
@@ -73,6 +73,16 @@ pub enum IpcMessage {
         global_scanned_wallets_count: usize,
         #[serde(default)]
         candidate_wallets_count: usize,
+        #[serde(default)]
+        ws_subscribed_wallets: usize,
+        #[serde(default)]
+        ws_expected_wallets: usize,
+        #[serde(default)]
+        stale_positions_count: usize,
+        #[serde(default)]
+        trading_paused: bool,
+        #[serde(default)]
+        wallet_pubkey_mismatch: bool,
     },
     WalletSync {
         wallets: Vec<SmartWallet>,

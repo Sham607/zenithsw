@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -98,12 +98,67 @@ fn get_price_cache() -> &'static PriceCache {
     PRICE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Ring-buffer deduplicator untuk signature transaksi Solana dengan retensi FIFO.
+/// Menghindari drop acak pada HashSet konvensional dan mencegah replay transaksi lama.
+#[derive(Debug)]
+pub struct SignatureDeduper {
+    set: HashSet<String>,
+    queue: VecDeque<String>,
+    capacity: usize,
+}
+
+impl SignatureDeduper {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            set: HashSet::with_capacity(capacity),
+            queue: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Mengembalikan true jika signature sudah pernah tercatat (duplikat).
+    /// Jika belum ada, menyimpannya dan mengembalikan false.
+    pub fn check_and_insert(&mut self, sig: &str) -> bool {
+        if self.set.contains(sig) {
+            return true;
+        }
+        if self.queue.len() >= self.capacity {
+            if let Some(oldest) = self.queue.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        self.set.insert(sig.to_string());
+        self.queue.push_back(sig.to_string());
+        false
+    }
+
+    pub fn contains(&self, sig: &str) -> bool {
+        self.set.contains(sig)
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+impl Default for SignatureDeduper {
+    fn default() -> Self {
+        Self::new(10_000)
+    }
+}
+
 pub struct SolanaStreamListener {
     rpc_urls: Vec<String>,
     execution_rpc_url: Option<String>,
     current_rpc_idx: AtomicUsize,
     last_signatures: Arc<Mutex<HashMap<String, String>>>,
-    processed_signatures: Arc<Mutex<HashSet<String>>>,
+    processed_signatures: Arc<Mutex<SignatureDeduper>>,
+    ws_subscribed_wallets: Arc<AtomicUsize>,
+    ws_expected_wallets: Arc<AtomicUsize>,
     client: Client,
 }
 
@@ -128,13 +183,22 @@ impl SolanaStreamListener {
             execution_rpc_url,
             current_rpc_idx: AtomicUsize::new(0),
             last_signatures: Arc::new(Mutex::new(HashMap::new())),
-            processed_signatures: Arc::new(Mutex::new(HashSet::new())),
+            processed_signatures: Arc::new(Mutex::new(SignatureDeduper::new(10_000))),
+            ws_subscribed_wallets: Arc::new(AtomicUsize::new(0)),
+            ws_expected_wallets: Arc::new(AtomicUsize::new(0)),
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .user_agent("ZenithSW/1.0")
                 .build()
                 .unwrap_or_default(),
         }
+    }
+
+    pub fn ws_subscription_status(&self) -> (usize, usize) {
+        (
+            self.ws_subscribed_wallets.load(Ordering::Relaxed),
+            self.ws_expected_wallets.load(Ordering::Relaxed),
+        )
     }
 
     fn next_rpc_index(&self) -> usize {
@@ -148,8 +212,133 @@ impl SolanaStreamListener {
         address: &str,
         db: Arc<SmartWalletDb>,
     ) -> Result<Option<WalletActivity>> {
-        self.check_transaction_for_signature(handle, address, None, db)
-            .await
+        if self.rpc_urls.is_empty() {
+            return Ok(None);
+        }
+
+        // Bounded polling without gaps: ambil hingga 10 signature terbaru (bukan limit: 1)
+        let sig_payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [address, { "limit": 10 }]
+        });
+        let mut sig_items = None;
+        let start_idx = self.next_rpc_index();
+        for offset in 0..self.rpc_urls.len() {
+            let rpc = &self.rpc_urls[(start_idx + offset) % self.rpc_urls.len()];
+            match self.client.post(rpc).json(&sig_payload).send().await {
+                Ok(res) if res.status().is_success() => {
+                    if let Ok(sig_json) = res.json::<Value>().await {
+                        if let Some(arr) = sig_json["result"].as_array() {
+                            sig_items = Some(arr.clone());
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(arr) = sig_items.filter(|arr| !arr.is_empty()) else {
+            return Ok(None);
+        };
+
+        let newest_sig = match arr.first().and_then(|item| item["signature"].as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return Ok(None),
+        };
+
+        let known_latest = {
+            let map = self.last_signatures.lock().unwrap();
+            map.get(address).cloned()
+        };
+
+        // Kasus 1: Signature teratas sama persis dengan watermark -> Tidak ada transaksi baru di on-chain
+        if let Some(ref known) = known_latest {
+            if known == &newest_sig {
+                return Ok(None);
+            }
+        } else {
+            // Kasus 2: Startup baseline registration untuk wallet ini.
+            // Pasang watermark ke signature teratas dan masukkan seluruh signature saat ini ke dedup filter
+            // agar riwayat transaksi lama sebelum engine start tidak pernah di-replay.
+            {
+                let mut map = self.last_signatures.lock().unwrap();
+                map.insert(address.to_string(), newest_sig);
+            }
+            {
+                let mut dedup = self.processed_signatures.lock().unwrap();
+                for item in arr.iter() {
+                    if let Some(s) = item["signature"].as_str() {
+                        dedup.check_and_insert(s);
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
+        // Kasus 3: Terdeteksi ada transaksi baru!
+        // Ambil hanya signature baru yang berada di atas watermark known_latest
+        let new_items: Vec<&Value> = if let Some(ref known) = known_latest {
+            if let Some(idx) = arr
+                .iter()
+                .position(|item| item["signature"].as_str() == Some(known.as_str()))
+            {
+                arr[..idx].iter().collect()
+            } else {
+                // Jika known_latest tidak ditemukan (burst transaksi > 10), proses seluruh batch
+                arr.iter().collect()
+            }
+        } else {
+            arr.iter().collect()
+        };
+
+        let now_ts = Utc::now().timestamp();
+        let mut detected_activity = None;
+
+        // Iterasi dari yang terlama ke yang terbaru di antara batch baru
+        for item in new_items.into_iter().rev() {
+            let sig = item["signature"].as_str().unwrap_or("");
+            let block_time = item["blockTime"].as_i64().unwrap_or(0);
+            if sig.is_empty() {
+                continue;
+            }
+
+            // Guard usia transaksi: Transaksi polling > 90 detik diabaikan
+            if block_time > 0 {
+                let age = (now_ts - block_time).max(0);
+                if age > 90 {
+                    let mut dedup = self.processed_signatures.lock().unwrap();
+                    dedup.check_and_insert(sig);
+                    continue;
+                }
+            }
+
+            // Dedup check
+            let already_seen = {
+                let mut dedup = self.processed_signatures.lock().unwrap();
+                dedup.check_and_insert(sig)
+            };
+            if already_seen {
+                continue;
+            }
+
+            if let Ok(Some(act)) = self
+                .check_transaction_for_signature(handle, address, Some(sig), block_time, db.clone())
+                .await
+            {
+                detected_activity = Some(act);
+                break;
+            }
+        }
+
+        // Simpan signature terbaru mutlak sebagai watermark tanpa syarat
+        {
+            let mut last_map = self.last_signatures.lock().unwrap();
+            last_map.insert(address.to_string(), newest_sig);
+        }
+
+        Ok(detected_activity)
     }
 
     async fn check_transaction_for_signature(
@@ -157,46 +346,16 @@ impl SolanaStreamListener {
         handle: &str,
         address: &str,
         notified_signature: Option<&str>,
+        block_time: i64,
         db: Arc<SmartWalletDb>,
     ) -> Result<Option<WalletActivity>> {
         if self.rpc_urls.is_empty() {
             return Ok(None);
         }
 
-        // 1. Event WebSocket memberi signature langsung; polling mengambil signature terbaru.
-        let (signature, block_time) = if let Some(notified) = notified_signature {
-            (notified.to_string(), 0i64)
-        } else {
-            let sig_payload = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getSignaturesForAddress",
-                "params": [address, { "limit": 1 }]
-            });
-            let mut sig_items = None;
-            let start_idx = self.next_rpc_index();
-            for offset in 0..self.rpc_urls.len() {
-                let rpc = &self.rpc_urls[(start_idx + offset) % self.rpc_urls.len()];
-                match self.client.post(rpc).json(&sig_payload).send().await {
-                    Ok(res) if res.status().is_success() => {
-                        if let Ok(sig_json) = res.json::<Value>().await {
-                            if let Some(arr) = sig_json["result"].as_array() {
-                                sig_items = Some(arr.clone());
-                                break;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let Some(arr) = sig_items.filter(|arr| !arr.is_empty()) else {
-                return Ok(None);
-            };
-            let item = &arr[0];
-            (
-                item["signature"].as_str().unwrap_or("").to_string(),
-                item["blockTime"].as_i64().unwrap_or(0),
-            )
+        let signature = match notified_signature {
+            Some(sig) => sig.to_string(),
+            None => return Ok(None),
         };
         if signature.is_empty() {
             return Ok(None);
@@ -209,34 +368,16 @@ impl SolanaStreamListener {
             0
         };
 
-        // Deduplication & Signature diff check
-        {
-            let mut last_map = self.last_signatures.lock().unwrap();
-            if let Some(last_sig) = last_map.get(address) {
-                if last_sig == &signature {
-                    return Ok(None); // No new transaction, skip
-                }
-            } else {
-                // First time baseline registration on startup
-                last_map.insert(address.to_string(), signature.to_string());
-                if tx_age_secs > 120 {
-                    return Ok(None);
-                }
-            }
-            last_map.insert(address.to_string(), signature.to_string());
+        // Guard usia awal (jika block_time disertakan caller)
+        if block_time > 0 && tx_age_secs > 90 {
+            return Ok(None);
         }
 
+        // Deduplication & Seen check via ring buffer
         {
             let mut processed = self.processed_signatures.lock().unwrap();
-            if processed.contains(&signature) {
+            if processed.check_and_insert(&signature) {
                 return Ok(None);
-            }
-            processed.insert(signature.to_string());
-            if processed.len() > 1000 {
-                let to_remove: Vec<String> = processed.iter().take(200).cloned().collect();
-                for r in to_remove {
-                    processed.remove(&r);
-                }
             }
         }
 
@@ -291,6 +432,14 @@ impl SolanaStreamListener {
             Some(res) => res,
             None => return Ok(None),
         };
+
+        // Guard usia on-chain riil: tolak jika transaksi lebih tua dari 90 detik
+        if let Some(chain_block_time) = tx_result["blockTime"].as_i64() {
+            let actual_age = (now.timestamp() - chain_block_time).max(0);
+            if actual_age > 90 {
+                return Ok(None);
+            }
+        }
 
         let meta = &tx_result["meta"];
         if meta.is_null() {
@@ -402,20 +551,42 @@ impl SolanaStreamListener {
         let mut onchain_price_usd = 0.0;
         let mut onchain_amount_usd = 0.0;
 
-        if token_amount > 0.0 && (activity_type == ActivityType::Buy || activity_type == ActivityType::Sell) {
+        if token_amount > 0.0
+            && (activity_type == ActivityType::Buy || activity_type == ActivityType::Sell)
+        {
             let sol_flow = if activity_type == ActivityType::Buy {
-                if trade_delta_sol < -0.0005 { trade_delta_sol.abs() } else { 0.0 }
+                if trade_delta_sol < -0.0005 {
+                    trade_delta_sol.abs()
+                } else {
+                    0.0
+                }
             } else {
-                if trade_delta_sol > 0.0005 { trade_delta_sol } else { 0.0 }
+                if trade_delta_sol > 0.0005 {
+                    trade_delta_sol
+                } else {
+                    0.0
+                }
             };
             let stables_flow = if activity_type == ActivityType::Buy {
-                if trade_delta_stables_usd < -0.01 { trade_delta_stables_usd.abs() } else { 0.0 }
+                if trade_delta_stables_usd < -0.01 {
+                    trade_delta_stables_usd.abs()
+                } else {
+                    0.0
+                }
             } else {
-                if trade_delta_stables_usd > 0.01 { trade_delta_stables_usd } else { 0.0 }
+                if trade_delta_stables_usd > 0.01 {
+                    trade_delta_stables_usd
+                } else {
+                    0.0
+                }
             };
 
-            let sol_price = Self::get_cached_sol_price_usd().await;
-            let total_net_usd = (sol_flow * sol_price) + stables_flow;
+            // Tanpa harga SOL terverifikasi, harga eksekusi on-chain tidak dihitung (tetap 0).
+            let total_net_usd = match Self::get_cached_sol_price_usd().await {
+                Some(sol_price) => (sol_flow * sol_price) + stables_flow,
+                None if sol_flow > 0.0 => 0.0,
+                None => stables_flow,
+            };
             if total_net_usd > 0.0 {
                 onchain_amount_usd = total_net_usd;
                 onchain_price_usd = total_net_usd / token_amount;
@@ -431,13 +602,14 @@ impl SolanaStreamListener {
         }
 
         // Gunakan harga eksekusi swap on-chain aktual jika tersedia; fallback ke DexScreener jika bukan swap SOL/stables
-        let (execution_price_usd, amount_usd) = if onchain_price_usd > 0.0 && onchain_price_usd.is_finite() {
-            (onchain_price_usd, onchain_amount_usd)
-        } else if dex_market_price > 0.0 {
-            (dex_market_price, token_amount * dex_market_price)
-        } else {
-            (0.0, 0.0)
-        };
+        let (execution_price_usd, amount_usd) =
+            if onchain_price_usd > 0.0 && onchain_price_usd.is_finite() {
+                (onchain_price_usd, onchain_amount_usd)
+            } else if dex_market_price > 0.0 {
+                (dex_market_price, token_amount * dex_market_price)
+            } else {
+                (0.0, 0.0)
+            };
 
         let tx_time = if block_time > 0 {
             DateTime::from_timestamp(block_time, 0)
@@ -522,6 +694,9 @@ impl SolanaStreamListener {
             .await
             .map_err(|error| anyhow::anyhow!("Solana WebSocket connect gagal: {error}"))?
             .0;
+        self.ws_expected_wallets
+            .store(wallets.len(), Ordering::Relaxed);
+        self.ws_subscribed_wallets.store(0, Ordering::Relaxed);
         let mut request_id = 1u64;
         let mut subscriptions = HashMap::new();
         for wallet in wallets {
@@ -541,8 +716,10 @@ impl SolanaStreamListener {
         }
         let mut subscription_to_wallet = HashMap::new();
         while let Some(frame) = socket.next().await {
-            let frame =
-                frame.map_err(|error| anyhow::anyhow!("Solana WebSocket read gagal: {error}"))?;
+            let frame = frame.map_err(|error| {
+                self.ws_subscribed_wallets.store(0, Ordering::Relaxed);
+                anyhow::anyhow!("Solana WebSocket read gagal: {error}")
+            })?;
             let Message::Text(text) = frame else { continue };
             let value: Value = match serde_json::from_str(&text) {
                 Ok(value) => value,
@@ -554,6 +731,19 @@ impl SolanaStreamListener {
             ) {
                 if let Some(wallet) = subscriptions.remove(&request) {
                     subscription_to_wallet.insert(subscription, wallet);
+                    self.ws_subscribed_wallets
+                        .store(subscription_to_wallet.len(), Ordering::Relaxed);
+                }
+                continue;
+            }
+            if let Some(err) = value.get("error") {
+                if let Some(request) = value.get("id").and_then(Value::as_u64) {
+                    if let Some(wallet) = subscriptions.remove(&request) {
+                        eprintln!(
+                            "[SOLANA WS SUBSCRIBE ERROR ⚠️] wallet={} subscribe failed: {}",
+                            wallet.address, err
+                        );
+                    }
                 }
                 continue;
             }
@@ -583,6 +773,7 @@ impl SolanaStreamListener {
                     &resolved_handle,
                     &wallet.address,
                     Some(&signature),
+                    0,
                     db.clone(),
                 )
                 .await
@@ -596,15 +787,15 @@ impl SolanaStreamListener {
         anyhow::bail!("Solana WebSocket disconnected")
     }
 
-    /// Mengambil estimasi harga SOL dari Jupiter Swap Quote API (1 WSOL -> USDC) dengan cache 30 detik
-    pub async fn get_cached_sol_price_usd() -> f64 {
-        let cache = SOL_PRICE_CACHE.get_or_init(|| {
-            RwLock::new((0.0, Instant::now() - Duration::from_secs(120)))
-        });
+    /// Mengambil estimasi harga SOL dari Jupiter Swap Quote API (1 WSOL -> USDC) dengan cache 30 detik.
+    /// `None` bila belum pernah ada harga terverifikasi; tidak ada nilai default statis.
+    pub async fn get_cached_sol_price_usd() -> Option<f64> {
+        let cache = SOL_PRICE_CACHE
+            .get_or_init(|| RwLock::new((0.0, Instant::now() - Duration::from_secs(120))));
 
         if let Ok(guard) = cache.read() {
             if guard.0 > 0.0 && guard.1.elapsed() < Duration::from_secs(30) {
-                return guard.0;
+                return Some(guard.0);
             }
         }
 
@@ -623,7 +814,7 @@ impl SolanaStreamListener {
                                 if let Ok(mut guard) = cache.write() {
                                     *guard = (price, Instant::now());
                                 }
-                                return price;
+                                return Some(price);
                             }
                         }
                     }
@@ -634,11 +825,12 @@ impl SolanaStreamListener {
         // Fallback: check cache read even if older
         if let Ok(guard) = cache.read() {
             if guard.0 > 0.0 {
-                return guard.0;
+                return Some(guard.0);
             }
         }
 
-        120.0
+        // Belum pernah ada harga terverifikasi: tidak ada nilai karangan.
+        None
     }
 
     /// Seleksi pool terbaik dari respon JSON DexScreener:
@@ -648,6 +840,14 @@ impl SolanaStreamListener {
     pub fn select_best_pair_from_dex_json(
         pairs: &[Value],
         mint: &str,
+    ) -> Option<(String, f64, f64, f64)> {
+        Self::select_best_pair_from_dex_json_with_min_age(pairs, mint, 0)
+    }
+
+    pub fn select_best_pair_from_dex_json_with_min_age(
+        pairs: &[Value],
+        mint: &str,
+        min_pool_age_secs: u64,
     ) -> Option<(String, f64, f64, f64)> {
         let matching_pairs: Vec<&Value> = pairs
             .iter()
@@ -679,8 +879,22 @@ impl SolanaStreamListener {
         let mut best_symbol = "TOKEN".to_string();
         let mut best_price = 0.0;
         let mut best_mcap = 0.0;
+        let now_ms = Utc::now().timestamp_millis() as u64;
 
         for pair in matching_pairs {
+            if min_pool_age_secs > 0 {
+                if let Some(created_ms) = pair.get("pairCreatedAt").and_then(Value::as_u64) {
+                    let age_secs = if now_ms > created_ms {
+                        (now_ms - created_ms) / 1000
+                    } else {
+                        0
+                    };
+                    if age_secs < min_pool_age_secs {
+                        continue;
+                    }
+                }
+            }
+
             let dex_id = pair.get("dexId").and_then(|s| s.as_str()).unwrap_or("");
             let sym = pair
                 .get("baseToken")
@@ -742,9 +956,8 @@ impl SolanaStreamListener {
             }
         }
 
-        let effective_liq = max_liq.max(total_liq);
         if best_price > 0.0 {
-            Some((best_symbol, best_price, effective_liq, best_mcap))
+            Some((best_symbol, best_price, total_liq, best_mcap))
         } else {
             None
         }
@@ -752,20 +965,28 @@ impl SolanaStreamListener {
 
     /// Fetches live price & aggregated liquidity with multi-pool scanning & in-memory TTL caching (DexScreener + Search Fallback)
     pub async fn fetch_token_price(mint: &str) -> Result<(String, f64, f64, f64)> {
-        Self::fetch_token_price_internal(mint, false).await
+        Self::fetch_token_price_internal(mint, false, 0).await
+    }
+
+    pub async fn fetch_token_price_with_min_age(
+        mint: &str,
+        min_pool_age_secs: u64,
+    ) -> Result<(String, f64, f64, f64)> {
+        Self::fetch_token_price_internal(mint, min_pool_age_secs > 0, min_pool_age_secs).await
     }
 
     /// Fetches live price bypassing in-memory cache to verify sudden price crashes / stop-loss ticks
     pub async fn fetch_token_price_fresh(mint: &str) -> Result<(String, f64, f64, f64)> {
-        Self::fetch_token_price_internal(mint, true).await
+        Self::fetch_token_price_internal(mint, true, 0).await
     }
 
     async fn fetch_token_price_internal(
         mint: &str,
         bypass_cache: bool,
+        min_pool_age_secs: u64,
     ) -> Result<(String, f64, f64, f64)> {
         // Step 1: Check in-memory price cache (TTL 3 seconds) unless bypass_cache is requested
-        if !bypass_cache {
+        if !bypass_cache && min_pool_age_secs == 0 {
             if let Ok(cache) = get_price_cache().read() {
                 if let Some((sym, price, liq, mcap, ts)) = cache.get(mint) {
                     if ts.elapsed() < Duration::from_secs(3) {
@@ -787,19 +1008,25 @@ impl SolanaStreamListener {
                 if let Ok(json) = res.json::<Value>().await {
                     if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
                         if let Some((best_sym, best_price, effective_liq, best_mcap)) =
-                            Self::select_best_pair_from_dex_json(pairs, mint)
+                            Self::select_best_pair_from_dex_json_with_min_age(
+                                pairs,
+                                mint,
+                                min_pool_age_secs,
+                            )
                         {
-                            if let Ok(mut cache) = get_price_cache().write() {
-                                cache.insert(
-                                    mint.to_string(),
-                                    (
-                                        best_sym.clone(),
-                                        best_price,
-                                        effective_liq,
-                                        best_mcap,
-                                        Instant::now(),
-                                    ),
-                                );
+                            if min_pool_age_secs == 0 {
+                                if let Ok(mut cache) = get_price_cache().write() {
+                                    cache.insert(
+                                        mint.to_string(),
+                                        (
+                                            best_sym.clone(),
+                                            best_price,
+                                            effective_liq,
+                                            best_mcap,
+                                            Instant::now(),
+                                        ),
+                                    );
+                                }
                             }
                             return Ok((best_sym, best_price, effective_liq, best_mcap));
                         }
@@ -815,19 +1042,25 @@ impl SolanaStreamListener {
                 if let Ok(json) = res.json::<Value>().await {
                     if let Some(pairs) = json.get("pairs").and_then(|v| v.as_array()) {
                         if let Some((best_sym, best_price, effective_liq, best_mcap)) =
-                            Self::select_best_pair_from_dex_json(pairs, mint)
+                            Self::select_best_pair_from_dex_json_with_min_age(
+                                pairs,
+                                mint,
+                                min_pool_age_secs,
+                            )
                         {
-                            if let Ok(mut cache) = get_price_cache().write() {
-                                cache.insert(
-                                    mint.to_string(),
-                                    (
-                                        best_sym.clone(),
-                                        best_price,
-                                        effective_liq,
-                                        best_mcap,
-                                        Instant::now(),
-                                    ),
-                                );
+                            if min_pool_age_secs == 0 {
+                                if let Ok(mut cache) = get_price_cache().write() {
+                                    cache.insert(
+                                        mint.to_string(),
+                                        (
+                                            best_sym.clone(),
+                                            best_price,
+                                            effective_liq,
+                                            best_mcap,
+                                            Instant::now(),
+                                        ),
+                                    );
+                                }
                             }
                             return Ok((best_sym, best_price, effective_liq, best_mcap));
                         }
@@ -1048,7 +1281,10 @@ mod tests {
         assert!(best.is_some());
         let (sym, price, liq, mcap) = best.unwrap();
         assert_eq!(sym, "SLOPCORE");
-        assert!((price - 0.00001549).abs() < 1e-8, "Must pick real pumpswap price, not dead pumpfun curve");
+        assert!(
+            (price - 0.00001549).abs() < 1e-8,
+            "Must pick real pumpswap price, not dead pumpfun curve"
+        );
         assert!(liq > 0.0);
         assert_eq!(mcap, 15490.0);
     }
@@ -1077,7 +1313,83 @@ mod tests {
         let (sym, price, liq, mcap) = best.unwrap();
         assert_eq!(sym, "FRESH");
         assert_eq!(price, 0.000005);
-        assert!(liq > 0.0 && liq <= 12_000.0, "Derived liquidity for bonding curve must be capped");
+        assert!(
+            liq > 0.0 && liq <= 12_000.0,
+            "Derived liquidity for bonding curve must be capped"
+        );
         assert_eq!(mcap, 5000.0);
+    }
+
+    #[test]
+    fn select_best_pair_respects_min_pool_age() {
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let young_created_ms = now_ms - 30_000; // 30 detik lalu
+        let _old_created_ms = now_ms - 300_000; // 300 detik lalu
+
+        let pairs = serde_json::json!([
+            {
+                "dexId": "raydium",
+                "baseToken": {
+                    "address": "PoolAgeMint11111111111111111111111111111111",
+                    "symbol": "AGE"
+                },
+                "priceUsd": "0.01",
+                "liquidity": { "usd": 50000.0 },
+                "marketCap": 100000.0,
+                "pairCreatedAt": young_created_ms
+            }
+        ]);
+
+        // Jika min_pool_age_secs adalah 60 (pool berusia 30 detik), harus ditolak
+        let result_young = SolanaStreamListener::select_best_pair_from_dex_json_with_min_age(
+            pairs.as_array().unwrap(),
+            "PoolAgeMint11111111111111111111111111111111",
+            60,
+        );
+        assert!(
+            result_young.is_none(),
+            "Pool yang lebih muda dari min_pool_age_secs wajib ditolak"
+        );
+
+        // Jika min_pool_age_secs adalah 10 (pool berusia 30 detik), harus diterima
+        let result_ok = SolanaStreamListener::select_best_pair_from_dex_json_with_min_age(
+            pairs.as_array().unwrap(),
+            "PoolAgeMint11111111111111111111111111111111",
+            10,
+        );
+        assert!(
+            result_ok.is_some(),
+            "Pool yang lebih tua dari min_pool_age_secs wajib diterima"
+        );
+    }
+
+    #[test]
+    fn signature_deduper_fifo_eviction_and_seen_detection() {
+        let mut dedup = super::SignatureDeduper::new(3);
+
+        // Insert sig1, sig2, sig3
+        assert!(!dedup.check_and_insert("sig1"));
+        assert!(!dedup.check_and_insert("sig2"));
+        assert!(!dedup.check_and_insert("sig3"));
+
+        // Duplicates are rejected
+        assert!(dedup.check_and_insert("sig1"));
+        assert!(dedup.check_and_insert("sig2"));
+        assert_eq!(dedup.len(), 3);
+
+        // Insert sig4 -> sig1 (oldest FIFO) should be evicted
+        assert!(!dedup.check_and_insert("sig4"));
+        assert_eq!(dedup.len(), 3);
+        assert!(!dedup.contains("sig1")); // sig1 has been evicted
+        assert!(dedup.contains("sig2"));
+        assert!(dedup.contains("sig3"));
+        assert!(dedup.contains("sig4"));
+
+        // Insert sig5 -> sig2 should be evicted
+        assert!(!dedup.check_and_insert("sig5"));
+        assert!(!dedup.contains("sig2")); // sig2 has been evicted
+        assert!(dedup.contains("sig3"));
+        assert!(dedup.contains("sig4"));
+        assert!(dedup.contains("sig5"));
     }
 }

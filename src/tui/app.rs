@@ -23,7 +23,7 @@ pub struct App {
     pub wallet_sol_balance: f64,
     pub sol_price_usd: f64,
     pub wallet_equity_usd: f64,
-    pub total_realized_pnl_usd: f64,
+    pub total_realized_pnl_usd: Option<f64>,
 
     // Live Synchronized Parameters (from Engine Config)
     pub min_liquidity_usd: f64,
@@ -51,6 +51,11 @@ pub struct App {
     pub polled_wallets_count: usize,
     pub global_scanned_wallets_count: usize,
     pub candidate_wallets_count: usize,
+    pub ws_subscribed_wallets: usize,
+    pub ws_expected_wallets: usize,
+    pub stale_positions_count: usize,
+    pub trading_paused: bool,
+    pub wallet_pubkey_mismatch: bool,
     pub radar_selected_index: usize,
     pub clipboard_notice: Option<(String, Instant)>,
 }
@@ -89,7 +94,7 @@ impl App {
             wallet_sol_balance: 0.0,
             sol_price_usd: 0.0,
             wallet_equity_usd: 0.0,
-            total_realized_pnl_usd: 0.0,
+            total_realized_pnl_usd: None,
             min_liquidity_usd: 0.0,
             max_price_delta_pct: 0.0,
             position_size_usd: 0.0,
@@ -115,6 +120,11 @@ impl App {
             polled_wallets_count: 0,
             global_scanned_wallets_count: 0,
             candidate_wallets_count: 0,
+            ws_subscribed_wallets: 0,
+            ws_expected_wallets: 0,
+            stale_positions_count: 0,
+            trading_paused: false,
+            wallet_pubkey_mismatch: false,
             radar_selected_index: 0,
             clipboard_notice: None,
         }

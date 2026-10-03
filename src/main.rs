@@ -197,6 +197,7 @@ async fn main() -> Result<()> {
                                 Chain::Base => enable_base,
                                 _ => false,
                             });
+                            acts.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                             state.activities = acts;
                         }
                         Err(error) => state.add_log(format!("TUI DB activities stale: {error}")),

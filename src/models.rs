@@ -338,6 +338,16 @@ pub struct ShadowPosition {
     pub status: String, // "OPEN" | "PARTIAL_EXIT" | "CLOSED"
     #[serde(default = "default_is_dry_run")]
     pub is_dry_run: bool,
+    #[serde(default)]
+    pub owner_pubkey: Option<String>,
+    #[serde(default = "default_price_source")]
+    pub price_source: String, // "JUPITER" | "DEXSCREENER" | "STALE"
+    #[serde(default = "chrono::Utc::now")]
+    pub price_updated_at: DateTime<Utc>,
+}
+
+pub fn default_price_source() -> String {
+    "DEXSCREENER".to_string()
 }
 
 pub fn default_is_dry_run() -> bool {

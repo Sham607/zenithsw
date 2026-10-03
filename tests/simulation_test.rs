@@ -112,6 +112,10 @@ fn get_mock_config() -> Config {
         wallet_db_path: ":memory:".to_string(),
         candidate_db_path: ":memory:".to_string(),
         ipc_socket_path: "/tmp/zenithsw_test.sock".to_string(),
+        stale_price_max_secs: 5,
+        min_pool_age_secs: 0,
+        exit_quote_ttl_ms: 2_000,
+        trading_paused: false,
     }
 }
 
@@ -1373,6 +1377,9 @@ async fn test_wallet_demotion_on_consecutive_losses() {
         last_update: now,
         status: "OPEN".to_string(),
         is_dry_run: true,
+        owner_pubkey: None,
+        price_source: "TEST".to_string(),
+        price_updated_at: now,
     };
     db.upsert_position(&pos1).unwrap();
     db.close_position("POS-1", "CUTLOSS", 0.9).unwrap();
@@ -1406,6 +1413,9 @@ async fn test_wallet_demotion_on_consecutive_losses() {
         last_update: now,
         status: "OPEN".to_string(),
         is_dry_run: true,
+        owner_pubkey: None,
+        price_source: "TEST".to_string(),
+        price_updated_at: now,
     };
     db.upsert_position(&pos2).unwrap();
     db.close_position("POS-2", "CUTLOSS", 1.7).unwrap();
@@ -1465,6 +1475,9 @@ async fn test_wallet_demotion_on_catastrophic_loss() {
         last_update: now,
         status: "OPEN".to_string(),
         is_dry_run: true,
+        owner_pubkey: None,
+        price_source: "TEST".to_string(),
+        price_updated_at: now,
     };
     db.upsert_position(&pos).unwrap();
     db.close_position("POS-CAT", "STOP_LOSS", 0.65).unwrap();
@@ -1507,6 +1520,9 @@ async fn test_pre_tp_conditional_trailing_stop_logic() {
         last_update: now,
         status: "OPEN".to_string(),
         is_dry_run: true,
+        owner_pubkey: None,
+        price_source: "TEST".to_string(),
+        price_updated_at: now,
     };
     db.upsert_position(&pos).unwrap();
 
@@ -1581,6 +1597,9 @@ async fn test_bot_autonomous_exit_full_tp_and_sl_logic() {
         last_update: now,
         status: "OPEN".to_string(),
         is_dry_run: true,
+        owner_pubkey: None,
+        price_source: "TEST".to_string(),
+        price_updated_at: now,
     };
     db.upsert_position(&pos_tp).unwrap();
 
@@ -1625,6 +1644,9 @@ async fn test_bot_autonomous_exit_full_tp_and_sl_logic() {
         last_update: now,
         status: "OPEN".to_string(),
         is_dry_run: true,
+        owner_pubkey: None,
+        price_source: "TEST".to_string(),
+        price_updated_at: now,
     };
     db.upsert_position(&pos_sl).unwrap();
 
@@ -1759,4 +1781,32 @@ async fn test_copytrade_allowed_whales_whitelist_gating() {
             .contains("REJECTED_COPYTRADE_DISABLED_MONITOR_ONLY"),
         "Alasan penolakan harus MONITOR_ONLY"
     );
+}
+
+/// Regresi anti-fallback statis: tanpa jumlah token riil tidak ada kuotasi (sampel 1_000_000
+/// dilarang), dan decimals yang gagal dibaca wajib error (bukan default 6).
+#[tokio::test]
+async fn test_exit_quote_and_decimals_fail_closed_without_static_fallback() {
+    let db = Arc::new(SmartWalletDb::new_in_memory().unwrap());
+    let mut config = get_mock_config();
+    config.solana_rpc_url = "http://127.0.0.1:1".to_string();
+    config.solana_portfolio_rpc_url = None;
+    config.solana_execution_rpc_url = None;
+    let sol_exec = SolanaExecutor::new(config, db);
+    let mint = "MintNoFallback11111111111111111111111111111";
+
+    // Ditolak sebelum menyentuh Jupiter: pesan wajib menyebut jumlah 0 (bukan error jaringan/rute).
+    for result in [
+        sol_exec.get_fresh_exit_quote(mint, 0).await,
+        sol_exec.get_realizable_exit_quote(mint, 0).await,
+    ] {
+        let error = result.expect_err("kuotasi dengan jumlah 0 wajib ditolak").to_string();
+        assert!(
+            error.contains("jumlah token 0"),
+            "penolakan harus karena jumlah 0, bukan sampel/jaringan: {error}"
+        );
+    }
+
+    let decimals = sol_exec.get_token_decimals(mint).await;
+    assert!(decimals.is_err(), "decimals gagal dibaca wajib error, bukan default 6");
 }

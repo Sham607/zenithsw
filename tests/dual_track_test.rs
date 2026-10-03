@@ -112,6 +112,10 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         evm_slippage_bps: 50,
         evm_gas_reserve_wei: 2_000_000_000_000_000,
         evm_deadline_secs: 120,
+        stale_price_max_secs: 5,
+        min_pool_age_secs: 0,
+        exit_quote_ttl_ms: 2000,
+        trading_paused: false,
         radar_min_holding_value_usd: 100.0,
         radar_prune_minutes: 30,
         quarantine_base_minutes: 15,
@@ -255,6 +259,9 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         last_update: now,
         status: "OPEN".to_string(),
         is_dry_run: true,
+        owner_pubkey: None,
+        price_source: "TEST".to_string(),
+        price_updated_at: now,
     };
     db.upsert_position(&fast_pos).unwrap();
 
@@ -278,6 +285,9 @@ async fn test_dual_track_db_roundtrip_and_routing() {
         last_update: now,
         status: "OPEN".to_string(),
         is_dry_run: true,
+        owner_pubkey: None,
+        price_source: "TEST".to_string(),
+        price_updated_at: now,
     };
     db.upsert_position(&vault_pos).unwrap();
 

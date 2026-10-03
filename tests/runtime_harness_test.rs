@@ -208,6 +208,9 @@ fn seed_all_domains(trading_db: &Path, wallet_db: &Path) {
         last_update: now,
         status: "OPEN".into(),
         is_dry_run: true,
+        owner_pubkey: None,
+        price_source: "TEST".into(),
+        price_updated_at: now,
     })
     .expect("seed position solana");
     db.upsert_position(&ShadowPosition {
@@ -230,6 +233,9 @@ fn seed_all_domains(trading_db: &Path, wallet_db: &Path) {
         last_update: now,
         status: "OPEN".into(),
         is_dry_run: true,
+        owner_pubkey: None,
+        price_source: "TEST".into(),
+        price_updated_at: now,
     })
     .expect("seed position base");
 

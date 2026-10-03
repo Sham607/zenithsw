@@ -19,7 +19,7 @@ async fn test_ipc_broadcast_and_client_roundtrip() {
         wallet_sol_balance: 0.25,
         sol_price_usd: 100.0,
         wallet_equity_usd: 35.0,
-        total_realized_pnl_usd: 5.0,
+        total_realized_pnl_usd: Some(5.0),
         min_liquidity_usd: 30000.0,
         max_price_delta_pct: 5.0,
         position_size_usd: 5.0,
@@ -42,6 +42,11 @@ async fn test_ipc_broadcast_and_client_roundtrip() {
         polled_wallets_count: 3,
         global_scanned_wallets_count: 2,
         candidate_wallets_count: 7,
+        ws_subscribed_wallets: 5,
+        ws_expected_wallets: 5,
+        stale_positions_count: 0,
+        trading_paused: false,
+        wallet_pubkey_mismatch: false,
     };
     server.broadcast(&test_hb).unwrap();
 
@@ -115,7 +120,7 @@ async fn test_ipc_client_reconnects_and_receives_activity_payload() {
             wallet_sol_balance: 0.0,
             sol_price_usd: 0.0,
             wallet_equity_usd: 0.0,
-            total_realized_pnl_usd: 0.0,
+            total_realized_pnl_usd: Some(0.0),
             min_liquidity_usd: 0.0,
             max_price_delta_pct: 0.0,
             position_size_usd: 0.0,
@@ -138,6 +143,11 @@ async fn test_ipc_client_reconnects_and_receives_activity_payload() {
             polled_wallets_count: 1,
             global_scanned_wallets_count: 0,
             candidate_wallets_count: 0,
+            ws_subscribed_wallets: 1,
+            ws_expected_wallets: 1,
+            stale_positions_count: 0,
+            trading_paused: false,
+            wallet_pubkey_mismatch: false,
         })
         .unwrap();
     let activity = zenithsw::models::WalletActivity {

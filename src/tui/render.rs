@@ -1,6 +1,6 @@
 use crate::models::{ActivityType, ExecutionTrack, WalletTier};
 use crate::tui::app::App;
-use chrono::FixedOffset;
+use chrono::{FixedOffset, Utc};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -103,20 +103,46 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
         "N/A".to_string()
     };
     let realized = if heartbeat_fresh {
-        format!("${:+.2}", app.total_realized_pnl_usd)
+        match app.total_realized_pnl_usd {
+            Some(pnl) => format!("${:+.2}", pnl),
+            None => "N/A".to_string(),
+        }
     } else {
         "N/A".to_string()
     };
 
+    let mut alerts = Vec::new();
+    if app.trading_paused {
+        alerts.push("⏸️ PAUSED".to_string());
+    }
+    if app.wallet_pubkey_mismatch {
+        alerts.push("⚠️ WALLET MISMATCH".to_string());
+    }
+    if app.stale_positions_count > 0 {
+        alerts.push(format!("⚠️ {} STALE POS", app.stale_positions_count));
+    }
+    if app.ws_expected_wallets > 0 && app.ws_subscribed_wallets < app.ws_expected_wallets {
+        alerts.push(format!(
+            "⚠️ WS FEED {}/{}",
+            app.ws_subscribed_wallets, app.ws_expected_wallets
+        ));
+    }
+    let alert_str = if alerts.is_empty() {
+        String::new()
+    } else {
+        format!(" • [{}]", alerts.join(" | "))
+    };
+
     let header_title = format!(
-        " ZENITHSW • {} • [{}] • SOL: {:.4} ({}) • POS: ${:.2} • TOTAL EQUITY: {} • REALIZED: {} ",
+        " ZENITHSW • {} • [{}] • SOL: {:.4} ({}) • POS: ${:.2} • TOTAL EQUITY: {} • REALIZED: {}{} ",
         mode_str,
         pubkey_short,
         app.wallet_sol_balance,
         sol_value,
         total_pos_usd,
         total_equity,
-        realized
+        realized,
+        alert_str
     );
 
     let tabs = Tabs::new(tab_titles)
@@ -211,14 +237,17 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
             Style::default().fg(Color::Cyan),
         ),
         Span::raw(") | Realized PnL: "),
-        Span::styled(
-            format!("${:+.2}", app.total_realized_pnl_usd),
-            Style::default().fg(if app.total_realized_pnl_usd >= 0.0 {
-                Color::Green
-            } else {
-                Color::Red
-            }),
-        ),
+        match app.total_realized_pnl_usd {
+            Some(pnl) => Span::styled(
+                format!("${:+.2}", pnl),
+                Style::default().fg(if pnl >= 0.0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
+            ),
+            None => Span::styled("N/A", Style::default().fg(Color::DarkGray)),
+        },
     ]);
 
     let footer = Paragraph::new(footer_text)
@@ -235,8 +264,11 @@ fn render_tab_stream(frame: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     // Left: Live Whale Activities
+    let mut sorted_activities = app.activities.clone();
+    sorted_activities.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
     let mut act_items = Vec::new();
-    for act in app.activities.iter().take(15) {
+    for act in sorted_activities.iter().take(15) {
         let wib_dt = act
             .timestamp
             .with_timezone(&FixedOffset::east_opt(7 * 3600).unwrap());
@@ -966,6 +998,8 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
         "Target Whale",
         "Entry Price",
         "Current Price",
+        "SRC",
+        "AGE",
         "Bag %",
         "PnL ($)",
         "PnL (%)",
@@ -1010,6 +1044,22 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
                 ExecutionTrack::VaultLane => ("VAULT 🏛️", Color::Yellow),
             };
 
+            let age_secs = (Utc::now() - pos.price_updated_at).num_seconds().max(0);
+            let age_color = if age_secs > 5 {
+                Color::Red
+            } else if age_secs > 2 {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            };
+            let age_display = format!("{}s", age_secs);
+
+            let src_badge = match pos.price_source.as_str() {
+                "JUPITER" => Span::styled("JUP 🪐", Style::default().fg(Color::Cyan)),
+                "DEXSCREENER" => Span::styled("DEX 📊", Style::default().fg(Color::Magenta)),
+                _ => Span::styled("STALE ⚠️", Style::default().fg(Color::Red)),
+            };
+
             Row::new(vec![
                 Cell::from(Span::styled(
                     track_badge,
@@ -1023,6 +1073,8 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
                 Cell::from(handle_display),
                 Cell::from(format!("${:.6}", pos.entry_price)),
                 Cell::from(format!("${:.6}", pos.current_price)),
+                Cell::from(src_badge),
+                Cell::from(Span::styled(age_display, Style::default().fg(age_color))),
                 Cell::from(portion_str),
                 Cell::from(format!(
                     "${:+.2}",
@@ -1064,7 +1116,10 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
         "N/A".to_string()
     };
     let realized_display = if app.heartbeat_is_fresh() {
-        format!("${:+.2}", app.total_realized_pnl_usd)
+        match app.total_realized_pnl_usd {
+            Some(pnl) => format!("${:+.2}", pnl),
+            None => "N/A".to_string(),
+        }
     } else {
         "N/A".to_string()
     };
@@ -1082,17 +1137,19 @@ fn render_tab_positions(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(10), // Track
-            Constraint::Length(10), // Symbol
-            Constraint::Length(9),  // Chain
-            Constraint::Length(19), // Mint / Contract
-            Constraint::Length(26), // Target Whale
-            Constraint::Length(13), // Entry Price
-            Constraint::Length(14), // Current Price
-            Constraint::Length(7),  // Bag %
-            Constraint::Length(10), // PnL ($)
-            Constraint::Length(10), // PnL (%)
-            Constraint::Length(8),  // Status
+            Constraint::Length(9),  // Track
+            Constraint::Length(8),  // Symbol
+            Constraint::Length(7),  // Chain
+            Constraint::Length(18), // Mint / Contract
+            Constraint::Length(18), // Target Whale
+            Constraint::Length(12), // Entry Price
+            Constraint::Length(12), // Current Price
+            Constraint::Length(8),  // SRC
+            Constraint::Length(5),  // AGE
+            Constraint::Length(6),  // Bag %
+            Constraint::Length(9),  // PnL ($)
+            Constraint::Length(9),  // PnL (%)
+            Constraint::Length(7),  // Status
         ],
     )
     .header(header)
@@ -1147,17 +1204,27 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         format!("{:.6} SOL (N/A)", app.wallet_sol_balance)
     };
-    let realized_pnl_display = if app.heartbeat_is_fresh() {
-        format!("${:+.2} USD", app.total_realized_pnl_usd)
+    let (realized_pnl_display, realized_pnl_color) = if app.heartbeat_is_fresh() {
+        match app.total_realized_pnl_usd {
+            Some(pnl) => (
+                format!("${:+.2} USD", pnl),
+                if pnl >= 0.0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                },
+            ),
+            None => ("N/A".to_string(), Color::DarkGray),
+        }
     } else {
-        "N/A".to_string()
+        ("N/A".to_string(), Color::DarkGray)
     };
 
     let mode_desc = if app.is_live_mode {
         format!(
             "LIVE ON-CHAIN 🟢 (Signer: {})",
             if app.wallet_pubkey.is_empty() {
-                "bLiHABX6WnneYX94mqR7eUh9VsMvZB23772eWAtvvdk"
+                "MENUNGGU DATA ENGINE..."
             } else {
                 &app.wallet_pubkey
             }
@@ -1212,11 +1279,7 @@ fn render_tab_stats(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 realized_pnl_display.clone(),
                 Style::default()
-                    .fg(if app.total_realized_pnl_usd >= 0.0 {
-                        Color::Green
-                    } else {
-                        Color::Red
-                    })
+                    .fg(realized_pnl_color)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),

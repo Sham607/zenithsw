@@ -379,10 +379,13 @@ impl SmartWalletDb {
                  entry_time TEXT NOT NULL,
                  last_update TEXT NOT NULL,
                  status TEXT NOT NULL,
-                 is_dry_run INTEGER NOT NULL DEFAULT 1
-             );
+                 is_dry_run INTEGER NOT NULL DEFAULT 1,
+                 owner_pubkey TEXT,
+                 price_source TEXT NOT NULL DEFAULT 'DEXSCREENER',
+                 price_updated_at TEXT
+                 );
 
-             CREATE TABLE IF NOT EXISTS trade_history (
+                 CREATE TABLE IF NOT EXISTS trade_history (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  timestamp TEXT NOT NULL,
                  chain TEXT NOT NULL,
@@ -529,6 +532,13 @@ impl SmartWalletDb {
         let (column, definition) = ("is_dry_run", "INTEGER NOT NULL DEFAULT 1");
         add_column_if_missing(&conn, "shadow_positions", column, definition)?;
         add_column_if_missing(&conn, "trade_history", column, definition)?;
+        for (column, definition) in [
+            ("owner_pubkey", "TEXT"),
+            ("price_source", "TEXT NOT NULL DEFAULT 'DEXSCREENER'"),
+            ("price_updated_at", "TEXT"),
+        ] {
+            add_column_if_missing(&conn, "shadow_positions", column, definition)?;
+        }
         for (column, definition) in [
             ("source_reference", "TEXT"),
             ("parser_version", "TEXT"),
@@ -728,9 +738,12 @@ impl SmartWalletDb {
                  entry_time TEXT NOT NULL,
                  last_update TEXT NOT NULL,
                  status TEXT NOT NULL,
-                 is_dry_run INTEGER NOT NULL DEFAULT 1
-             );
-             CREATE TABLE IF NOT EXISTS trade_history (
+                 is_dry_run INTEGER NOT NULL DEFAULT 1,
+                 owner_pubkey TEXT,
+                 price_source TEXT NOT NULL DEFAULT 'DEXSCREENER',
+                 price_updated_at TEXT
+                 );
+                 CREATE TABLE IF NOT EXISTS trade_history (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  timestamp TEXT NOT NULL,
                  chain TEXT NOT NULL,
@@ -792,6 +805,13 @@ impl SmartWalletDb {
             "track",
             "TEXT NOT NULL DEFAULT 'FAST_LANE'",
         )?;
+        for (column, definition) in [
+            ("owner_pubkey", "TEXT"),
+            ("price_source", "TEXT NOT NULL DEFAULT 'DEXSCREENER'"),
+            ("price_updated_at", "TEXT"),
+        ] {
+            add_column_if_missing(&conn, "shadow_positions", column, definition)?;
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS execution_intents (
                 intent_id TEXT PRIMARY KEY,
@@ -1546,7 +1566,7 @@ impl SmartWalletDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, wallet_handle, wallet_address, chain, activity_type, token_symbol, token_mint, amount_usd, token_amount, execution_price_usd, whale_balance_before, whale_balance_after, sell_ratio_pct, tx_signature, timestamp, source_reference, parser_version, finality
-             FROM wallet_activities ORDER BY id DESC LIMIT ?1",
+             FROM wallet_activities ORDER BY timestamp DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |row| {
             let id: Option<i64> = row.get(0)?;
@@ -1635,7 +1655,7 @@ impl SmartWalletDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT chain, token_symbol, token_mint, whale_handle, whale_address, whale_tier, whale_entry_price, current_pool_price, price_delta_pct, pool_liquidity_usd, is_passed, rejection_reason, confluence_count, timestamp, track
-             FROM shadow_signals ORDER BY id DESC LIMIT ?1",
+             FROM shadow_signals ORDER BY timestamp DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |row| {
             let chain_str: String = row.get(0)?;
@@ -1694,10 +1714,11 @@ impl SmartWalletDb {
 
         let conn = self.conn.lock().unwrap();
         let is_dry_run_val = if pos.is_dry_run { 1i64 } else { 0i64 };
+        let price_updated_str = pos.price_updated_at.to_rfc3339();
         conn.execute(
             "INSERT INTO shadow_positions (
-                id, chain, token_symbol, token_mint, target_whale_handle, target_whale_address, entry_price, current_price, peak_price, amount_native, amount_usd, remaining_portion_pct, unrealized_pnl_pct, realized_pnl_usd, track, entry_time, last_update, status, is_dry_run
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                id, chain, token_symbol, token_mint, target_whale_handle, target_whale_address, entry_price, current_price, peak_price, amount_native, amount_usd, remaining_portion_pct, unrealized_pnl_pct, realized_pnl_usd, track, entry_time, last_update, status, is_dry_run, owner_pubkey, price_source, price_updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
              ON CONFLICT(id) DO UPDATE SET
                 entry_price = excluded.entry_price,
                 amount_usd = excluded.amount_usd,
@@ -1712,7 +1733,10 @@ impl SmartWalletDb {
                 track = excluded.track,
                 last_update = excluded.last_update,
                 status = excluded.status,
-                is_dry_run = excluded.is_dry_run",
+                is_dry_run = excluded.is_dry_run,
+                owner_pubkey = COALESCE(excluded.owner_pubkey, shadow_positions.owner_pubkey),
+                price_source = excluded.price_source,
+                price_updated_at = excluded.price_updated_at",
             params![
                 pos.id,
                 chain_str,
@@ -1733,6 +1757,9 @@ impl SmartWalletDb {
                 update_str,
                 pos.status,
                 is_dry_run_val,
+                pos.owner_pubkey,
+                pos.price_source,
+                price_updated_str,
             ],
         )?;
         Ok(())
@@ -1741,7 +1768,7 @@ impl SmartWalletDb {
     pub fn get_active_positions(&self) -> Result<Vec<ShadowPosition>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chain, token_symbol, token_mint, target_whale_handle, target_whale_address, entry_price, current_price, peak_price, amount_native, amount_usd, remaining_portion_pct, unrealized_pnl_pct, realized_pnl_usd, entry_time, last_update, status, track, is_dry_run
+            "SELECT id, chain, token_symbol, token_mint, target_whale_handle, target_whale_address, entry_price, current_price, peak_price, amount_native, amount_usd, remaining_portion_pct, unrealized_pnl_pct, realized_pnl_usd, entry_time, last_update, status, track, is_dry_run, owner_pubkey, price_source, price_updated_at
              FROM shadow_positions WHERE status != 'CLOSED' ORDER BY entry_time DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1765,6 +1792,9 @@ impl SmartWalletDb {
             let track_str: String = row.get(17).unwrap_or_else(|_| "FAST_LANE".to_string());
             let is_dry_run_int: i64 = row.get(18).unwrap_or(1);
             let is_dry_run = is_dry_run_int != 0;
+            let owner_pubkey: Option<String> = row.get(19).ok();
+            let price_source: String = row.get(20).unwrap_or_else(|_| "DEXSCREENER".to_string());
+            let price_updated_str: Option<String> = row.get(21).ok();
 
             let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
             let entry_time = DateTime::parse_from_rfc3339(&entry_str)
@@ -1773,6 +1803,13 @@ impl SmartWalletDb {
             let last_update = DateTime::parse_from_rfc3339(&update_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            let price_updated_at = price_updated_str
+                .and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc))
+                })
+                .unwrap_or(last_update);
             let track = ExecutionTrack::from_str(&track_str).unwrap_or(ExecutionTrack::FastLane);
 
             Ok(ShadowPosition {
@@ -1795,6 +1832,9 @@ impl SmartWalletDb {
                 last_update,
                 status,
                 is_dry_run,
+                owner_pubkey,
+                price_source,
+                price_updated_at,
             })
         })?;
 
@@ -2029,20 +2069,101 @@ impl SmartWalletDb {
         self.close_position_portion(id, 100.0, exit_reason, exit_price)
     }
 
-    /// Menutup posisi yang saldo fisiknya terbukti nol / fill tidak terbukti, TANPA
-    /// mencatat PnL atau trade_history fiktif. Status menjadi CLOSED, remaining 0.
+    /// Menutup posisi yang saldo fisiknya terbukti nol / fill tidak terbukti,
+    /// mencatat trade_history dengan exit_reason dan kalkulasi konservatif (-100% PnL)
+    /// agar tidak terjadi pembukuan fiktif atau rugi yang lenyap diam-diam.
     pub fn close_position_without_fill(&self, id: &str, reason: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let changed = conn.execute(
-            "UPDATE shadow_positions SET status='CLOSED', remaining_portion_pct=0, last_update=?1
-             WHERE id=?2 AND status!='CLOSED'",
-            params![Utc::now().to_rfc3339(), id],
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let mut stmt = tx.prepare(
+            "SELECT chain, token_symbol, token_mint, target_whale_handle, entry_price, amount_usd, remaining_portion_pct, realized_pnl_usd, entry_time, track, is_dry_run
+             FROM shadow_positions WHERE id = ?1 AND status != 'CLOSED'",
         )?;
-        if changed != 1 {
-            return Err(anyhow::anyhow!("posisi aktif tidak ditemukan: {id}"));
+        let pos_opt = stmt
+            .query_row(params![id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, f64>(6)?,
+                    row.get::<_, f64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, bool>(10)?,
+                ))
+            })
+            .optional()?;
+        drop(stmt);
+
+        if let Some((
+            chain_str,
+            symbol,
+            mint,
+            target_whale,
+            entry_price,
+            amount_usd,
+            remaining_portion_pct,
+            current_realized_pnl,
+            entry_str,
+            track_s,
+            is_dry_run,
+        )) = pos_opt
+        {
+            let now = Utc::now();
+            let entry_time = DateTime::parse_from_rfc3339(&entry_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(now);
+            let duration_secs = (now - entry_time).num_seconds().max(0) as u64;
+
+            let exit_price = 0.0;
+            let pnl_pct = -100.0;
+            let sold_usd_basis = amount_usd * (remaining_portion_pct / 100.0);
+            let pnl_usd_this_trade = -sold_usd_basis;
+            let new_realized_pnl = current_realized_pnl + pnl_usd_this_trade;
+            let chain = Chain::from_str(&chain_str).unwrap_or(Chain::Solana);
+            let is_dry_run_val = if is_dry_run { 1i64 } else { 0i64 };
+
+            tx.execute(
+                "INSERT INTO trade_history (
+                    timestamp, chain, action, symbol, mint, target_whale, exit_reason, portion_sold_pct, entry_price, exit_price, pnl_pct, pnl_usd, duration_secs, track, is_dry_run
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    now.to_rfc3339(),
+                    chain.to_string(),
+                    "SELL",
+                    symbol,
+                    mint,
+                    target_whale,
+                    reason,
+                    remaining_portion_pct,
+                    entry_price,
+                    exit_price,
+                    pnl_pct,
+                    pnl_usd_this_trade,
+                    duration_secs,
+                    track_s,
+                    is_dry_run_val,
+                ],
+            )?;
+
+            let changed = tx.execute(
+                "UPDATE shadow_positions SET status='CLOSED', remaining_portion_pct=0, realized_pnl_usd=?1, last_update=?2
+                 WHERE id=?3 AND status!='CLOSED'",
+                params![new_realized_pnl, now.to_rfc3339(), id],
+            )?;
+            if changed != 1 {
+                return Err(anyhow::anyhow!("posisi aktif tidak ditemukan: {id}"));
+            }
+            tx.commit()?;
+            println!("[POSITION CLOSED WITHOUT FILL] id={id} reason={reason}");
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("posisi aktif tidak ditemukan: {id}"))
         }
-        println!("[POSITION CLOSED WITHOUT FILL] id={id} reason={reason}");
-        Ok(())
     }
 
     pub fn get_recent_trades(&self, limit: usize) -> Result<Vec<TradeRecord>> {
@@ -2786,6 +2907,31 @@ impl SmartWalletDb {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .optional()?)
+    }
+
+    /// Ada intent non-terminal untuk mint ini (eksekusi bot sedang berjalan)?
+    pub fn has_active_execution_intent(&self, chain: Chain, token_mint: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let active: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM execution_intents
+                 WHERE chain=?1 AND token_mint=?2 AND state IN ({ACTIVE_INTENT_STATES_SQL})"
+            ),
+            params![chain.to_string(), token_mint],
+            |row| row.get(0),
+        )?;
+        Ok(active > 0)
+    }
+
+    /// Signature ini milik transaksi yang dikirim bot sendiri?
+    pub fn is_execution_signature(&self, signature: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM execution_intents WHERE signature=?1",
+            params![signature],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn get_pending_execution_intents(&self) -> Result<Vec<PendingExecutionIntent>> {

@@ -30,17 +30,21 @@ pub struct Config {
     pub max_token_exposure_usd: f64, // Max $50 aggregated exposure per token mint
     pub max_price_impact_pct: f64, // Max 15.0% price impact on pool to prevent buying local tops
     pub price_sanity_spike_mult: f64, // Max single-tick price multiplier (e.g. 5.0x / 500%)
-    pub min_market_cap_usd: f64,  // Min $50k market cap
-    pub max_market_cap_usd: f64,  // Max $20M market cap
-    pub confluence_window_secs: i64, // Window for confluence counting (e.g. 300s)
-    pub tier_b_min_confluence_buyers: u32, // Minimum buyers for Tier-B solo trigger (e.g. 2)
-    pub trailing_stop_pct: f64,   // 10% trailing stop
-    pub trailing_stop_trigger_pct: f64, // Activation threshold for trailing stop (e.g. 35%)
-    pub stop_loss_pct: f64,       // 15% stop loss
-    pub take_profit_pct: f64,     // 100% take profit trigger (50% partial exit)
-    pub take_profit_2_pct: f64,   // Tier 2 take profit (e.g. 300% / 4x)
-    pub tp1_portion_pct: f64,     // Portion % to exit at TP1 (e.g. 50%)
-    pub tp2_portion_pct: f64,     // Portion % to exit at TP2 (e.g. 25%)
+    /// Umur maksimum harga sebelum TUI menandai stale (detik). Bukan pemicu jual.
+    pub stale_price_max_secs: u64,
+    /// Umur minimum pool sebelum layak dibeli (detik). 0 = tidak dibatasi.
+    pub min_pool_age_secs: u64,
+    pub min_market_cap_usd: f64,              // Min $50k market cap
+    pub max_market_cap_usd: f64,              // Max $20M market cap
+    pub confluence_window_secs: i64,          // Window for confluence counting (e.g. 300s)
+    pub tier_b_min_confluence_buyers: u32,    // Minimum buyers for Tier-B solo trigger (e.g. 2)
+    pub trailing_stop_pct: f64,               // 10% trailing stop
+    pub trailing_stop_trigger_pct: f64,       // Activation threshold for trailing stop (e.g. 35%)
+    pub stop_loss_pct: f64,                   // 15% stop loss
+    pub take_profit_pct: f64,                 // 100% take profit trigger (50% partial exit)
+    pub take_profit_2_pct: f64,               // Tier 2 take profit (e.g. 300% / 4x)
+    pub tp1_portion_pct: f64,                 // Portion % to exit at TP1 (e.g. 50%)
+    pub tp2_portion_pct: f64,                 // Portion % to exit at TP2 (e.g. 25%)
     pub runner_min_pump_mult: f64, // Minimum pump multiplier from entry to arm runner protections (e.g. 2.0x)
     pub profit_lock_min_current_pnl_pct: f64, // Minimum current PnL % to trigger profit-lock floor exit (e.g. 5%)
     pub liquidity_drain_usd: f64,             // Floor for emergency exit on liquidity collapse
@@ -54,9 +58,11 @@ pub struct Config {
     pub solana_trailing_slippage_bps: u16, // Jupiter trailing sell slippage bps (e.g. 300 bps)
     pub solana_sl_slippage_bps: u16,  // Jupiter emergency hard SL slippage bps (e.g. 500 bps)
     pub solana_priority_fee_max_lamports: u64, // Batas atas priority fee Jupiter (level veryHigh)
-    pub evm_slippage_bps: u128,       // EVM swap slippage bps (e.g. 50 bps)
-    pub evm_gas_reserve_wei: u128,    // EVM minimum gas reserve in wei (e.g. 0.002 ETH)
-    pub evm_deadline_secs: u64,       // EVM swap deadline in seconds (e.g. 120s)
+    /// TTL cache kuotasi exit Jupiter (ms). Dipakai untuk monitoring; SL selalu pakai quote segar.
+    pub exit_quote_ttl_ms: u64,
+    pub evm_slippage_bps: u128,    // EVM swap slippage bps (e.g. 50 bps)
+    pub evm_gas_reserve_wei: u128, // EVM minimum gas reserve in wei (e.g. 0.002 ETH)
+    pub evm_deadline_secs: u64,    // EVM swap deadline in seconds (e.g. 120s)
 
     // Radar Parameters
     pub radar_min_holding_value_usd: f64, // Min holding USD to qualify for radar projection (e.g. 100.0)
@@ -74,6 +80,8 @@ pub struct Config {
     pub bot_trailing_stop_pct: f64, // Bot autonomous trailing drop %
     pub confluence_mode: String,  // "TIER_S_OR_DUAL_A"
     pub dry_run: bool,
+    /// Jeda trading: engine tetap memantau & SL proteksi jalan, tetapi BUY ditolak.
+    pub trading_paused: bool,
     pub sim_initial_balance: f64, // Virtual cash balance in dry_run mode
     /// Live Robinhood gate tambahan; tidak cukup sendiri untuk broadcast.
     pub live_robinhood_enabled: bool,
@@ -306,6 +314,11 @@ impl Config {
         let max_token_exposure_usd = parse_value("MAX_TOKEN_EXPOSURE_USD", 50.0f64)?;
         let max_price_impact_pct = parse_value("MAX_PRICE_IMPACT_PCT", 15.0f64)?;
         let price_sanity_spike_mult = parse_value("PRICE_SANITY_SPIKE_MULT", 5.0f64)?;
+        let stale_price_max_secs = parse_value("STALE_PRICE_MAX_SECS", 5u64)?;
+        if stale_price_max_secs == 0 {
+            anyhow::bail!("STALE_PRICE_MAX_SECS harus lebih besar dari 0");
+        }
+        let min_pool_age_secs = parse_value("MIN_POOL_AGE_SECS", 0u64)?;
         let min_market_cap_usd = parse_value("MIN_MARKET_CAP_USD", 50000.0f64)?;
         let max_market_cap_usd = parse_value("MAX_MARKET_CAP_USD", 20000000.0f64)?;
         let confluence_window_secs = parse_value("CONFLUENCE_WINDOW_SECS", 300i64)?;
@@ -332,6 +345,10 @@ impl Config {
             parse_value("SOLANA_PRIORITY_FEE_MAX_LAMPORTS", 100_000u64)?;
         if solana_priority_fee_max_lamports == 0 || solana_priority_fee_max_lamports > 5_000_000 {
             anyhow::bail!("SOLANA_PRIORITY_FEE_MAX_LAMPORTS harus 1..=5000000");
+        }
+        let exit_quote_ttl_ms = parse_value("EXIT_QUOTE_TTL_MS", 2_000u64)?;
+        if !(100..=60_000).contains(&exit_quote_ttl_ms) {
+            anyhow::bail!("EXIT_QUOTE_TTL_MS harus 100..=60000");
         }
         let evm_slippage_bps = parse_value("EVM_SLIPPAGE_BPS", 50u128)?;
         let evm_gas_reserve_wei = parse_value("EVM_GAS_RESERVE_WEI", 2_000_000_000_000_000u128)?;
@@ -451,6 +468,7 @@ impl Config {
         }
 
         let dry_run = parse_bool("DRY_RUN", true)?;
+        let trading_paused = parse_bool("TRADING_PAUSED", false)?;
         let sim_initial_balance = parse_value("SIM_INITIAL_BALANCE", 100.0f64)?;
         if sim_initial_balance <= 0.0 {
             anyhow::bail!("SIM_INITIAL_BALANCE harus lebih besar dari 0");
@@ -506,6 +524,8 @@ impl Config {
             max_token_exposure_usd,
             max_price_impact_pct,
             price_sanity_spike_mult,
+            stale_price_max_secs,
+            min_pool_age_secs,
             min_market_cap_usd,
             max_market_cap_usd,
             confluence_window_secs,
@@ -528,6 +548,7 @@ impl Config {
             solana_trailing_slippage_bps,
             solana_sl_slippage_bps,
             solana_priority_fee_max_lamports,
+            exit_quote_ttl_ms,
             evm_slippage_bps,
             evm_gas_reserve_wei,
             evm_deadline_secs,
@@ -546,6 +567,7 @@ impl Config {
             confluence_mode: env::var("CONFLUENCE_MODE")
                 .unwrap_or_else(|_| "TIER_S_OR_DUAL_A".to_string()),
             dry_run,
+            trading_paused,
             sim_initial_balance,
             live_robinhood_enabled,
             enable_solana,

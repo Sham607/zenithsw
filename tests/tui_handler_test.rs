@@ -53,6 +53,10 @@ fn test_config() -> Config {
         evm_slippage_bps: 50,
         evm_gas_reserve_wei: 2_000_000_000_000_000,
         evm_deadline_secs: 120,
+        stale_price_max_secs: 5,
+        min_pool_age_secs: 0,
+        exit_quote_ttl_ms: 2000,
+        trading_paused: false,
         radar_min_holding_value_usd: 100.0,
         radar_prune_minutes: 30,
         quarantine_base_minutes: 15,
@@ -191,6 +195,9 @@ fn position(chain: Chain, status: &str) -> ShadowPosition {
         entry_time: chrono::Utc::now(),
         last_update: chrono::Utc::now(),
         status: status.to_string(),
+        owner_pubkey: None,
+        price_source: "TEST".to_string(),
+        price_updated_at: chrono::Utc::now(),
     }
 }
 
@@ -346,7 +353,7 @@ fn heartbeat_updates_connection_and_dry_run_mode() {
             wallet_sol_balance: 1.5,
             sol_price_usd: 150.0,
             wallet_equity_usd: 300.0,
-            total_realized_pnl_usd: 12.5,
+            total_realized_pnl_usd: Some(12.5),
             min_liquidity_usd: 30000.0,
             max_price_delta_pct: 5.0,
             position_size_usd: 15.0,
@@ -369,6 +376,11 @@ fn heartbeat_updates_connection_and_dry_run_mode() {
             polled_wallets_count: 3,
             global_scanned_wallets_count: 40,
             candidate_wallets_count: 5,
+            ws_subscribed_wallets: 2,
+            ws_expected_wallets: 2,
+            stale_positions_count: 0,
+            trading_paused: false,
+            wallet_pubkey_mismatch: false,
         },
         &config,
     );
@@ -376,6 +388,7 @@ fn heartbeat_updates_connection_and_dry_run_mode() {
     assert!(app.heartbeat_received_at.is_some());
     assert_eq!(app.heartbeat_seq, 7);
     assert_eq!(app.uptime_secs, 120);
+    assert_eq!(app.total_realized_pnl_usd, Some(12.5));
     assert!(!app.is_live_mode);
     assert!(!app.shadow_exit_enabled);
     assert_eq!(app.qualified_wallets_count, 2);

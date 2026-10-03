@@ -18,6 +18,7 @@ engine:
 
 start: release
 	@sed -i 's/^DRY_RUN=.*/DRY_RUN=true/' .env
+	@sed -i 's|^TRADING_DB_PATH=.*|TRADING_DB_PATH=data/trading_state.db|' .env
 	@echo "🟢 Menjalankan ZenithSW Engine Daemon (DRY-RUN)..."
 	@systemctl --user restart zenithsw-engine.service
 	@sleep 1
@@ -25,6 +26,7 @@ start: release
 
 start-live: release
 	@sed -i 's/^DRY_RUN=.*/DRY_RUN=false/' .env
+	@sed -i 's|^TRADING_DB_PATH=.*|TRADING_DB_PATH=data/trading_state_live.db|' .env
 	@echo "🔴 Menjalankan ZenithSW Engine Daemon (LIVE MODE)..."
 	@systemctl --user restart zenithsw-engine.service
 	@sleep 1
